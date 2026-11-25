@@ -5,3 +5,17 @@ cargo fmt --all -- --check || { echo "pre-push: cargo fmt --all ausführen und e
 scripts/fints-registrierung.sh scan >/dev/null || { echo "pre-push: scripts/fints-registrierung.sh scan meldet eine eingecheckte Produkt-ID." >&2; exit 1; }
 scripts/xcstrings.py check >/dev/null || { echo "pre-push: String Catalog nicht sortiert – scripts/xcstrings.py format ausführen." >&2; exit 1; }
 scripts/lint-vault-access.sh >/dev/null || { echo "pre-push: Vault-Zugriff aus einer View – über AppModel (vaultOffMain/isUnlocked) gehen." >&2; exit 1; }
+# Secret-Scan der Commits, die dieser Push neu auf den Server bringt (wie der CI-Job `secrets`).
+# Nur wenn gitleaks installiert ist (`brew install gitleaks`); CI prüft ohnehin.
+if command -v gitleaks >/dev/null 2>&1; then
+  zero=0000000000000000000000000000000000000000
+  while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue # Branch wird gelöscht
+    if [ "$remote_sha" = "$zero" ]; then range="$local_sha --not --remotes"; else range="$remote_sha..$local_sha"; fi
+    gitleaks git . --no-banner --redact --config .gitleaks.toml --log-opts="$range" >/dev/null 2>&1 || {
+      echo "pre-push: gitleaks meldet ein mögliches Geheimnis in den neuen Commits." >&2
+      echo "  Details: gitleaks git . --redact --config .gitleaks.toml --log-opts=\"$range\"" >&2
+      exit 1
+    }
+  done
+fi

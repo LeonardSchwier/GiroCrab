@@ -1,0 +1,54 @@
+# Secret scanning for GiroCrab (gitleaks, https://github.com/gitleaks/gitleaks).
+#
+# Runs in CI on every PR (its commits), on every push to main and weekly over the whole history,
+# and in the pre-push hook when gitleaks is installed. See docs/quality-gates.md.
+#
+# Rules: gitleaks' default rule set plus GiroCrab-specific ones below.
+# Allowlists stay NARROW and each one says why. Never allowlist a real secret: rotate it, then
+# remove it from the history. A false positive in production code is better silenced on the line
+# itself with a trailing `gitleaks:allow` comment than with a path here.
+
+[extend]
+useDefault = true
+
+# A HAR file is a full browser network capture: session cookies, bearer tokens, account numbers.
+# Connector work starts from such captures (CONTRIBUTING.md); they stay on the contributor's
+# machine, anonymised excerpts go into tests as Rust/JSON fixtures.
+[[rules]]
+id = "har-capture"
+description = "Browser network capture (HAR) committed: contains cookies, tokens and bank session data"
+path = '''(?i)\.har$'''
+
+# Raw session or auth headers pasted from a browser or a bank log.
+[[rules]]
+id = "http-auth-header"
+description = "Authorization/Cookie header with a real-looking value"
+regex = '''(?i)\b(?:authorization:\s*bearer|cookie:\s*[a-z0-9_.-]*session[a-z0-9_.-]*=)\s*([a-z0-9._~+/=-]{24,})'''
+secretGroup = 1
+keywords = ["authorization", "cookie"]
+
+[[allowlists]]
+description = "Test sources and fixtures: keys and tokens there are generated for the tests and used nowhere else"
+paths = [
+  '''(^|/)(Tests|tests)/''',
+  '''(^|/)fixtures/''',
+  # build output and generated bindings (git-ignored; only seen by a local `gitleaks dir`)
+  '''^(target|generated|GiroCrabApp/\.build)/''',
+]
+
+[[allowlists]]
+description = "A PEM header literal with no key after it (file-format checks in tests)"
+targetRules = ["private-key"]
+regexTarget = "match"
+regexes = ['''^-----BEGIN [A-Z ]*PRIVATE KEY-----"''']
+
+[[allowlists]]
+description = "Names of settings rows in SQL (`WHERE key = 'maintenance.…'`), not credentials"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+regexes = ['''WHERE key = '[a-z0-9_.]+''']
+
+[[allowlists]]
+description = "Documented example of the generated backup password format (doc comment in the Qt port)"
+targetRules = ["generic-api-key"]
+regexes = ['''^kawxe7-hupdyq-bomtiz$''']

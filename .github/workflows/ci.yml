@@ -118,6 +118,177 @@ jobs:
       - name: cargo audit
         run: cargo audit --deny warnings
 
+  # Secret scanning (gitleaks, rules + narrow allowlists in `.gitleaks.toml`): a PR's own commits,
+  # the commits of a push to main, and every Monday the whole history (a new default rule can find
+  # something old). Built from source through the Go module proxy, whose checksum database pins the
+  # exact release; no third-party action (the official one needs a licence key for organisations).
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Install gitleaks 8.30.1
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      - name: gitleaks
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          range=""
+          if [ "$EVENT" = "pull_request" ]; then
+            range="HEAD^1..HEAD"   # HEAD is the PR merged into its base: exactly the PR's commits
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && ! echo "$BEFORE" | grep -qE '^0+$' \
+               && git cat-file -e "$BEFORE" 2>/dev/null; then
+            range="$BEFORE..HEAD"
+          fi
+          echo "Scanning ${range:-the whole history}"
+          "$(go env GOPATH)/bin/gitleaks" git . --no-banner --redact --config .gitleaks.toml \
+            ${range:+--log-opts="$range"}
+
+  # Fix-Proof (docs/fix-proof.md): every new or changed test runs on the base WITHOUT the PR's
+  # production code (red) and on the PR head (green). A `fix:` PR fails here unless at least one
+  # test proves it, or the PR body gives `Fix-Proof: skip – <reason>`. The result (`fix-proof`
+  # artifact) shows on the PR card. With Swift tests the verdict waits for `swift` and comes from
+  # `fix-proof-verdict` instead.
+  fix-proof:
+    needs: changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      swift: ${{ steps.plan.outputs.swift }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # HEAD = the PR merged into its base, HEAD^1 = the base it is proven against
+          persist-credentials: false
+      - name: Plan (new/changed tests, fix or not, exemption)
+        id: plan
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          mkdir -p fix-proof
+          printf '%s' "$BODY" > fix-proof/body.md
+          python3 -I tools/fix_proof.py plan --base HEAD^1 --head HEAD --title "$TITLE" \
+            --body-file fix-proof/body.md --out fix-proof/plan.json --github-output "$GITHUB_OUTPUT"
+          rm fix-proof/body.md
+      - if: steps.plan.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Restores the cache main's `rust` job writes (same key); never saves.
+      - if: steps.plan.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: rust
+          save-if: false
+      - name: Rust tests – red on the base, green on the head
+        if: steps.plan.outputs.rust == 'true'
+        run: python3 -I tools/fix_proof.py run --plan fix-proof/plan.json --lang rust --out fix-proof/rust.json --logs fix-proof/logs
+      - name: Verdict (a fix PR needs a test that is red without the fix)
+        if: steps.plan.outputs.swift != 'true'
+        run: |
+          python3 -I tools/fix_proof.py verdict --plan fix-proof/plan.json --results fix-proof/rust.json \
+            --json fix-proof/fix-proof.json --summary "$GITHUB_STEP_SUMMARY" --enforce
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.plan.outputs.swift == 'true' && 'fix-proof-rust' || 'fix-proof' }}
+          path: fix-proof/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # Only for PRs with new or changed Swift tests: combines the Rust and Swift results of
+  # `fix-proof` and `swift`.
+  fix-proof-verdict:
+    needs: [fix-proof, swift]
+    if: always() && github.event_name == 'pull_request' && needs.fix-proof.outputs.swift == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: fix-proof-rust
+          path: fix-proof
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: fix-proof-swift
+          path: fix-proof-swift
+      - name: Verdict (a fix PR needs a test that is red without the fix)
+        run: |
+          python3 -I tools/fix_proof.py verdict --plan fix-proof/plan.json \
+            --results fix-proof/rust.json fix-proof-swift/swift.json \
+            --json fix-proof/fix-proof.json --summary "$GITHUB_STEP_SUMMARY" --enforce
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fix-proof
+          path: fix-proof/fix-proof.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # Phase 3 of Fix-Proof: mutation testing (cargo-mutants) of the Rust functions the PR changes.
+  # Each mutant is a small deliberate bug; a mutant the tests do not notice points at a missing
+  # test. Report only (some mutants change nothing observable), never blocks; at most 12 mutants
+  # per PR (~1 min each), more are sampled round-robin.
+  mutants:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Plan
+        id: plan
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 -I tools/fix_proof.py plan --base HEAD^1 --head HEAD --title "$TITLE" \
+            --out fix-proof/plan.json --github-output "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.mutants == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - if: steps.plan.outputs.mutants == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: rust
+          save-if: false
+      - if: steps.plan.outputs.mutants == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Mutation testing of the changed Rust functions (report only)
+        if: steps.plan.outputs.mutants == 'true'
+        continue-on-error: true
+        timeout-minutes: 32
+        run: |
+          python3 -I tools/fix_proof.py mutants --plan fix-proof/plan.json --out fix-proof/mutants.json \
+            --logs fix-proof/mutants --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.plan.outputs.mutants == 'true'
+        with:
+          name: fix-proof-mutants
+          path: |
+            fix-proof/mutants.json
+            fix-proof/mutants/mutants.out/*.txt
+          retention-days: 30
+          if-no-files-found: ignore
+
   # `rust` and `swift` deliberately run in parallel and independently: a red
   # fmt/Clippy/Rust test run must not hide the Swift build, and vice versa.
   # The job names stay unchanged so existing required checks keep matching.
@@ -171,8 +342,8 @@ jobs:
         run: python3 -I GiroCrabLinux/scripts/i18n-report.py
       - name: Test String-Catalog-Merge-Driver
         run: python3 -m unittest scripts/test_xcstrings.py scripts/test_sync_docs.py
-      - name: Test AI provenance classifier
-        run: python3 -m unittest tools/test_export_ai_provenance.py
+      - name: Test AI provenance classifier and Fix-Proof (incl. a real red -> green run)
+        run: python3 -m unittest tools/test_export_ai_provenance.py tools/test_fix_proof.py
       - name: Test FNZ portal browser scripts
         run: node --test scripts/test-fnz-portal.cjs scripts/test-quirion-portal.cjs scripts/test-schwaebisch-hall-portal.cjs scripts/test-advanzia-portal.cjs
       - name: FFI types carry the optional serde derive (front ends without UniFFI)
@@ -251,10 +422,11 @@ jobs:
     needs: changes
     if: github.event_name != 'schedule'
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 2 # Fix-Proof below compares HEAD (PR merged into its base) with HEAD^1
           persist-credentials: false
       - name: Cache prebuilt macOS XCFramework + UniFFI bindings
         if: needs.changes.outputs.swift == 'true'
@@ -290,6 +462,28 @@ jobs:
       - name: Build & Test SwiftUI app (parallel + serial-defaults)
         if: needs.changes.outputs.swift == 'true'
         run: scripts/swift-test-split.sh
+      # Fix-Proof for Swift tests (docs/fix-proof.md): new/changed XCTest and Swift Testing tests run
+      # on the base with only the PR's test files laid over it (red) and on the head (green). The
+      # base reuses these bindings unless the PR changes the core; then it builds its own.
+      - name: Fix-Proof plan (new or changed Swift tests)
+        id: fp
+        if: github.event_name == 'pull_request' && needs.changes.outputs.swift == 'true'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 -I tools/fix_proof.py plan --base HEAD^1 --head HEAD --title "$TITLE" \
+            --out fix-proof/plan.json --github-output "$GITHUB_OUTPUT"
+      - name: Fix-Proof – Swift tests red on the base, green on the head
+        if: steps.fp.outputs.swift == 'true'
+        timeout-minutes: 30
+        run: python3 -I tools/fix_proof.py run --plan fix-proof/plan.json --lang swift --out fix-proof/swift.json --logs fix-proof/logs
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.fp.outputs.swift == 'true'
+        with:
+          name: fix-proof-swift
+          path: fix-proof/
+          retention-days: 30
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------------------
   # Linux port (GiroCrabLinux/, Qt 6 / QML).
