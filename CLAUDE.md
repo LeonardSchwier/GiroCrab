@@ -91,6 +91,10 @@ Internal code identifiers (module, function, test and file names) are exempt; `s
   run against a demo vault: `AppModel(options: LaunchOptions(arguments: ["--demo-seed"], environment: [:]))`,
   pattern in `Tests/GiroCrabUITests/SelectionLoadTests.swift`. Run them before pushing.
 - Tests, die `UserDefaults.standard` nutzen, tragen `// test: serial-defaults` (läuft seriell nach der parallelen Phase, `scripts/swift-test-split.sh`). Eigene Suites immer mit `\(UUID().uuidString)` (`scripts/lint-test-defaults.sh`).
+- **Fix-Proof** (CI job `fix-proof`, `tools/fix_proof.py`, `docs/fix-proof.md`): a `fix:` PR needs a Rust test that FAILS
+  on the base without the fix and passes with it. Before pushing: `python3 -I tools/fix_proof.py check --base upstream/main`.
+  A test that is also green without the fix proves nothing; rewrite it. Test through an interface that already existed:
+  a test that only compiles with the fix is weak proof. Untestable fix: `Fix-Proof: skip – <reason>` in the PR body.
 - Rust: `cargo test -q -p girocrab-core --lib <module>` for one module; whole `--lib` run ~10 s. It stays
   that fast only because unit tests skip `cipher_memory_security` (`cfg!(test)` in `Vault::apply_key`) and
   `.cargo/config.toml` builds SQLite with `SQLITE_DEFAULT_MEMSTATUS=0`: both make parallel test threads

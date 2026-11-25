@@ -171,6 +171,10 @@ To avoid two people building the same thing (it has happened, e.g. account group
 
 * **Keep PRs small and focused (one concern per PR):** Oversized PRs touching dozens of files or bundling multiple features and schema versions are automatically held for splitting. For larger features, split into (1) schema + core logic and (2) UI + tests.
 * CI runs `cargo fmt --check`, `cargo clippy`, `cargo test -p girocrab-core` and a Swift build.
+* CI also runs **Fix-Proof** ([docs/fix-proof.md](docs/fix-proof.md)): new or changed Rust tests run once without
+  your production change and once with it. A `fix:` PR needs at least one test that fails without the fix and
+  passes with it. Check before pushing: `python3 -I tools/fix_proof.py check --base upstream/main`. If a fix cannot
+  be tested automatically, write `Fix-Proof: skip – <reason>` in the PR body.
 * Work through the checklist below. Tick what applies, write "n/a: <why>" for the rest.
 * By contributing you agree to license your work under GPL-3.0-or-later.
 

@@ -118,6 +118,52 @@ jobs:
       - name: cargo audit
         run: cargo audit --deny warnings
 
+  # Fix-Proof (docs/fix-proof.md): every new or changed Rust test runs on the base WITHOUT the
+  # PR's production code (must fail) and on the PR (must pass). A `fix:` PR fails here unless at
+  # least one test proves it, or the PR body says `Fix-Proof: skip – <reason>`.
+  fix-proof:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2 # HEAD = the PR merged into its base, HEAD^1 = the base it is proven against
+          persist-credentials: false
+      - name: Plan (new or changed tests, fix or not, exemption)
+        id: plan
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          mkdir -p fix-proof
+          printf '%s' "$BODY" > "$RUNNER_TEMP/pr-body.md"
+          python3 -I tools/fix_proof.py plan --base HEAD^1 --head HEAD --title "$TITLE" \
+            --body-file "$RUNNER_TEMP/pr-body.md" --out fix-proof/plan.json --github-output "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Restores the cache main's `rust` job writes; never saves.
+      - if: steps.plan.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: rust
+          save-if: false
+      - name: Tests on the base (must fail) and on the PR (must pass)
+        if: steps.plan.outputs.rust == 'true'
+        run: python3 -I tools/fix_proof.py run --plan fix-proof/plan.json --out fix-proof/rust.json --logs fix-proof/logs
+      - name: Verdict
+        run: |
+          python3 -I tools/fix_proof.py verdict --plan fix-proof/plan.json --results fix-proof/rust.json \
+            --json fix-proof/fix-proof.json --summary "$GITHUB_STEP_SUMMARY" --enforce
+      - name: Upload result and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fix-proof
+          path: fix-proof/
+          retention-days: 30
+          if-no-files-found: ignore
+
   # `rust` and `swift` deliberately run in parallel and independently: a red
   # fmt/Clippy/Rust test run must not hide the Swift build, and vice versa.
   # The job names stay unchanged so existing required checks keep matching.
@@ -171,8 +217,8 @@ jobs:
         run: python3 -I GiroCrabLinux/scripts/i18n-report.py
       - name: Test String-Catalog-Merge-Driver
         run: python3 -m unittest scripts/test_xcstrings.py scripts/test_sync_docs.py scripts/test_coderabbit_flow.py
-      - name: Test AI provenance classifier
-        run: python3 -m unittest tools/test_export_ai_provenance.py
+      - name: Test AI provenance classifier and Fix-Proof (incl. a real red -> green run)
+        run: python3 -m unittest tools/test_export_ai_provenance.py tools/test_fix_proof.py
       - name: Test FNZ portal browser scripts
         run: node --test scripts/test-fnz-portal.cjs scripts/test-quirion-portal.cjs scripts/test-sharinbox-portal.cjs scripts/test-axashareplan-portal.cjs scripts/test-unioninvestment-portal.cjs scripts/test-berghauscie-portal.cjs scripts/test-schwaebisch-hall-portal.cjs scripts/test-advanzia-portal.cjs scripts/test-equateplus-linux.cjs scripts/test-advanzia-linux.cjs scripts/test-portal-cards-linux.cjs
       - name: FFI types carry the optional serde derive (front ends without UniFFI)

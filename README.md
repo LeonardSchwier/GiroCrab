@@ -646,6 +646,15 @@ GitHub at most every 15 minutes (no personal data). Details: [docs/banking-polic
 
 DE: **Sicherheitssperre für Bankverbindungen:** Enthält eine Version eine Sicherheitslücke oder einen schweren Fehler im Bankzugang, kann der Herausgeber eine signierte `banking-policy.json` veröffentlichen. Ältere Versionen kontaktieren dann keine Bank mehr, bis sie aktualisiert sind; Lesen und Exportieren bleiben möglich. Sobald aktiviert, lädt die App diese kleine Datei höchstens alle 15 Minuten von GitHub (ohne persönliche Daten). Details: [docs/banking-policy.md](docs/banking-policy.md).
 
+## 🧪 Fix-Proof: Jeder Fix wird bewiesen / Every fix is proven
+
+DE: Ein Regressionstest schützt nur, wenn er den behobenen Fehler wirklich erkennt, und das sieht man einem Test nicht an. Deshalb läuft jeder neue oder geänderte Rust-Test eines Pull Requests zweimal: auf dem Stand **ohne** die Änderung, wo er fehlschlagen muss, und **mit** ihr, wo er bestehen muss. Ein `fix:`-PR, bei dem kein Test diese Probe besteht, wird im CI-Check `fix-proof` rot. Das gilt für jeden Beitrag, gleich ob ein Mensch oder ein KI-Agent den Test geschrieben hat.
+
+EN: A regression test only protects the project if it actually catches the bug, and you cannot tell by looking at it. So every new or changed Rust test in a pull request runs twice: **without** the change, where it must fail, and **with** it, where it must pass. A `fix:` PR without such a test fails the `fix-proof` check, whoever wrote the test.
+
+→ **[docs/fix-proof.md](docs/fix-proof.md)**
+
+---
 ## 🤖 KI-Transparenz / AI Transparency
 
 DE: GiroCrab entsteht in hybrider Mensch-KI-Entwicklung und ist Living Lab des Forschungsprojekts *„AI-enabled Transparency of AI Use in Software Creation Processes“*. Jeder PR bekommt automatisch eine **AI Provenance & Transparency Card**. Echte Finanzdaten kommen nie in Prompts.
