@@ -148,11 +148,15 @@ To avoid two people building the same thing (it has happened, e.g. account group
    and merged on its own.
 4. **Link your PR** with `Closes #123` (or `Refs #123` if it is only part of it).
 5. **Let go if plans change.** If you can't continue, comment `/unassign` (or tell us on the issue) so it can be reassigned.
+6. **Use the shared words.** UI texts, code and issues use the terms in [docs/GLOSSARY.md](docs/GLOSSARY.md); a PR that
+   introduces a new term adds it there.
 
 ## Pull requests
 
-* Keep PRs focused; describe what and why.
-* CI runs `cargo fmt --check`, `cargo clippy`, `cargo test -p girocrab-core` and a Swift build.
+* Keep PRs focused; describe what and why. The PR template (`.github/pull_request_template.md`) has the sections.
+* CI runs `cargo fmt --check`, `cargo clippy`, `cargo test -p girocrab-core`, a Swift build, a secret scan and
+  **Fix-Proof**: every new or changed test also runs without your change; a `fix:` PR needs at least one test that
+  is red without the fix and green with it, or the check fails ([docs/fix-proof.md](docs/fix-proof.md)). All gates: [docs/quality-gates.md](docs/quality-gates.md).
 * Work through the checklist below. Tick what applies, write "n/a: <why>" for the rest.
 * By contributing you agree to license your work under GPL-3.0-or-later.
 
@@ -174,6 +178,9 @@ fehlende Angabe mit ⚠️.
 - [ ] **Dependencies and licences:** `scripts/check-third-party-notices.sh` passes, and `THIRD_PARTY_NOTICES.md` is updated in the same PR when `Cargo.toml`, `Cargo.lock` or `Package.swift` changed.
 - [ ] **Brand neutrality:** `scripts/lint-brand-names.sh` passes.
 - [ ] **New access:** new network, process or file access is named in the PR description.
+- [ ] **No secrets in commits:** no keys, tokens, real IBANs or browser captures (`.har`). CI scans every commit with
+  gitleaks (`.gitleaks.toml`); locally the pre-push hook does it when `gitleaks` is installed. / Keine Schlüssel,
+  Tokens, echten IBANs oder HAR-Mitschnitte in Commits.
 
 #### ⚡ Performance & Responsiveness (Pflicht / mandatory)
 
@@ -191,6 +198,37 @@ fehlende Angabe mit ⚠️.
 - [ ] **Swift tests and `UserDefaults`:** tests that use `UserDefaults.standard` carry `// test: serial-defaults` (run serially after the parallel phase, `scripts/swift-test-split.sh`); own suites always with `\(UUID().uuidString)` (`scripts/lint-test-defaults.sh`).
 - [ ] **Before pushing:** `cargo fmt --all`, `cargo clippy -q --workspace --all-targets -- -D warnings`, `scripts/lint-appmodel-internals.sh`.
 
+#### 🧪 Fix-Proof & Evidence (Pflicht / mandatory)
+
+- [ ] **Regression test red before the fix:** a `fix:` PR adds or changes a test that fails without the fix and
+  passes with it. Check it locally: `python3 -I tools/fix_proof.py check --base upstream/main` (`--swift` on a Mac).
+  A test that also passes without the fix proves nothing. If a fix cannot be tested automatically, say why in the PR
+  body: `Fix-Proof: skip – <reason>`. / Ein `fix:`-PR bringt einen Test mit, der ohne den Fix fehlschlägt und mit ihm
+  besteht.
+- [ ] **Prefer the strong proof:** test the fix through an interface that already existed (the calling function, an
+  integration test under `tests/`). A test that only compiles with the fix counts as weak proof (🟧 on the card).
+- [ ] **Evidence:** the PR body has a `### Evidence` section: claim → exact command → observed result. A check that
+  could not run (no Mac, no Qt, no bank account) is written down as **not run**, never as passed; "should work" is
+  not evidence. / Jede Behauptung mit Befehl und beobachtetem Ergebnis; nicht Gelaufenes heißt „nicht gelaufen“.
+- [ ] **Review:** say who checked the diff: a person, an independent agent run (a fresh session that gets a brief, not
+  the author's history) or `self-review – <reason>`.
+
+#### 🧯 Robustheit / Robustness
+
+For every change a user can reach / Für jede Änderung, die Nutzer erreichen können:
+
+- [ ] **Error paths:** every `Result` from the core is shown or logged (via `sanitize_report_text`), never dropped;
+  no `unwrap()`/`expect()` on data from a bank, a file or the user.
+- [ ] **Lifecycle:** the vault can be locked or swapped while a background job runs (`vaultOffMain` returns `nil`,
+  check `listGeneration` before publishing); a cancelled load is never the only refresh of a view.
+- [ ] **Boundaries:** empty account, no bookings, 0 €, negative and very large amounts (cents as integers), month and
+  year ends, leap days, time zones, foreign currencies, long or broken text (mojibake, `text.rs`).
+- [ ] **Concurrency:** two syncs, a sync during an edit, iCloud merge of the same row from two devices
+  (`vault/merge.rs`).
+- [ ] **Input from outside:** bank responses, imported files and paths are untrusted (size limits, traversal and
+  symlinks, formula injection in CSV exports).
+- [ ] **Platforms:** what is macOS-only has a sensible iOS/Linux/Windows path or is compiled out.
+
 #### 🤖 AI Provenance & Process Reflection
 
 PRs written with AI help carry two things (details and examples: [AI transparency](docs/ai-transparency.md)):
@@ -199,8 +237,13 @@ PRs written with AI help carry two things (details and examples: [AI transparenc
    * `AI-Orchestrator: <model>` is the model that plans and orchestrates the session, with a matching `Co-authored-by: <Model> <email>`.
    * `AI-Agent: <tool>` or `AI-Model: <model>` is the coding agent that wrote the code.
    * Optional: `Security-Check: <text>` and `Perf-Check: <text>`, with the same content as the bullets below. The card reads both places.
-2. **A `### 🤖 AI Process Reflection` block** at the end of the PR body with five bullets: `Human-Steering`, `AI-Agency`, `Review-Focus` and the mandatory **`Security-Check`** and **`Perf-Check`**:
+2. **A `### 🤖 AI Process Reflection` block** at the end of the PR body with five bullets: `Human-Steering`, `AI-Agency`, `Review-Focus` and the mandatory **`Security-Check`** and **`Perf-Check`**, plus `Review` and, when the PR taught something, `Process-Learning`:
    * **Security-Check:** what you checked for secrets and personal data (logs, `.sensitive()` redaction, new HTTP/process/file access, new or upgraded dependencies, `THIRD_PARTY_NOTICES.md`). "Nothing relevant: <why>" is a valid answer; an empty one is not.
    * **Perf-Check:** what you measured or ruled out (`offMain` for calls over ~16 ms, no `list_transactions` for counts or sums, `category_perf` numbers for changes on the category path). "No hot path touched: <why>" is a valid answer. Naming `category_perf` in the PR body is shown as a hint.
 
-   The card lists both in stage 4 "Verification & Audit" and in the reflection block. PRs that only have the three original bullets still render.
+   * **Review:** who checked the diff (see the checklist above). The card marks a missing answer with ⚠️.
+   * **Process-Learning** (optional): a trap this PR ran into and the rule, checklist item or lint that now prevents
+     it (`CLAUDE.md`, this file, `scripts/lint-*.sh`). A lint beats a sentence.
+
+   The card lists them in stage 4 "Verification & Audit" and in the reflection block, next to the Fix-Proof and
+   mutation results from CI. PRs that only have the three original bullets still render.

@@ -30,6 +30,7 @@ Rust core (`girocrab-core`, UniFFI) + SwiftUI app (`GiroCrabApp`). Root = this d
   `Recurring`, `Logos`, `Printing`; helper types in `AppModelTypes.swift`.
   An `AppModel+*.swift` file holds only `extension AppModel` blocks. Members the feature files share are internal
   but not for views: `scripts/lint-appmodel-internals.sh` (CI) lists them; add one there when you widen a `private`.
+- `tools/fix_proof.py` – Fix-Proof: new/changed tests red on the base without the fix, green on the head; mutation testing (`docs/fix-proof.md`, tests `tools/test_fix_proof.py`). All gates: `docs/quality-gates.md`; shared terms: `docs/GLOSSARY.md`; secret-scan rules: `.gitleaks.toml`
 - `GiroCrabApp/Sources/GiroCrabUI/RootView.swift` – top-level UI
 - `GiroCrabApp/Sources/GiroCrabUI/BookingListView.swift` – booking list
 - `GiroCrabApp/Sources/GiroCrabUI/ConnectionsUI.swift` – bank connections UI
@@ -39,6 +40,8 @@ Other UI files live in the same `GiroCrabUI/` dir. A view with its own design pa
 ## Builds
 - **Swift-only change** (only `GiroCrabApp/**/*.swift`): NEVER rebuild `girocrab-core` or run `./build-xcframework.sh`. Run only `swift build -q` (in `GiroCrabApp/`) or `xcodebuild -quiet`.
 - Rust change: `cargo check -q -p girocrab-core`; rebuild the xcframework only if the UniFFI API changed.
+- CI scans every commit for secrets (gitleaks, `.gitleaks.toml`; job `secrets`). Never commit HAR captures, tokens,
+  real IBANs or keys; test keys live under `Tests/` or `fixtures/`.
 - Before every push run `cargo fmt --all`: CI fails on `cargo fmt --check` and then skips the Swift job. Enable the hook once: `git config core.hooksPath .githooks`.
 - Always pass `-q`/`--quiet` to `cargo check`, `cargo test`, `xcodebuild`. If output is still long, pipe through `tail -n 40`.
 - Before pushing a PR (also Swift-only ones; CI runs these on every PR): `cargo fmt --all -- --check` and `cargo clippy -q --workspace --all-targets -- -D warnings`. After pushing, check `gh pr checks`.
@@ -68,6 +71,12 @@ Internal code identifiers (module, function, test and file names) are exempt; `s
 - For any file > 200 lines use `grep -n` or `Read` with `offset`/`limit`; never read it whole.
 
 ## Tests
+- **Fix-Proof (CI job `fix-proof`, blocks `fix:` PRs):** a fix comes with a test that FAILS on the base without the fix
+  and passes with it. Before pushing: `python3 -I tools/fix_proof.py check --base upstream/main` (`--swift` on a Mac).
+  A test that is also green without the fix proves nothing; rewrite it. Test through an interface that already
+  existed (calling function, `tests/` integration test): a test that only compiles with the fix is weak proof (🟧).
+  Untestable fix (log text, CI, real-bank timing): `Fix-Proof: skip – <reason>` in the PR body. Never weaken,
+  `#[ignore]` or delete a test to get green.
 - Swift: `cd GiroCrabApp && swift test -q --filter <Suite>`; whole suite ~30 s. `AppModel` tests
   run against a demo vault: `AppModel(options: LaunchOptions(arguments: ["--demo-seed"], environment: [:]))`,
   pattern in `Tests/GiroCrabUITests/SelectionLoadTests.swift`. Run them before pushing.
@@ -89,6 +98,8 @@ Internal code identifiers (module, function, test and file names) are exempt; `s
   `scripts/lint-vault-access.sh` enforces this in CI.
 - `vault.list_transactions` enriches every row in the filter (merchant, flow, sums); `limit`/`offset`
   only trim the result. Never call it for a count or a sum – add a SQL aggregate.
+- User-reachable changes go through the robustness checklist in `CONTRIBUTING.md` (error paths, vault locked/swapped,
+  boundaries such as 0 €/month ends/leap days, concurrent sync and iCloud merge, untrusted bank/file input).
 - An edit must either reload synchronously or declare what it invalidates (`rulesStale`,
   `dashboardStale`, `categoryRefreshTask`). A cancelled background load must never be the only
   thing that would have refreshed a view.
@@ -158,7 +169,7 @@ The PR card (`tools/export-ai-provenance.py`, `docs/ai-transparency.md`) reads o
   (the default for the maintainer's sessions), otherwise the model the contributor names (`ChatGPT`, `Claude`,
   `Cursor`, `GitHub Copilot`, …). A coding agent that writes code adds `AI-Agent: <tool>` or `AI-Model: <model>`.
   Stage 1+2 (framing/orchestration) = `AI-Orchestrator`; stage 3 (code generation) = `Co-authored-by`, `AI-Agent`, `AI-Model`.
-- Every AI-authored PR body ends with this section (German is fine; the five labels stay as written):
+- Every AI-authored PR body ends with this section (German is fine; the labels stay as written):
   ```
   ### 🤖 AI Process Reflection
   - **Human-Steering:** what the human specified or decided (architecture, security, scope)
@@ -166,6 +177,8 @@ The PR card (`tools/export-ai-provenance.py`, `docs/ai-transparency.md`) reads o
   - **Review-Focus:** where a human reviewer should look first
   - **Security-Check:** what was checked for secrets/personal data (logs, `.sensitive()` redaction, new network/process/file access, dependencies + `THIRD_PARTY_NOTICES.md`); "Nothing relevant: <why>" is valid
   - **Perf-Check:** what was measured or ruled out (`offMain` for calls over ~16 ms, no `list_transactions` for counts/sums, `category_perf` numbers); "No hot path touched: <why>" is valid
+  - **Review:** who checked the diff: a person, an independent agent run (fresh session with a brief, not this history) or `self-review – <reason>`
+  - **Process-Learning:** (optional) the trap this PR found and the rule/lint that now prevents it
   ```
 - Optional trailers `Security-Check:` / `Perf-Check:` carry the same content as the bullets; the card shows both in stage 4. Before pushing run the checks in the PR checklist of `CONTRIBUTING.md`.
 - This is a self-report, shown on the card as unverified. Never put real financial data, IBANs or secrets in it.
@@ -177,6 +190,11 @@ The PR card (`tools/export-ai-provenance.py`, `docs/ai-transparency.md`) reads o
     commit in their contributor graph.
 
 ## Workflow
+- **Evidence, not confidence.** Every claim in the PR body goes in `### Evidence` as claim → exact command → observed
+  result (template: `.github/pull_request_template.md`). A check you could not run (Swift/iOS/Qt in a Linux container,
+  no bank account) is written as "nicht gelaufen", never as passed; "should work" is not evidence.
+- **Process learning:** when you hit a trap these rules did not warn about, add the rule here, a checklist item in
+  `CONTRIBUTING.md` or (best) a lint in `scripts/` in the same PR, and name it under `Process-Learning:`.
 - **Verify locally first, never block on CI.** Targeted `cargo test`, `swift test`, `clippy`, `cargo fmt --all -- --check`
   and the `scripts/lint-*.sh` checks run locally before the push (together well under a minute for a focused change).
   After the PR is open do NOT sit in the session for 10–15 min with `gh pr checks --watch` (and never pipe a `--watch` to `tail`).

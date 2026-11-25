@@ -45,6 +45,13 @@
 >
 > *In our first 7 days: 265+ stars, 280+ merged pull requests, 15 contributors with commits (as of 2026-11-16, from GitHub). No Swift or Rust experience needed – turn your own feature wish into a pull request with Claude Code, Codex or Cursor and [`CLAUDE.md`](CLAUDE.md). See the [step-by-step guide](https://girocrab.de/girocrab_mitbau_anleitung.html) and [CONTRIBUTING.md](CONTRIBUTING.md).*
 
+
+> ### 🧪 Jeder Fix wird bewiesen · Every fix is proven
+> Bei GiroCrab prüft die CI jeden Bugfix maschinell: Der neue Test muss **ohne den Fix rot** und **mit dem Fix grün** sein (**Fix-Proof**). Ein `fix:`-PR, dessen Test den Fehler nicht fängt, bekommt einen roten Check. Dazu **Mutation Testing** der geänderten Rust-Funktionen und ein **Secret-Scan** jedes Commits. Das Ergebnis steht auf der Card jedes Pull Requests, auch bei Code von KI-Agenten.
+> 👉 [**So funktioniert Fix-Proof**](docs/fix-proof.md) · [Alle Qualitäts-Gates](docs/quality-gates.md)
+>
+> *CI proves every bug fix: the new test must be **red without the fix** and **green with it**. A `fix:` PR whose test does not catch the bug gets a red check. Plus mutation testing of the changed Rust functions and a secret scan of every commit, shown on every PR's card – including code written by AI agents.*
+
 ---
 
 ## 🇩🇪 Deutsch
@@ -552,6 +559,24 @@ they are updated – reading and exporting keep working. Once activated, the app
 GitHub at most every 15 minutes (no personal data). Details: [docs/banking-policy.md](docs/banking-policy.md).
 
 DE: **Sicherheitssperre für Bankverbindungen:** Enthält eine Version eine Sicherheitslücke oder einen schweren Fehler im Bankzugang, kann der Herausgeber eine signierte `banking-policy.json` veröffentlichen. Ältere Versionen kontaktieren dann keine Bank mehr, bis sie aktualisiert sind; Lesen und Exportieren bleiben möglich. Sobald aktiviert, lädt die App diese kleine Datei höchstens alle 15 Minuten von GitHub (ohne persönliche Daten). Details: [docs/banking-policy.md](docs/banking-policy.md).
+
+## 🧪 Qualität: Belege statt Beteuerung / Quality: evidence, not claims
+
+DE: Ein Regressionstest schützt das Projekt, solange es existiert, aber nur, wenn er den Fehler wirklich fängt. Einem Test sieht man das nicht an: Er kann grün sein und trotzdem am Fehler vorbeiprüfen. Deshalb lässt GiroCrab jeden neuen oder geänderten Test eines Pull Requests **zweimal** laufen: auf dem Stand **ohne** den Fix (dort muss er fehlschlagen) und **mit** dem Fix (dort muss er bestehen). Erst dann gilt ein Fix als bewiesen. So wird aus „Test hinzugefügt“ ein nachprüfbarer Lauf, und ein Fehler, der einmal behoben ist, kommt nicht unbemerkt zurück. Das gilt für jeden Beitrag, egal ob er von Menschen oder von KI-Agenten geschrieben wurde: Ein Agent kann behaupten, dass sein Test den Fix beweist; vortäuschen, dass der Test ohne den Fix rot ist, kann er nicht.
+
+| Gate | Prüft | Durchsetzung |
+|---|---|---|
+| 🧪 **Fix-Proof** | jeder neue/geänderte Test: ohne Fix rot, mit Fix grün; `fix:`-PRs ohne solchen Test sind rot | CI (`fix-proof`), [docs/fix-proof.md](docs/fix-proof.md) |
+| 🧬 **Mutation Testing** | würden die Tests andere kleine Fehler in den geänderten Rust-Funktionen bemerken? | CI (`mutants`), Hinweis |
+| 🔑 **Secret-Scan** | keine Schlüssel, Tokens, Browser-Mitschnitte (HAR) in Commits | CI (`secrets`, wöchentlich ganze Historie), Pre-push-Hook |
+| 📋 **Evidence** | jede Behauptung im PR mit Befehl und Ergebnis; nicht Gelaufenes heißt „nicht gelaufen“ | PR-Vorlage, PR-Card |
+| 👀 **Review** | wer hat den Diff geprüft (Person, unabhängiger Agentenlauf oder begründetes Self-Review) | PR-Card |
+
+Vorab an drei gemergten Fixes erprobt: In einem Sicherheits-Audit-PR waren 18 von 25 neuen Rust-Tests ohne den Fix rot, einer war auch ohne den Fix grün. Er sichert vorhandenes Verhalten ab, beweist aber nichts über den Fix, und das war vorher nicht zu sehen ([Belege](docs/fix-proof.md#belege-echte-fixes-aus-der-historie)).
+
+Dazu kommen Formatierung, Clippy, über 1.400 Rust-Tests und die Swift-Suite, `cargo audit` und gut ein Dutzend projektspezifische Prüfskripte (Lints, Kataloge, Lizenzen, FinTS-Produkt-ID). → **[docs/quality-gates.md](docs/quality-gates.md)** · Glossar: [docs/GLOSSARY.md](docs/GLOSSARY.md)
+
+EN: A regression test protects the project for as long as it exists, but only if it actually catches the bug, and you cannot tell that by looking at it. So every new or changed test in a pull request runs **twice**: on the code **without** the fix (it must fail) and **with** the fix (it must pass). Only then is a fix proven. "Added a test" becomes a recorded run, for every contribution, human or AI-written. Plus mutation testing, secret scanning, an evidence block (claim → command → result) and a visible review statement on every PR card.
 
 ## 🤖 KI-Transparenz / AI Transparency
 
