@@ -2,6 +2,7 @@
 import importlib.util
 import pathlib
 import copy
+import json
 import unittest
 from unittest import mock
 
@@ -125,7 +126,8 @@ class Stage4(unittest.TestCase):
 
     def test_missing_flagged_for_ai_prs_only(self):
         refl = prov.parse_reflection("", [])
-        self.assertEqual(sum("fehlt" in e for e in self.stage4(refl)[2]), 2)
+        # Security-Check, Perf-Check and Review (who checked the diff) are expected from AI PRs
+        self.assertEqual(sum("fehlt" in e for e in self.stage4(refl)[2]), 3)
         self.assertEqual(sum("fehlt" in e for e in self.stage4(refl, involved=False)[2]), 0)
 
     def test_stage4_tolerates_old_reflection_without_new_keys(self):
@@ -154,6 +156,102 @@ class Stage4(unittest.TestCase):
         f = self.feats({"present": True, "security_check": ["x"]})
         f["tests"]["tests_added"] = 2
         self.assertTrue(prov.stages(f)[3][1])
+
+
+class FixProofOnCard(unittest.TestCase):
+    """Fix-Proof / mutation results come from CI artifacts written by PR code: only enums and
+    counts are taken, and a PR that edits the verifier never earns the hard-evidence ✅."""
+
+    def feats(self, raw=None, paths=("girocrab-core/src/a.rs",), title="fix: a", mutants=None, refl=None):
+        f = Stage4.feats(Stage4(), refl or {"present": False})
+        f["fix_proof"] = prov.fix_proof_features(raw, list(paths), title)
+        f["mutants"] = prov.mutants_features(mutants)
+        return f
+
+    PROVEN = {"verdict": "proven", "tests_total": 2, "exempt": None,
+              "counts": {"proven": 1, "not_red": 1, "proven_build": 0}}
+
+    def test_proven_is_hard_evidence(self):
+        name, ok, ev = prov.stages(self.feats(self.PROVEN))[3]
+        self.assertTrue(ok)
+        self.assertTrue(any("1 Test(s) ohne Fix rot, mit Fix grün" in e for e in ev))
+
+    def test_verifier_change_is_shown_but_not_counted(self):
+        f = self.feats(self.PROVEN, paths=("tools/fix_proof.py", "girocrab-core/src/a.rs"))
+        _, ok, ev = prov.stages(f)[3]
+        self.assertFalse(ok)
+        self.assertTrue(any("PR ändert den Prüfer" in e for e in ev))
+
+    def test_failures_and_pending(self):
+        for raw, needle in (({"verdict": "not_red", "counts": {"not_red": 2}}, "auch ohne Fix grün"),
+                            ({"verdict": "missing", "counts": {}}, "ohne neuen oder geänderten Test"),
+                            ({"verdict": "skipped", "counts": {}, "exempt": "x"}, "Ausnahme begründet"),
+                            (None, "steht noch aus")):
+            _, ok, ev = prov.stages(self.feats(raw))[3]
+            self.assertFalse(ok, needle)
+            self.assertTrue(any(needle in e for e in ev), (needle, ev))
+
+    def test_untrusted_json_is_reduced_to_enums_and_counts(self):
+        raw = {"verdict": "proven", "counts": {"proven": "<script>", "not_red": -3, "proven_build": True},
+               "tests_total": 10 ** 9, "tests": [{"path": "@evil"}], "exempt": "free text"}
+        fp = prov.fix_proof_features(raw, [], "fix: x")
+        self.assertEqual((fp["proven"], fp["not_red"], fp["weak"], fp["tests"], fp["exempt"]), (0, 0, 0, 0, True))
+        self.assertNotIn("@evil", json.dumps(fp))
+        self.assertFalse(prov.fix_proof_features({"verdict": "totally proven"}, [], "fix: x")["available"])
+
+    def test_no_fix_no_pending_line(self):
+        _, _, ev = prov.stages(self.feats(None, title="feat: a"))[3]
+        self.assertFalse(any("Fix-Proof" in e for e in ev))
+
+    def test_mutants_line(self):
+        m = {"status": "ran", "total": 30, "tested": 12, "caught": 9, "missed": 2, "timeout": 1, "unviable": 0,
+             "sampled": True}
+        _, _, ev = prov.stages(self.feats(self.PROVEN, mutants=m))[3]
+        self.assertIn("🧬 Mutation Testing (CI): 10/12 Mutanten erkannt (Stichprobe)", ev)
+
+    def test_review_and_process_learning(self):
+        refl = prov.parse_reflection("### 🤖 AI Process Reflection\n- **Review:** self-review – kleiner Diff\n"
+                                     "- **Process-Learning:** Lint ergänzt", [])
+        self.assertEqual(refl["review"], ["self-review – kleiner Diff"])
+        self.assertEqual(refl["process_learning"], ["Lint ergänzt"])
+        _, _, ev = prov.stages(self.feats(self.PROVEN, refl=refl))[3]
+        self.assertIn("👀 Review: self-review – kleiner Diff (Selbstauskunft)", ev)
+        self.assertEqual(prov.parse_reflection("", [("Review", "Gemini, unabhängiger Lauf")])["review"],
+                         ["Gemini, unabhängiger Lauf"])
+
+
+class Evidence(unittest.TestCase):
+    BODY = """## Zusammenfassung
+x
+### Evidence
+| Behauptung | Befehl | Ergebnis |
+|---|---|---|
+| Core-Tests grün | `cargo test -q -p girocrab-core --lib` | 1410 passed |
+| iOS baut | `xcodebuild -quiet` | nicht gelaufen (kein Mac) |
+- Fix bewiesen: `python3 -I tools/fix_proof.py check` → rot → grün
+
+### 🤖 AI Process Reflection
+- **Review-Focus:** x
+"""
+
+    def test_rows_and_not_run(self):
+        self.assertEqual(prov.parse_evidence(self.BODY), {"present": True, "items": 3, "not_run": 1})
+
+    def test_absent(self):
+        self.assertEqual(prov.parse_evidence("## Tests\n- ok"), {"present": False, "items": 0, "not_run": 0})
+
+    def test_unfilled_template_counts_nothing(self):
+        import pathlib
+        tpl = (pathlib.Path(__file__).parent.parent / ".github" / "pull_request_template.md").read_text()
+        body = prov.HTML_COMMENT_RE.sub("", tpl)
+        self.assertEqual(prov.parse_evidence(body)["items"], 0)
+        refl = prov.parse_reflection(body, [])
+        self.assertFalse(any(refl[k] for k in ("human_steering", "review", "security_check", "process_learning")))
+
+    def test_on_card(self):
+        f = Stage4.feats(Stage4(), {"present": False})
+        f["evidence"] = prov.parse_evidence(self.BODY)
+        self.assertIn("📋 Evidence: 3 Beleg(e), davon 1 nicht gelaufen (Selbstauskunft)", prov.stages(f)[3][2])
 
 
 class Stage2(Stage4):

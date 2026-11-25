@@ -28,11 +28,14 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import urllib.request
+import zipfile
 from collections import Counter
 from datetime import datetime
 
-SCHEMA_VERSION = 3  # 2: ai.roles, reflection; 3: reflection.security_check/perf_check/perf_benchmark_mentioned (older records lack them)
+SCHEMA_VERSION = 4  # 2: ai.roles, reflection; 3: reflection.security_check/perf_check/perf_benchmark_mentioned;
+# 4: fix_proof, mutants, evidence, reflection.review/process_learning (older records lack them)
 MARKER = "<!-- girocrab-ai-transparency -->"
 
 # --------------------------------------------------------------------------- rules
@@ -71,12 +74,24 @@ ORCH_PHRASE_RE = re.compile(
 # Provenance trailers defined in docs/ai-transparency.md (+ common conventions).
 TRAILER_RE = re.compile(
     r"^(Co-Authored-By|AI-Orchestrator|AI-Agent|AI-Model|AI-Assisted|Assisted-By|Generated-By|"
-    r"Human-Steering|AI-Agency|Review-Focus|Security-Check|Perf-Check|Verification|AI-Data-Policy)\s*:\s*(.+?)\s*$", re.I | re.M)
+    r"Human-Steering|AI-Agency|Review-Focus|Security-Check|Perf-Check|Verification|AI-Data-Policy|Review|"
+    r"Process-Learning|Fix-Proof)\s*:\s*(.+?)\s*$", re.I | re.M)
 FOOTER_RE = re.compile(r"Generated with \[?(Claude Code|[\w .-]+?)\]?\(", re.I)
 PERF_BENCH_RE = re.compile(r"\bcategory_perf\b", re.I)
 REFLECTION_HEAD_RE = re.compile(r"^#{1,6}\s*(?:🤖\s*)?AI Process Reflection\b.*$", re.I | re.M)
 REFLECTION_ITEM_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?\**(Human-Steering|AI-Agency|Review-Focus|Security-Check|Perf-Check)\s*:\**\s*(.+?)\s*$", re.I | re.M)
+    r"^[ \t]*(?:[-*][ \t]*)?\**(Human-Steering|AI-Agency|Review-Focus|Security-Check|Perf-Check|Review|Process-Learning)"
+    r"[ \t]*:\**[ \t]*(?![*\s]*$)(\S.*?)[ \t]*$", re.I | re.M)  # [ \t], not \s: an empty item must not take the next line
+# `### Evidence` (or Belege/Nachweise): one row or bullet per claim -> command -> observed result.
+EVIDENCE_HEAD_RE = re.compile(r"^#{1,6}\s*(?:\W+\s*)?(Evidence|Belege|Nachweise?)\b.*$", re.I | re.M)
+EVIDENCE_NOT_RUN_RE = re.compile(r"nicht gelaufen|nicht ausgeführt|not run|skipped|übersprungen|blockiert|blocked", re.I)
+FIX_TITLE_RE = re.compile(r"^\s*(fix|bugfix|hotfix)(\([^)]*\))?!?\s*:", re.I)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# Fix-Proof telemetry (docs/fix-proof.md) is produced by PR code in CI: a PR that changes the
+# verifier gets its result shown but not counted as evidence.
+FIX_PROOF_VERIFIER = ("tools/fix_proof.py", ".github/workflows/ci.yml")
+FIX_PROOF_VERDICTS = ("proven", "proven_weak", "not_red", "missing", "not_run", "skipped", "not_applicable", "info")
+FIX_PROOF_STATUSES = ("proven", "proven_build", "proven_timeout", "not_red", "head_failed", "not_run")
 
 LAYERS = [  # first match wins
     ("legacy", r"^(cashcrab-core|CashCrabApp)/"),
@@ -162,7 +177,8 @@ def parse_reflection(body, trailers):
     "ai_agency": [...], "review_focus": [...], "security_check": [...], "perf_check": [...]}.
     Sources: the `### 🤖 AI Process Reflection`
     section of the PR body and the trailers of the commits/PR body. Self-reported, unverified."""
-    out = {"human_steering": [], "ai_agency": [], "review_focus": [], "security_check": [], "perf_check": []}
+    out = {"human_steering": [], "ai_agency": [], "review_focus": [], "security_check": [], "perf_check": [],
+           "review": [], "process_learning": []}
     section = False
     m = REFLECTION_HEAD_RE.search(body or "")
     if m:
@@ -182,6 +198,60 @@ def parse_reflection(body, trailers):
     bench = bool(PERF_BENCH_RE.search(body or ""))
     return {"present": section or any(out.values()), "section": section,
             "perf_benchmark_mentioned": bench, **out}
+
+
+def parse_evidence(body):
+    """`### Evidence` section: claims with the command run and the observed result (self-report).
+    -> {"present", "items", "not_run"}; counts only, the text stays in the PR body."""
+    m = EVIDENCE_HEAD_RE.search(body or "")
+    if not m:
+        return {"present": False, "items": 0, "not_run": 0}
+    rest = body[m.end():]
+    nxt = re.search(r"^#{1,6}\s", rest, re.M)
+    rest = rest[:nxt.start()] if nxt else rest
+    items = []
+    for line in rest.splitlines():
+        s = line.strip()
+        if s.startswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c) or not any(cells):
+                continue  # separator row
+            if items == [] and any(re.fullmatch(r"(?i)(behauptung|claim|befehl|command|ergebnis|result|"
+                                                r"aussage|check|prüfung)", c) for c in cells):
+                continue  # header row
+            if cells and cells[-1]:  # a template row without a result is not evidence
+                items.append(s)
+        elif re.match(r"^[-*]\s+\S", s):
+            items.append(s)
+    return {"present": bool(items), "items": len(items),
+            "not_run": sum(bool(EVIDENCE_NOT_RUN_RE.search(i)) for i in items)}
+
+
+def _int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 100_000 else 0
+
+
+def fix_proof_features(raw, paths, title):
+    """Fix-Proof result (CI artifact `fix-proof`, untrusted JSON) -> enums and counts only."""
+    is_fix = bool(FIX_TITLE_RE.search(title or ""))
+    verifier_changed = any(p in FIX_PROOF_VERIFIER for p in paths)
+    if not isinstance(raw, dict) or raw.get("verdict") not in FIX_PROOF_VERDICTS:
+        return {"available": False, "is_fix": is_fix, "verifier_changed": verifier_changed}
+    counts = raw.get("counts") if isinstance(raw.get("counts"), dict) else {}
+    c = {k: _int(counts.get(k)) for k in FIX_PROOF_STATUSES}
+    return {"available": True, "is_fix": is_fix, "verifier_changed": verifier_changed,
+            "trusted": not verifier_changed, "verdict": raw["verdict"],
+            "exempt": bool(raw.get("exempt")), "tests": _int(raw.get("tests_total")),
+            "proven": c["proven"], "weak": c["proven_build"] + c["proven_timeout"],
+            "not_red": c["not_red"], "head_failed": c["head_failed"], "not_run": c["not_run"]}
+
+
+def mutants_features(raw):
+    if not isinstance(raw, dict) or raw.get("status") not in ("ran", "timeout", "no_mutants", "skipped",
+                                                              "no_tool", "error"):
+        return {"available": False}
+    return {"available": True, "status": raw["status"], "sampled": bool(raw.get("sampled")),
+            **{k: _int(raw.get(k)) for k in ("total", "tested", "caught", "missed", "timeout", "unviable")}}
 
 
 def is_bot(actor):
@@ -229,7 +299,7 @@ def repo_slug(explicit=None):
 
 
 PR_FIELDS = """
-  number title url state isDraft createdAt mergedAt closedAt headRefName baseRefName
+  number title url state isDraft createdAt mergedAt closedAt headRefName headRefOid baseRefName
   isCrossRepository additions deletions changedFiles body
   author { login }
   labels(first: 20) { nodes { name } }
@@ -289,9 +359,12 @@ def local_patch_for_pr(pr):
 
 
 # --------------------------------------------------------------------------- PR features
-def pr_features(pr, patch=None, pseudo=None):
+def pr_features(pr, patch=None, pseudo=None, ci=None):
+    """`ci`: {"fix-proof": dict, "fix-proof-mutants": dict} from the PR's CI run (or None)."""
     pseudo = pseudo or (lambda x: x)
-    body = pr.get("body") or ""
+    ci = ci or {}
+    # HTML comments are template hints (.github/pull_request_template.md), not statements
+    body = HTML_COMMENT_RE.sub("", pr.get("body") or "")
     author = (pr.get("author") or {}).get("login") or "ghost"
     commits = [n["commit"] for n in pr["commits"]["nodes"]]
     paths = [f["path"] for f in pr["files"]["nodes"]]
@@ -372,7 +445,41 @@ def pr_features(pr, patch=None, pseudo=None):
                      "human_steering_signal": bool(reviews or comments or discussed_issues or steering_trailers
                                                    or DECISION_SECTION_RE.search(body))},
         "verification": {"trailers": verification_trailers},
+        "evidence": parse_evidence(body),
+        "fix_proof": fix_proof_features(ci.get("fix-proof"), paths, pr.get("title")),
+        "mutants": mutants_features(ci.get("fix-proof-mutants")),
     }
+
+
+def fix_proof_items(f):
+    """Stage-4 lines for Fix-Proof and mutation testing (hard telemetry from CI)."""
+    fp, items, hard = f.get("fix_proof") or {}, [], False
+    if fp.get("available"):
+        v = fp["verdict"]
+        note = " – ⚠️ PR ändert den Prüfer, kein Beleg" if not fp.get("trusted") else ""
+        if v == "proven":
+            items.append(f"🧪 Fix-Proof (CI): {fp['proven']} Test(s) ohne Fix rot, mit Fix grün{note}")
+            hard = fp.get("trusted", False)
+        elif v == "proven_weak":
+            items.append(f"🧪 Fix-Proof (CI): {fp['weak']} Test(s) ohne Fix nicht baubar, mit Fix grün (schwacher Beleg){note}")
+        elif v == "not_red":
+            items.append(f"🧪 Fix-Proof (CI): ❌ {fp['not_red']} Test(s) auch ohne Fix grün – beweisen den Fix nicht")
+        elif v == "missing":
+            items.append("🧪 Fix-Proof (CI): ❌ Fix ohne neuen oder geänderten Test")
+        elif v == "skipped":
+            items.append("🧪 Fix-Proof: Ausnahme begründet (`Fix-Proof: skip` im PR-Body)")
+        elif v == "not_run":
+            items.append("🧪 Fix-Proof (CI): ⚪️ Tests nicht gelaufen")
+        elif v == "info" and fp.get("tests"):
+            items.append(f"🧪 Fix-Proof (CI): {fp['tests']} neue/geänderte Test(s), keiner ohne die Änderung rot")
+    elif fp.get("is_fix"):
+        items.append("🧪 Fix-Proof: Ergebnis steht noch aus (CI-Job `fix-proof`)")
+    m = f.get("mutants") or {}
+    if m.get("available") and m["status"] in ("ran", "timeout"):
+        detected = m["caught"] + m["timeout"]
+        items.append(f"🧬 Mutation Testing (CI): {detected}/{detected + m['missed']} Mutanten erkannt"
+                     + (" (Stichprobe)" if m["sampled"] else ""))
+    return items, hard
 
 
 def stages(f):
@@ -425,8 +532,18 @@ def stages(f):
     if t["pr_body_test_section"]:
         ver.append("Test-Sektion im PR-Body")
     ver += f["verification"]["trailers"][:3]
+    fp_items, fp_hard = fix_proof_items(f)
+    ver += fp_items
     ver.append("CI: fmt, clippy -D warnings, cargo test, swift build")
-    ok4 = bool(len(ver) > 1)  # self-reported checks below are shown but never set ✅
+    ok4 = bool(len(ver) > 1 + len(fp_items)) or fp_hard  # self-reported checks below are shown but never set ✅
+    ev = f.get("evidence") or {}
+    if ev.get("present"):
+        ver.append(f"📋 Evidence: {ev['items']} Beleg(e)" + (f", davon {ev['not_run']} nicht gelaufen" if ev["not_run"] else "")
+                   + " (Selbstauskunft)")
+    if refl.get("review"):
+        ver.append("👀 Review: " + "; ".join(refl["review"][:2]) + " (Selbstauskunft)")
+    elif ai["involved"]:
+        ver.append("👀 Review: ⚠️ fehlt (wer hat den Diff geprüft? `Review:`)")
     for label, key in (("🔐 Security-Check", "security_check"), ("⚡ Perf-Check", "perf_check")):
         if refl.get(key):
             item = f"{label} dokumentiert (Selbstauskunft)"
@@ -493,7 +610,8 @@ def render_card(f, repo="GiroCrab/GiroCrab", audit=None):
         lines += ["", "### 🤖 AI Process Reflection <sub>(Selbstauskunft der KI/des Autors, ungeprüft)</sub>"]
         for label, key in (("Human-Steering", "human_steering"), ("AI-Agency", "ai_agency"),
                            ("Review-Focus", "review_focus"), ("Security-Check", "security_check"),
-                           ("Perf-Check", "perf_check")):
+                           ("Perf-Check", "perf_check"), ("Review", "review"),
+                           ("Process-Learning", "process_learning")):
             if refl.get(key):
                 lines.append(f"- **{label}:** " + evidence_cell(refl[key]))
             elif key == "perf_check" and refl.get("perf_benchmark_mentioned"):
@@ -510,7 +628,8 @@ def render_card(f, repo="GiroCrab/GiroCrab", audit=None):
                   "erhielt nur bereinigte Metadaten, ist unverbindlich und kann irren.</sub>"]
     lines += [
         "",
-        "<sub>Ebene 1 (Telemetrie) ist deterministisch aus Commits, Trailern, PR-Body und Dateipfaden erzeugt; "
+        "<sub>Ebene 1 (Telemetrie) ist deterministisch aus Commits, Trailern, PR-Body, Dateipfaden und CI-Ergebnissen "
+        "([Fix-Proof](https://github.com/" + repo + "/blob/main/docs/fix-proof.md)) erzeugt; "
         "Ebene 3 (Meta-Audit) ist optional und sieht nie Diffs. Format & Taxonomie: [docs/ai-transparency.md](https://github.com/" + repo + "/blob/main/docs/ai-transparency.md). "
         "Ergänzungen bitte als Git-Trailer (`AI-Orchestrator:`, `AI-Model:`, `Human-Steering:`, `Verification:`).</sub>",
         "",
@@ -762,11 +881,49 @@ def cmd_export(a):
     summarize(prs, commits)
 
 
+CI_ARTIFACTS = {"fix-proof": "fix-proof.json", "fix-proof-mutants": "mutants.json"}
+MAX_ARTIFACT_BYTES = 2_000_000
+
+
+def fetch_ci_results(repo, head_sha):
+    """JSON results of the newest CI run for the PR head: {artifact name: parsed JSON}.
+    Data only (the files are written by PR code); any failure -> {} and the card says 'pending'."""
+    out = {}
+    if not head_sha:
+        return out
+    try:
+        runs = json.loads(run(["gh", "api", f"repos/{repo}/actions/runs?head_sha={head_sha}&per_page=30"]))
+        runs = [r for r in runs.get("workflow_runs", []) if r.get("path", "").endswith("workflows/ci.yml")]
+        for r in sorted(runs, key=lambda r: r.get("created_at", ""), reverse=True)[:2]:
+            arts = json.loads(run(["gh", "api", f"repos/{repo}/actions/runs/{r['id']}/artifacts?per_page=100"]))
+            for art in arts.get("artifacts", []):
+                name = art.get("name")
+                if name not in CI_ARTIFACTS or name in out or art.get("expired") \
+                        or art.get("size_in_bytes", 0) > MAX_ARTIFACT_BYTES:
+                    continue
+                data = subprocess.run(["gh", "api", f"repos/{repo}/actions/artifacts/{art['id']}/zip"],
+                                      capture_output=True, timeout=60)
+                if data.returncode != 0 or len(data.stdout) > MAX_ARTIFACT_BYTES:
+                    continue
+                with tempfile.TemporaryFile() as tmp:
+                    tmp.write(data.stdout)
+                    tmp.seek(0)
+                    with zipfile.ZipFile(tmp) as z:
+                        member = next((n for n in z.namelist() if n.rsplit("/", 1)[-1] == CI_ARTIFACTS[name]), None)
+                        if member and z.getinfo(member).file_size <= MAX_ARTIFACT_BYTES:
+                            out[name] = json.loads(z.read(member).decode("utf-8"))
+            if out:
+                break
+    except (RuntimeError, ValueError, OSError, zipfile.BadZipFile, subprocess.TimeoutExpired) as err:
+        print(f"CI results not available: {err}", file=sys.stderr)
+    return out
+
+
 def cmd_card(a):
     repo = repo_slug(a.repo)
     pr = fetch_pr(repo, a.pr)
     patch = run(["gh", "pr", "diff", str(a.pr), "-R", repo], check=False)  # None if too large
-    f = pr_features(pr, patch)
+    f = pr_features(pr, patch, ci=fetch_ci_results(repo, pr.get("headRefOid")))
     card = render_card(f, repo, meta_audit(f, pr, no_llm=a.no_llm))
     if a.out:
         open(a.out, "w", encoding="utf-8").write(card)

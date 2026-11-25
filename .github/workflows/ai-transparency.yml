@@ -9,35 +9,59 @@ name: AI Transparency
 # and reads the PR (title, body, commits, file paths) through the GitHub API as plain data.
 # The classifier therefore always comes from the base branch: a PR cannot change how its own
 # provenance is assessed. Changes to this file take effect once merged.
+#
+# `workflow_run` rebuilds the card when CI has finished, so the Fix-Proof and mutation results
+# (CI artifacts, docs/fix-proof.md) appear on it. It also runs the default branch's code only;
+# the artifacts are written by PR code and are read as data: enums and counts, nothing else.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 permissions:
   contents: read
   pull-requests: write # sticky PR comment (issues API on a PR needs this)
   issues: read
+  actions: read # Fix-Proof results: artifacts of the PR's CI run
   models: read # GitHub Models fallback for the layer-3 meta-audit
 
 concurrency:
-  group: ai-transparency-${{ github.event.pull_request.number }}
+  group: ai-transparency-${{ github.event.pull_request.number || github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 
 jobs:
   card:
+    if: github.event_name == 'pull_request_target' || github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      PR: ${{ github.event.pull_request.number }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # Trusted base commit, never the PR head.
-          ref: ${{ github.event.pull_request.base.sha }}
+          # Trusted code only: the PR's base commit, or the default branch for workflow_run.
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           sparse-checkout: tools
           persist-credentials: false
 
+      - name: Which PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
+          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Fork PRs have no `pull_requests` in the workflow_run payload: find the open PR by its head.
+          if [ -z "$NUMBER" ] && [ -n "$HEAD_BRANCH" ]; then
+            NUMBER=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f head="$HEAD_OWNER:$HEAD_BRANCH" \
+              -q '[.[] | select(.head.sha == env.HEAD_SHA)][0].number // empty')
+          fi
+          case "$NUMBER" in ''|*[!0-9]*) echo "No open PR for this run."; exit 0 ;; esac
+          echo "PR=$NUMBER" >> "$GITHUB_ENV"
+
       - name: Build provenance card
+        if: env.PR != ''
         env:
           GH_TOKEN: ${{ github.token }}
           # Layer 3 (meta-audit): Gemini if the secret exists, else GitHub Models via the
