@@ -231,6 +231,19 @@ class Parsers(unittest.TestCase):
         self.assertEqual(res, {("lib", "tests::adds"): "FAILED", ("lib", "tests::panics"): "ok",
                                ("lib", "tests::skipped"): "ignored", ("test:it", "integration"): "ok"})
 
+    def test_compile_error_files_ignore_warnings(self):
+        out = textwrap.dedent('''
+            warning: unused variable: `x`
+              --> calc/src/other.rs:3:9
+            error[E0425]: cannot find function `triple` in this scope
+               --> calc/src/lib.rs:12:30
+            error: cannot find macro `nope` in this scope
+             --> calc/src/checks.rs:4:5
+            error[E0425]: cannot find function `triple` in this scope
+               --> calc/src/lib.rs:14:30
+        ''')
+        self.assertEqual(fp.compile_error_files(out), ["calc/src/lib.rs", "calc/src/checks.rs"])
+
     def test_cargo_compile_error(self):
         res, failed = fp.parse_cargo("error[E0425]: cannot find function `x` in this scope\n"
                                      "error: could not compile `calc` (lib test) due to 1 previous error\n")
@@ -439,6 +452,33 @@ class EndToEnd(unittest.TestCase):
         res = fp.run_rust(plan, self.repo, logs, timeout=600, log=lambda *_: None)
         status = {t["path"]: t["status"] for t in res["tests"]}
         self.assertEqual(status, {"tests::adds": "proven", "tests::same": "not_red"})
+        self.git("checkout", "-q", "main")
+
+    def test_non_compiling_test_file_does_not_hide_a_real_proof(self):
+        """One test file needs the new API (base cannot compile it), another proves the fix with
+        an assertion: the first is taken back and counts as weak, the second stays a real proof."""
+        self.git("checkout", "-q", "-b", "mixed", self.base)
+        lib = (self.repo / "calc/src/lib.rs").read_text()
+        self.write({"calc/src/lib.rs": lib.replace("#[cfg(test)]\nmod tests {", "#[cfg(test)]\nmod checks;\n#[cfg(test)]\nmod tests {")})
+        self.write({"calc/src/checks.rs": "#[test]\nfn old_check() { assert_eq!(super::double(1), 2); }\n"})
+        self.git("add", "-A")
+        self.git("commit", "-qm", "test: checks module")
+        base = self.git("rev-parse", "HEAD").strip()
+        fixed = (self.repo / "calc/src/lib.rs").read_text().replace("a - b", "a + b").replace(
+            "pub fn double", "pub fn triple(a: i32) -> i32 { a * 3 }\npub fn double").replace(
+            "#[test]\n    fn zero()", "#[test]\n    fn triples() { assert_eq!(triple(1), 3); }\n    #[test]\n    fn zero()")
+        self.write({"calc/src/lib.rs": fixed,
+                    "calc/src/checks.rs": "#[test]\nfn old_check() { assert_eq!(super::double(1), 2); }\n"
+                                          "#[test]\nfn adds() { assert_eq!(super::add(2, 2), 4); }\n"})
+        self.git("commit", "-qam", "fix: add adds, plus triple")
+        head = self.git("rev-parse", "HEAD").strip()
+        plan = fp.build_plan(self.repo, base, head, "fix: add adds", "")
+        logs = self.tmp / "logs-mixed"
+        logs.mkdir(exist_ok=True)
+        res = fp.run_rust(plan, self.repo, logs, timeout=600, log=lambda *_: None)
+        status = {t["path"]: t["status"] for t in res["tests"]}
+        self.assertEqual(status, {"checks::adds": "proven", "tests::triples": "proven_build"})
+        self.assertEqual(res["reverted"], ["calc/src/lib.rs"])
         self.git("checkout", "-q", "main")
 
     def test_fix_without_red_test_fails(self):

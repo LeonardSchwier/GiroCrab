@@ -726,7 +726,7 @@ def apply_overlay(plan, root, wt, lang):
                 if status == "R" and old != path and (Path(wt) / old).exists():
                     (Path(wt) / old).unlink()
                 continue
-            if path.endswith(".rs") and status in ("M", "R"):
+            if path.endswith(".rs") and status in ("M", "R") and _in_crate(path, root):
                 base_src, head_src = btree.read(old), htree.read(path)
                 if base_src is None or head_src is None:
                     continue
@@ -754,6 +754,33 @@ def apply_overlay(plan, root, wt, lang):
 
 def _in_crate(path, root):
     return crate_of(path, Path(root)) is not None
+
+
+ERROR_LOC_RE = re.compile(r"^\s*--> ([^:\s]+\.rs):\d+:\d+")
+
+
+def compile_error_files(output):
+    """Source files named by rustc errors (not warnings), relative to the workspace."""
+    lines, files = output.splitlines(), []
+    for i, line in enumerate(lines):
+        if re.match(r"^error(\[E\d+\])?: ", line):
+            for nxt in lines[i + 1:i + 4]:
+                m = ERROR_LOC_RE.match(nxt)
+                if m:
+                    files.append(m.group(1))
+                    break
+    return list(dict.fromkeys(files))
+
+
+def restore_base_file(plan, root, wt, path):
+    """Undo the overlay for one file: back to the base version (or gone, if the PR added it)."""
+    data = Tree(root, plan["base"]).read_bytes(path)
+    target = Path(wt) / path
+    if data is None:
+        if target.exists():
+            target.unlink()
+    else:
+        target.write_bytes(data)
 
 
 class BaseWorktree:
@@ -847,6 +874,7 @@ def parse_cargo(output):
 # (its sources are older than the head build). A per-package profile override that changes
 # nothing about the code gives each side its own unit; dependencies stay shared.
 UNIT_VARIANT = {"base": 255, "head-worktree": 254}
+MAX_REVERT_ROUNDS = 4  # base builds after taking back test files that need the fix to compile
 
 
 def cargo_cmd(tests, package, crate_has_lib, variant=None):
@@ -901,24 +929,44 @@ def run_rust(plan, root, out_dir, timeout=1800, keep=False, log=print):
     with HeadDir(root, plan, keep) as hd, BaseWorktree(root, plan["base"], keep) as wt:
         written = apply_overlay(plan, root, wt, "rust")
         log(f"fix-proof: base worktree {wt}, test overlay: {', '.join(written) or '–'}")
+        overlay = {w.lstrip("~-") for w in written}
+        reverted = set()
         for (pkg, crate_dir, target), ts in by_target.items():
             has_lib = (root / crate_dir / "src" / "lib.rs").exists()
             slug = re.sub(r"[^\w.-]+", "_", f"{pkg}-{target}")
             for side, cwd, store in (("head", hd, head_res), ("base", wt, base_res)):
                 variant = "base" if side == "base" else ("head-worktree" if Path(hd) != root else None)
                 cmd = cargo_cmd(ts, pkg, has_lib, variant)
-                log(f"fix-proof: {side}: {' '.join(cmd)}")
-                rc, text = run_logged(cmd, cwd, env, Path(out_dir) / f"rust-{side}-{slug}.log", timeout)
-                results, build_failed = parse_cargo(text)
+                for attempt in range(MAX_REVERT_ROUNDS + 1):
+                    suffix = f"-retry{attempt}" if attempt else ""
+                    log(f"fix-proof: {side}{suffix}: {' '.join(cmd)}")
+                    rc, text = run_logged(cmd, cwd, env, Path(out_dir) / f"rust-{side}-{slug}{suffix}.log", timeout)
+                    results, build_failed = parse_cargo(text)
+                    out["runs"].append({"side": side, "package": pkg, "target": target, "exit": rc,
+                                        "timed_out": rc is None, "build_failed": build_failed,
+                                        "results": len(results), "attempt": attempt})
+                    if side == "head" or not build_failed:
+                        break
+                    # Some test code needs what only the fix adds, so the base does not compile.
+                    # Take back the overlay of exactly those files and build again: their tests
+                    # count as weak proof, every other test still gets a real red/green answer.
+                    culprits = [f for f in compile_error_files(text) if f in overlay and f not in reverted]
+                    if not culprits:
+                        break
+                    for f in culprits:
+                        restore_base_file(plan, root, wt, f)
+                    reverted.update(culprits)
+                    log(f"fix-proof: base does not compile with the PR's tests in {', '.join(culprits)};"
+                        " those stay at base, retrying")
                 store[(pkg, target)] = (results, build_failed, rc is None)
-                out["runs"].append({"side": side, "package": pkg, "target": target, "exit": rc,
-                                    "timed_out": rc is None, "build_failed": build_failed, "results": len(results)})
+        out["reverted"] = sorted(reverted)
     for t in tests:
         hr, _, _ = head_res.get((t["package"], t["target"]), ({}, False, False))
         br, bfail, btime = base_res.get((t["package"], t["target"]), ({}, False, False))
         key = (t["target"], t["path"])
         status = classify(br.get(key), hr.get(key), bfail, btime)
-        out["tests"].append({**t, "status": status, "base": br.get(key), "head": hr.get(key)})
+        out["tests"].append({**t, "status": status, "base": br.get(key), "head": hr.get(key),
+                             "overlay_reverted": t["file"] in out["reverted"]})
     out["status"] = "ran"
     return out
 
