@@ -4,12 +4,12 @@ use std::sync::Arc;
 use rusqlite::Connection;
 
 use crate::error::CoreError;
-use crate::vault::{Vault, SCHEMA_VERSION};
+use crate::vault::{SCHEMA_VERSION, Vault};
 
 const PASSWORD: &str = "Krabbe am Strand 7";
 
 fn temp_path(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("girocrab-backup-{tag}-{}.db", uuid::Uuid::new_v4()))
+    crate::test_support::thread_temp_path(&format!("backup-{tag}.db"))
 }
 
 fn path(p: &Path) -> String {
@@ -101,6 +101,35 @@ fn not_a_backup_is_refused() {
     assert!(matches!(err, CoreError::InvalidInput { .. }), "{err:?}");
 }
 
+fn set_user_version(db: &Path, password: &str, version: i64) {
+    let c = Connection::open(db).unwrap();
+    c.pragma_update(None, "key", password).unwrap();
+    c.execute_batch(&format!("PRAGMA user_version = {version}"))
+        .unwrap();
+}
+
+/// Another app's encrypted database opened with its own password also holds
+/// `accounts` and `transactions`: it is named as such, never restored, also
+/// when its version number is above ours.
+#[test]
+fn other_apps_database_is_refused_with_its_own_message() {
+    use crate::importers::moneymoney_db::tests::{PW, fake_db};
+    let (dest, _) = filled(2);
+    let before = bookings(&dest);
+    let db = fake_db();
+    for version in [None, Some(SCHEMA_VERSION + 1)] {
+        if let Some(v) = version {
+            set_user_version(Path::new(&db), PW, v);
+        }
+        let err = dest.restore_backup(db.clone(), PW.into()).unwrap_err();
+        assert!(
+            matches!(&err, CoreError::InvalidInput { message } if message.contains("anderen App")),
+            "{err:?}"
+        );
+        assert_eq!(bookings(&dest), before);
+    }
+}
+
 #[test]
 fn empty_password_is_refused() {
     let (src, _) = filled(1);
@@ -115,12 +144,7 @@ fn backup_from_a_newer_app_is_refused() {
     let (src, _) = filled(1);
     let backup = temp_path("bak");
     src.write_backup(path(&backup), PASSWORD.into()).unwrap();
-    {
-        let c = Connection::open(&backup).unwrap();
-        c.pragma_update(None, "key", PASSWORD).unwrap();
-        c.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
-            .unwrap();
-    }
+    set_user_version(&backup, PASSWORD, SCHEMA_VERSION + 1);
     let dest = Vault::open(path(&temp_path("dest")), vec![2u8; 32]).unwrap();
     let err = dest
         .restore_backup(path(&backup), PASSWORD.into())
@@ -148,10 +172,11 @@ fn pre_fints_reg_backup_is_made_once_and_never_overwritten() {
     // new vault: nothing to preserve, only the marker is set
     let v = Vault::open(path(&p), key.clone()).unwrap();
     assert!(!Path::new(&bak).exists());
-    assert!(v
-        .get_setting("pre_0_8_0_fints_backup_done".into())
-        .unwrap()
-        .is_some());
+    assert!(
+        v.get_setting("pre_0_8_0_fints_backup_done".into())
+            .unwrap()
+            .is_some()
+    );
 
     // an existing vault from before the update: has data, no marker
     v.seed_demo_data().unwrap();
@@ -163,10 +188,11 @@ fn pre_fints_reg_backup_is_made_once_and_never_overwritten() {
     let v = Vault::open(path(&p), key.clone()).unwrap();
     assert!(Path::new(&bak).exists(), "backup written on first open");
     assert!(!Path::new(&format!("{bak}.tmp")).exists());
-    assert!(v
-        .get_setting("pre_0_8_0_fints_backup_done".into())
-        .unwrap()
-        .is_some());
+    assert!(
+        v.get_setting("pre_0_8_0_fints_backup_done".into())
+            .unwrap()
+            .is_some()
+    );
     let copy = Vault::open(bak.clone(), key.clone()).unwrap();
     assert_eq!(bookings(&copy), before);
     drop(copy);
@@ -246,4 +272,279 @@ fn backup_file_is_owner_only() {
     src.write_backup(path(&backup), PASSWORD.into()).unwrap();
     let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+}
+
+fn triggers_and_views(v: &Vault) -> Vec<String> {
+    v.db()
+        .unwrap()
+        .prepare("SELECT name FROM sqlite_master WHERE type IN ('trigger', 'view') ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn restore_drops_triggers_and_views_from_the_backup() {
+    let (src, _) = filled(1);
+    src.db()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER repoint AFTER INSERT ON settings BEGIN
+                 UPDATE settings SET value = 'https://evil.example/fints'
+                 WHERE key LIKE 'fints.url.%';
+             END;
+             CREATE TRIGGER repoint_on_sync AFTER UPDATE ON bank_connections BEGIN
+                 UPDATE settings SET value = 'https://evil.example/fints'
+                 WHERE key LIKE 'fints.url.%';
+             END;
+             CREATE VIEW extra AS SELECT 1;",
+        )
+        .unwrap();
+    let backup = temp_path("bak");
+    src.write_backup(path(&backup), PASSWORD.into()).unwrap();
+
+    let (dst, dst_path) = filled(2);
+    dst.set_setting(
+        "fints.url.12345678".into(),
+        "https://bank.example/fints".into(),
+    )
+    .unwrap();
+    dst.restore_backup(path(&backup), PASSWORD.into()).unwrap();
+    assert!(triggers_and_views(&dst).is_empty());
+
+    // a later settings write keeps this device's endpoint
+    dst.set_setting("ui.note".into(), "x".into()).unwrap();
+    assert_eq!(
+        dst.get_setting("fints.url.12345678".into())
+            .unwrap()
+            .as_deref(),
+        Some("https://bank.example/fints")
+    );
+    drop(dst);
+    let reopened = Vault::open(path(&dst_path), vec![2; 32]).unwrap();
+    assert!(triggers_and_views(&reopened).is_empty());
+}
+
+#[test]
+fn reopen_drops_triggers_left_in_the_vault() {
+    let (v, p) = filled(3);
+    v.db()
+        .unwrap()
+        .execute_batch("CREATE TRIGGER stray AFTER INSERT ON settings BEGIN SELECT 1; END;")
+        .unwrap();
+    drop(v);
+    let reopened = Vault::open(path(&p), vec![3; 32]).unwrap();
+    assert!(triggers_and_views(&reopened).is_empty());
+}
+
+// #1090: a restore wins against a deletion another device synced after the backup
+
+/// Two devices sharing the sync key, each holding one connection with two
+/// accounts and one booking each. Returns (device a, device b, connection id on a).
+fn synced_pair() -> (Arc<Vault>, Arc<Vault>, i64) {
+    let a = Vault::open(path(&temp_path("sync-a")), vec![7u8; 32]).unwrap();
+    let b = Vault::open(path(&temp_path("sync-b")), vec![7u8; 32]).unwrap();
+    let db = a.db().unwrap();
+    db.execute_batch("INSERT INTO account_groups(id, name) VALUES (1, 'G');")
+        .unwrap();
+    db.execute(
+        "INSERT INTO bank_connections(connector, display_name, login_name, bank_code)
+         VALUES ('fints:12345678', 'Bank', 'me', '12345678')",
+        [],
+    )
+    .unwrap();
+    let c = db.last_insert_rowid();
+    for ext in ["A1", "A2"] {
+        db.execute(
+            "INSERT INTO accounts(connection_id, group_id, external_ref, name) VALUES (?1, 1, ?2, ?2)",
+            rusqlite::params![c, ext],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents)
+             VALUES (?1, 'e1', '2026-01-01', -5)",
+            [db.last_insert_rowid()],
+        )
+        .unwrap();
+    }
+    drop(db);
+    sync(&a, &b);
+    (a, b, c)
+}
+
+/// One iCloud round: each device merges the other's snapshot.
+fn sync(a: &Vault, b: &Vault) {
+    a.merge_peer_snapshot(b.file_path()).unwrap();
+    b.merge_peer_snapshot(a.file_path()).unwrap();
+}
+
+/// Moves the deletion stamps one second back, so the restore that follows in
+/// the same millisecond is clearly later (as it is for a user).
+fn age_deletions(v: &Vault) {
+    let db = v.db().unwrap();
+    for table in ["bank_connections", "accounts", "transactions"] {
+        db.execute(
+            &format!(
+                "UPDATE {table} SET deleted_ms = deleted_ms - 1000 WHERE deleted_ms IS NOT NULL"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+}
+
+/// (live connections, live accounts, live bookings)
+fn live(v: &Vault) -> (i64, i64, i64) {
+    v.db()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM bank_connections WHERE deleted_ms IS NULL),
+                    (SELECT count(*) FROM accounts WHERE deleted_ms IS NULL),
+                    (SELECT count(*) FROM transactions WHERE deleted_ms IS NULL)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+/// Backup on a, connection deleted on b and synced, then a restores the backup.
+fn restore_after_peer_deletion() -> (Arc<Vault>, Arc<Vault>) {
+    let (a, b, _) = synced_pair();
+    let backup = temp_path("bak");
+    a.write_backup(path(&backup), PASSWORD.into()).unwrap();
+    let c_b: i64 = b
+        .db()
+        .unwrap()
+        .query_row("SELECT id FROM bank_connections", [], |r| r.get(0))
+        .unwrap();
+    b.delete_bank_connection(c_b).unwrap();
+    age_deletions(&b);
+    sync(&a, &b);
+    assert_eq!(live(&a), (0, 0, 0));
+    a.restore_backup(path(&backup), PASSWORD.into()).unwrap();
+    assert_eq!(live(&a), (1, 2, 2));
+    (a, b)
+}
+
+#[test]
+fn restored_connection_survives_the_peers_older_deletion() {
+    let (a, b) = restore_after_peer_deletion();
+    a.merge_peer_snapshot(b.file_path()).unwrap();
+    assert_eq!(live(&a), (1, 2, 2));
+}
+
+#[test]
+fn peer_takes_over_the_restored_state() {
+    let (a, b) = restore_after_peer_deletion();
+    sync(&a, &b);
+    assert_eq!(live(&a), (1, 2, 2));
+    assert_eq!(live(&b), (1, 2, 2));
+}
+
+#[test]
+fn deletion_after_the_restore_syncs_as_usual() {
+    let (a, b) = restore_after_peer_deletion();
+    sync(&a, &b);
+    let c_b: i64 = b
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM bank_connections WHERE deleted_ms IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // later than the restore stamp (the same millisecond would count as older)
+    b.db()
+        .unwrap()
+        .execute(
+            "UPDATE bank_connections SET created_ms = created_ms - 1000",
+            [],
+        )
+        .unwrap();
+    b.db()
+        .unwrap()
+        .execute("UPDATE accounts SET created_ms = created_ms - 1000", [])
+        .unwrap();
+    b.delete_bank_connection(c_b).unwrap();
+    sync(&a, &b);
+    assert_eq!(live(&a), (0, 0, 0));
+    assert_eq!(live(&b), (0, 0, 0));
+}
+
+fn remote_account(ext: &str) -> crate::connectors::RemoteAccount {
+    crate::connectors::RemoteAccount {
+        external_ref: ext.into(),
+        name: "Giro".into(),
+        owner: String::new(),
+        iban: String::new(),
+        account_number: String::new(),
+        currency: "EUR".into(),
+        kind: crate::models::AccountKind::Checking,
+        balance_cents: 0,
+        balance_date: "2026-11-10".into(),
+    }
+}
+
+fn remote_tx(ext: &str) -> crate::connectors::RemoteTransaction {
+    crate::connectors::RemoteTransaction {
+        account_ref: ext.into(),
+        external_id: format!("{ext}-1"),
+        booking_date: "2026-11-10".into(),
+        value_date: "2026-11-10".into(),
+        amount_cents: -500,
+        currency: "EUR".into(),
+        counterparty: "Shop".into(),
+        purpose: "Kauf".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn account_deleted_in_the_backup_stays_deleted_on_the_next_fetch() {
+    use crate::connectors::{FetchResult, store_fetch};
+    use crate::models::ConnectorKind;
+    let v = Vault::open(path(&temp_path("refetch")), vec![7u8; 32]).unwrap();
+    let c = v
+        .add_bank_connection(ConnectorKind::Comdirect, String::new(), "login".into())
+        .unwrap();
+    let fetch = || FetchResult {
+        accounts: vec![remote_account("DE1"), remote_account("DE2")],
+        transactions: vec![remote_tx("DE1"), remote_tx("DE2")],
+        ..Default::default()
+    };
+    store_fetch(&v, ConnectorKind::Comdirect, c, fetch()).unwrap();
+    // DE2 deleted with its booking while the connection existed
+    {
+        let db = v.db().unwrap();
+        db.execute_batch(
+            "UPDATE bank_connections SET created_ms = 100;
+             UPDATE accounts SET created_ms = 100;
+             UPDATE accounts SET deleted_ms = 200 WHERE external_ref = 'DE2';
+             UPDATE transactions SET deleted_ms = 200
+              WHERE account_id = (SELECT id FROM accounts WHERE external_ref = 'DE2');",
+        )
+        .unwrap();
+    }
+    let backup = temp_path("bak");
+    v.write_backup(path(&backup), PASSWORD.into()).unwrap();
+    v.restore_backup(path(&backup), PASSWORD.into()).unwrap();
+    assert_eq!(live(&v), (1, 1, 1));
+
+    store_fetch(&v, ConnectorKind::Comdirect, c, fetch()).unwrap();
+    assert_eq!(live(&v), (1, 1, 1));
+    let deleted: (i64, i64) = v
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM accounts WHERE external_ref = 'DE2' AND deleted_ms IS NOT NULL),
+                    (SELECT count(*) FROM transactions t JOIN accounts a ON a.id = t.account_id
+                      WHERE a.external_ref = 'DE2' AND t.deleted_ms IS NOT NULL)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(deleted, (1, 1));
 }

@@ -4,20 +4,33 @@
 
 use std::collections::HashSet;
 
-use super::syntax::{escape, SegmentBuilder};
-use super::{fints_date, mt535, FinTsConnector, SepaAccount, UpdAccount, CONSORSBANK_BLZ, COUNTRY};
-use crate::connectors::{today, ConnectContext};
-use crate::error::CoreResult;
-use crate::i18n::trf;
+use super::syntax::{SegmentBuilder, escape};
+use super::{CONSORSBANK_BLZ, COUNTRY, FinTsConnector, SepaAccount, UpdAccount, fints_date, mt535};
+use crate::connectors::{ConnectContext, today};
+use crate::error::{CoreError, CoreResult};
+use crate::i18n::{tr, trf};
+use crate::iban::normalize_iban;
 use crate::models::AccountKind;
-use crate::money::parse_cents;
+use crate::money::{cents, decimal};
+
+/// Why a depot fetch ended without any holdings statement: what the bank said instead.
+pub(super) fn no_holdings_message(codes: &[String]) -> String {
+    if codes.is_empty() {
+        return tr("Die Bank hat keinen Depotbestand geliefert.").to_string();
+    }
+    trf(
+        "Die Bank hat keinen Depotbestand geliefert ({0}).",
+        &[&codes.join("; ")],
+    )
+}
 
 pub(super) fn kind_from_code(code: u32) -> AccountKind {
     // FinTS Kontoart: 1-9 Kontokorrent, 10-19 Sparkonto, 20-29 Festgeld,
     // 30-39 Depot, 40-49 Darlehen, 50-59 Kreditkarte, 60-69 Fonds-Depot,
     // 70-79 Bausparvertrag, 80-89 Versicherung, 90-99 Sonstige
     match code {
-        10..=29 | 70..=79 => AccountKind::Savings,
+        10..=29 => AccountKind::Savings,
+        70..=79 => AccountKind::BuildingSavings,
         30..=39 | 60..=69 => AccountKind::Brokerage,
         40..=49 => AccountKind::Loan,
         50..=59 => AccountKind::CreditCard,
@@ -49,10 +62,9 @@ pub(super) fn merge_upd_with_sepa(
     let mut out: Vec<(SepaAccount, Option<UpdAccount>)> = Vec::new();
     for u in upd {
         // Only accounts of this bank with at least one usable transaction
-        let usable = u.allowed.is_empty()
-            || ["HKSAL", "HKCAZ", "HKKAZ", "HKWPD", "HKKKU", "DKKKU"]
-                .iter()
-                .any(|t| u.allowed.contains(*t));
+        let usable = ["HKSAL", "HKCAZ", "HKKAZ", "HKWPD", "HKKKU", "DKKKU"]
+            .iter()
+            .any(|t| u.allows(t));
         if crate::depot_debug::enabled() {
             let mut allowed: Vec<&str> = u.allowed.iter().map(String::as_str).collect();
             allowed.sort_unstable();
@@ -88,6 +100,7 @@ pub(super) fn merge_upd_with_sepa(
             } else {
                 u.blz.clone()
             },
+            full_kti: false,
         };
         out.push((acc, Some(u.clone())));
     }
@@ -125,12 +138,13 @@ pub(super) fn account_label(acc: &SepaAccount) -> String {
 }
 
 impl FinTsConnector {
-    /// Accounts from UPD merged with HKSPA (BIC/IBAN). Returns (account, upd).
+    /// Accounts from UPD merged with HKSPA (BIC/IBAN) as (account, upd), and why
+    /// HKSPA failed, if it did: whether that matters is the caller's to judge.
     pub(super) async fn account_list(
         &mut self,
         ctx: &ConnectContext,
-        errors: &mut Vec<String>,
-    ) -> Vec<(SepaAccount, Option<UpdAccount>)> {
+    ) -> (Vec<(SepaAccount, Option<UpdAccount>)>, Option<String>) {
+        let mut error = None;
         let mut sepa: Vec<SepaAccount> = Vec::new();
         if self.bank_supports("HKSPA") {
             let v = self.version("HKSPA");
@@ -151,15 +165,61 @@ impl FinTsConnector {
                                     account_number: t(3),
                                     sub_account: t(4),
                                     blz: t(6),
+                                    full_kti: false,
                                 });
                             }
                         }
                     }
                 }
-                Err(e) => errors.push(trf("Kontenliste (HKSPA) – {0}", &[&e])),
+                Err(e) => error = Some(trf("Kontenliste (HKSPA) – {0}", &[&e])),
             }
         }
-        merge_upd_with_sepa(&self.upd, sepa, &self.blz)
+        let mut accounts = merge_upd_with_sepa(&self.upd, sepa, &self.blz);
+        // Postbank also serves accounts of other banks of the group (BIC DEUT…) behind
+        // the one login, so the login's server decides, not the account's BIC.
+        if is_postbank_server(&self.url) {
+            for (acc, _) in &mut accounts {
+                acc.full_kti = true;
+            }
+        }
+        (accounts, error)
+    }
+
+    /// The order's source account from the bank's account list. `None` when the
+    /// UPD does not allow `seg_id` for it; the caller words that refusal.
+    pub(super) async fn source_account(
+        &mut self,
+        ctx: &ConnectContext,
+        iban: &str,
+        seg_id: &str,
+    ) -> CoreResult<Option<SepaAccount>> {
+        let (accounts, list_error) = self.account_list(ctx).await;
+        let want = normalize_iban(iban);
+        let Some((acc, upd)) = accounts
+            .into_iter()
+            .find(|(a, _)| normalize_iban(&a.iban) == want)
+        else {
+            // A failed HKSPA is the likely reason the account is missing.
+            let reason = list_error.map(|e| format!(" ({e})")).unwrap_or_default();
+            return Err(CoreError::NotFound {
+                what: trf("Konto {0} bei der Bank{1}", &[&iban, &reason]),
+            });
+        };
+        Ok(upd.is_none_or(|u| u.allows(seg_id)).then_some(acc))
+    }
+
+    /// #1513: a transfer to another account of this login from a source whose
+    /// UPD refuses HKCCS but lists HKCUM (typical for savings accounts) goes
+    /// out as SEPA-Umbuchung. Only an explicit UPD entry counts.
+    pub(super) fn is_upd_internal_transfer(&self, source_iban: &str, recipient_iban: &str) -> bool {
+        let find = |iban: &str| {
+            let want = normalize_iban(iban);
+            self.upd.iter().find(|u| normalize_iban(&u.iban) == want)
+        };
+        let (Some(src), Some(_)) = (find(source_iban), find(recipient_iban)) else {
+            return false;
+        };
+        !src.allows("HKCCS") && src.allowed.contains("HKCUM")
     }
 
     pub(super) async fn balance(
@@ -185,7 +245,7 @@ impl FinTsConnector {
             .await?;
         Ok(r.first("HISAL").and_then(|s| {
             // element 4: booked balance  C|D : amount : currency : date
-            let c = parse_cents(s.get(4, 1)).ok()?;
+            let c = decimal(s.get(4, 1), ',').and_then(cents)?;
             let sign = if s.get(4, 0) == "D" { -1 } else { 1 };
             let cur = if s.get(4, 2).is_empty() {
                 "EUR".to_string()
@@ -207,6 +267,9 @@ impl FinTsConnector {
         let v = self.version("HKWPD");
         let mut data = Vec::<u8>::new();
         let mut touchdown: Option<String> = None;
+        let mut seen_codes: Vec<String> = Vec::new();
+        // bytes of holdings statements received; the CRLF separators below do not count
+        let mut payload_len = 0usize;
         crate::depot_debug::log(&format!(
             "fints HKWPD: bpd HIWPDS versions={:?} (bank_supports={}), sending v{v} with KTV",
             self.st.versions.get("HKWPD"),
@@ -247,14 +310,31 @@ impl FinTsConnector {
             ));
             for s in r.all("HIWPD") {
                 if let Some(b) = s.binary(1) {
+                    payload_len += b.len();
                     data.extend_from_slice(b);
                     data.extend_from_slice(b"\r\n");
+                }
+            }
+            for c in &r.codes {
+                // 0010/0020 only say that the message arrived and ran
+                let note = format!("{} {}", c.0, c.2);
+                if !c.0.starts_with('9')
+                    && !matches!(c.0.as_str(), "0010" | "0020")
+                    && !seen_codes.contains(&note)
+                {
+                    seen_codes.push(note);
                 }
             }
             touchdown = r.code("3040").and_then(|c| c.3.first().cloned());
             if touchdown.is_none() {
                 break;
             }
+        }
+        // No error code, but no holdings statement either: the bank did not answer the order
+        // (#1743). That is not an empty depot, and its stored value must not look current.
+        // An HIWPD with a zero-length binary (`@0@`) carries no statement either.
+        if payload_len == 0 {
+            return Err(CoreError::protocol(no_holdings_message(&seen_codes)));
         }
         Ok(mt535::parse(&crate::text::decode_bank_bytes(&data)))
     }
@@ -274,14 +354,14 @@ impl FinTsConnector {
     /// Segmentaufbau") and wants all of IBAN:BIC:Konto:Unterkonto:280:BLZ.
     pub(super) fn kti(acc: &SepaAccount) -> String {
         if acc.blz == CONSORSBANK_BLZ && !acc.iban.is_empty() && !acc.account_number.is_empty() {
-            return format!(
-                "{}:{}:{}:{}:{COUNTRY}:{}",
-                escape(&acc.iban),
-                escape(&acc.bic),
-                escape(&acc.account_number),
-                escape(&acc.sub_account),
-                acc.blz
-            );
+            return Self::kti_full(acc, &acc.account_number);
+        }
+        // Postbank answers HKCAZ/HKCDB with 9210 "nationale Kontoverbindung erforderlich"
+        // for IBAN:BIC alone (#1702) and "Keine gültige Kontoverbindung" for the 10-digit
+        // number from the IBAN combined with its 3-digit sub-account. It accepts the
+        // account exactly as its HIUPD lists it (as HKKAZ already does through KTV).
+        if acc.full_kti && !acc.iban.is_empty() && !acc.account_number.is_empty() {
+            return Self::kti_full(acc, &acc.account_number);
         }
         if acc.iban.is_empty() {
             format!(
@@ -295,6 +375,18 @@ impl FinTsConnector {
         }
     }
 
+    /// IBAN:BIC:Konto:Unterkonto:280:BLZ.
+    fn kti_full(acc: &SepaAccount, number: &str) -> String {
+        format!(
+            "{}:{}:{}:{}:{COUNTRY}:{}",
+            escape(&acc.iban),
+            escape(&acc.bic),
+            escape(number),
+            escape(&acc.sub_account),
+            acc.blz
+        )
+    }
+
     pub(super) fn ktv(acc: &SepaAccount) -> String {
         format!(
             "{}:{}:{COUNTRY}:{}",
@@ -302,5 +394,30 @@ impl FinTsConnector {
             escape(&acc.sub_account),
             acc.blz
         )
+    }
+}
+
+fn is_postbank_server(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("hbci.postbank.de")
+}
+
+#[cfg(test)]
+mod postbank_kti_tests {
+    use super::*;
+
+    #[test]
+    fn postbank_kti_carries_the_upd_account_with_sub_account() {
+        let acc = SepaAccount {
+            iban: "DE89100100100123456789".into(),
+            bic: "PBNKDEFFXXX".into(),
+            account_number: "123456789".into(),
+            sub_account: "000".into(),
+            blz: "10010010".into(),
+            full_kti: true,
+        };
+        assert_eq!(
+            FinTsConnector::kti(&acc),
+            "DE89100100100123456789:PBNKDEFFXXX:123456789:000:280:10010010"
+        );
     }
 }

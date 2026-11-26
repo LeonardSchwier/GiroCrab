@@ -151,7 +151,7 @@ struct RecurringCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card()
+        .flatSection()
     }
 }
 
@@ -361,6 +361,10 @@ struct RecurringSheet: View {
                 ))
             }
         }
+        Toggle("Als Abo markieren", isOn: Binding(
+            get: { model.isSubscription(s) },
+            set: { model.setSubscription(s, marked: $0) }
+        ))
         if s.source == .manual {
             Button("Automatisch erkennen") { model.resetRecurring(s) }
         }

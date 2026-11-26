@@ -12,12 +12,15 @@
 //! fingerprint). Issue #94: MoneyMoney keeps closed accounts with the same
 //! IBAN; `mm-` ids are content hashes, so a closed account shares the few
 //! bookings MoneyMoney fetched again for its successor, but not most of its
-//! own. Accounts without any booking (depots) are twins when name and
-//! account number match too. A MoneyMoney account linked to no login (the
+//! own. Accounts without any booking (depots) are twins when name (ignoring
+//! spaces and punctuation) and account number match too; a depot may also sit
+//! on another login of the same connector. A MoneyMoney account linked to no login (the
 //! login was added after the import, e.g. Enable Banking) can be the twin of
-//! a bank account of any login, but only by IBAN and currency.
+//! a bank account of any login, but only by IBAN and currency; a depot without
+//! IBAN only when exactly one bank depot has its number, name and bank (#400:
+//! other unlinked accounts without IBAN stay apart).
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 
 use crate::error::CoreResult;
@@ -58,10 +61,37 @@ fn same_account(a: &Ident, b: &Ident) -> bool {
     a.iban == b.iban && (a.currency.is_empty() || b.currency.is_empty() || a.currency == b.currency)
 }
 
+/// Names compared without case, spaces and punctuation ("FFB-Fondsdepot").
+fn same_name(a: &str, b: &str) -> bool {
+    let plain = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    plain(a) == plain(b)
+}
+
+/// Bank names sharing a distinctive word ("FIL Fondsbank GmbH", "FFB (FIL
+/// Fondsbank)"); legal forms and "bank" alone do not count.
+fn same_bank(a: &str, b: &str) -> bool {
+    const GENERIC: [&str; 10] = [
+        "gmbh", "ag", "se", "kg", "eg", "co", "bank", "und", "the", "of",
+    ];
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .map(str::to_lowercase)
+            .filter(|w| w.len() >= 3 && !GENERIC.contains(&w.as_str()))
+            .collect()
+    };
+    let theirs = words(b);
+    words(a).iter().any(|w| theirs.contains(w))
+}
+
 /// How well the bank account `bank` (in schema `bank_schema`) holds the
 /// MoneyMoney account `mm` (in `mm_schema`): the number of its bookings found
 /// there, if that is most of them. Two accounts without any booking and with
-/// the same name score 0.
+/// the same name ([`same_name`]) score 0.
 fn twin_score(
     conn: &Connection,
     mm_schema: &str,
@@ -96,7 +126,7 @@ fn twin_score(
         [bank.id],
         |r| r.get(0),
     )?;
-    Ok((bank_empty && mm.name == bank.name).then_some(0))
+    Ok((bank_empty && same_name(&mm.name, &bank.name)).then_some(0))
 }
 
 /// The candidate with the best score, if any qualifies.
@@ -106,10 +136,10 @@ fn best<'a>(
 ) -> CoreResult<Option<i64>> {
     let mut best: Option<(i64, i64)> = None;
     for c in candidates {
-        if let Some(s) = score(c)? {
-            if best.is_none_or(|(top, _)| s > top) {
-                best = Some((s, c.id));
-            }
+        if let Some(s) = score(c)?
+            && best.is_none_or(|(top, _)| s > top)
+        {
+            best = Some((s, c.id));
         }
     }
     Ok(best.map(|(_, id)| id))
@@ -162,23 +192,90 @@ pub(crate) fn adopt_on_merge(
 }
 
 /// The live bank account the MoneyMoney account `mm` (on login
-/// `connection_id`, or none) is a twin of.
+/// `connection_id`, or none) is a twin of. A depot, identified by its number,
+/// may be on another login of the same connector.
 fn bank_twin(conn: &Connection, mm: &Ident, connection_id: Option<i64>) -> CoreResult<Option<i64>> {
-    // unlinked: any login, but only by IBAN
-    if connection_id.is_none() && mm.iban.is_empty() {
+    // unlinked: any login, by IBAN; a depot by number, name and bank, if unambiguous
+    let unlinked_depot = connection_id.is_none() && mm.iban.is_empty();
+    if unlinked_depot && (mm.kind != "brokerage" || mm.number.is_empty()) {
         return Ok(None);
     }
     let banks: Vec<Ident> = conn
         .prepare(&format!(
             "SELECT {IDENT_COLUMNS} FROM main.accounts
-              WHERE connection_id IS NOT NULL AND (?1 IS NULL OR connection_id = ?1)
+              WHERE connection_id IS NOT NULL
+                AND (?1 IS NULL OR connection_id = ?1
+                     OR (?2 = 'brokerage' AND connection_id IN (
+                            SELECT b.id FROM main.bank_connections b
+                              JOIN main.bank_connections m ON m.connector = b.connector
+                             WHERE m.id = ?1 AND b.deleted_ms IS NULL)))
                 AND external_ref NOT LIKE 'moneymoney-db:%' AND deleted_ms IS NULL
               ORDER BY id"
         ))?
-        .query_map([connection_id], ident)?
+        .query_map(params![connection_id, mm.kind], ident)?
         .collect::<Result<_, _>>()?;
+    if let Some(id) = switched_depot_twin(conn, mm, &banks)? {
+        return Ok(Some(id));
+    }
+    if unlinked_depot {
+        let bank_name = |id: i64| -> CoreResult<String> {
+            Ok(conn.query_row(
+                "SELECT IFNULL(bank_name, '') FROM main.accounts WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )?)
+        };
+        let mm_bank = bank_name(mm.id)?;
+        let mut found = Vec::new();
+        for bank in banks.iter().filter(|b| same_account(mm, b)) {
+            if !same_bank(&mm_bank, &bank_name(bank.id)?) {
+                continue;
+            }
+            if twin_score(conn, "main", mm, "main", bank)?.is_some() {
+                found.push(bank.id);
+            }
+        }
+        return Ok(match found.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        });
+    }
     best(banks.iter().filter(|b| same_account(mm, b)), |bank| {
         twin_score(conn, "main", mm, "main", bank)
+    })
+}
+
+/// A depot „Abrufweg umstellen“ marked that the other way did not take over
+/// (another reference, no IBAN): the only bank depot without IBAN whose
+/// number is the marked one's or that plus the sub-account `00` (comdirect:
+/// REST `1234567`, FinTS `123456700`) and that `twin_score` accepts: most
+/// bookings shared or, for an empty depot, the same name. The name is not
+/// required otherwise; the two ways may name the depot differently.
+fn switched_depot_twin(conn: &Connection, mm: &Ident, banks: &[Ident]) -> CoreResult<Option<i64>> {
+    if mm.kind != "brokerage" || !mm.iban.is_empty() || mm.number.is_empty() {
+        return Ok(None);
+    }
+    let marked: bool = conn.query_row(
+        "SELECT IFNULL(external_ref LIKE ?2 || '%', 0) FROM main.accounts WHERE id = ?1",
+        params![mm.id, crate::vault::connections::SWITCH_MARK],
+        |r| r.get(0),
+    )?;
+    if !marked {
+        return Ok(None);
+    }
+    let mut found = Vec::new();
+    for bank in banks.iter().filter(|b| {
+        b.kind == mm.kind
+            && b.iban.is_empty()
+            && (b.number == mm.number || b.number == format!("{}00", mm.number))
+    }) {
+        if twin_score(conn, "main", mm, "main", bank)?.is_some() {
+            found.push(bank.id);
+        }
+    }
+    Ok(match found.as_slice() {
+        [only] => Some(*only),
+        _ => None,
     })
 }
 
@@ -257,14 +354,23 @@ fn fold_inner(conn: &Connection, twin: i64, bank: i64) -> CoreResult<()> {
          DROP TABLE IF EXISTS other.transaction_splits;
          DROP TABLE IF EXISTS other.tags;
          DROP TABLE IF EXISTS other.transaction_tags;
+         DROP TABLE IF EXISTS other.refund_links;
          CREATE TABLE other.accounts AS SELECT * FROM main.accounts WHERE id = {twin};
          CREATE TABLE other.transactions AS SELECT * FROM main.transactions WHERE account_id = {twin};
          CREATE TABLE other.transaction_splits AS SELECT * FROM main.transaction_splits
              WHERE transaction_id IN (SELECT id FROM other.transactions);
          CREATE TABLE other.tags AS SELECT * FROM main.tags;
          CREATE TABLE other.transaction_tags AS SELECT * FROM main.transaction_tags
-             WHERE transaction_id IN (SELECT id FROM other.transactions);"
+             WHERE transaction_id IN (SELECT id FROM other.transactions);
+         CREATE TABLE other.refund_links AS SELECT * FROM main.refund_links
+             WHERE refund_id IN (SELECT id FROM other.transactions) OR original_id IN (SELECT id FROM other.transactions)
+                OR moved_from_refund_id IN (SELECT id FROM other.transactions) OR moved_from_original_id IN (SELECT id FROM other.transactions);"
     ))?;
+    // Transfer the twin's UUIDs through `other` without violating global uniqueness.
+    conn.execute(
+        "DELETE FROM main.transaction_splits WHERE transaction_id IN (SELECT id FROM other.transactions)",
+        [],
+    )?;
     // same vault: categories and rules map onto themselves
     let identity = |table: &str| -> CoreResult<HashMap<i64, i64>> {
         Ok(conn
@@ -279,7 +385,13 @@ fn fold_inner(conn: &Connection, twin: i64, bank: i64) -> CoreResult<()> {
     let rule_map = identity("rules")?;
     let acc_map = HashMap::from([(twin, bank)]);
     let mut stats = crate::vault::MergeStats::default();
-    super::merge_bookings(conn, &acc_map, &cat_map, &rule_map, &mut stats)?;
+    let moved = super::merge_bookings(conn, &acc_map, &cat_map, &rule_map, &mut stats)?;
+    let mut booking_map:HashMap<i64,i64>=conn.prepare("SELECT id,id FROM main.transactions WHERE id NOT IN (SELECT id FROM other.transactions)")?
+        .query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+    booking_map.extend(moved);
+    conn.execute("DELETE FROM main.refund_links WHERE refund_id IN (SELECT id FROM other.transactions) OR original_id IN (SELECT id FROM other.transactions)
+        OR moved_from_refund_id IN (SELECT id FROM other.transactions) OR moved_from_original_id IN (SELECT id FROM other.transactions)",[])?;
+    crate::refunds::merge_folded(conn, &booking_map)?;
     // stamped: a device still holding the rule on the twin's key loses
     conn.execute(
         "UPDATE rules SET account_id = ?2, updated_ms = max(updated_ms + 1, ?3) WHERE account_id = ?1",
@@ -320,8 +432,52 @@ fn fold_inner(conn: &Connection, twin: i64, bank: i64) -> CoreResult<()> {
         ),
         params![twin, bank],
     )?;
+    // so do securities transactions paid from one of its bookings (#1463 review)
+    conn.execute(
+        &format!(
+            "UPDATE security_transactions SET cash_transaction_id = IFNULL({}, cash_transaction_id)
+              WHERE cash_transaction_id IN (SELECT id FROM transactions WHERE account_id = ?1)",
+            counterpart.replace("{col}", "security_transactions.cash_transaction_id")
+        ),
+        params![twin, bank],
+    )?;
+    // asked before the history moves: the twin's may hold fetches too
+    move_depot_data(conn, twin, bank)?;
     // the imported depot history belongs to the bank's account from now on (#578)
     crate::depot_values::move_account(conn, twin, bank)?;
+    // so does the user's note (newer edit wins, like a merge, #980)
+    crate::user_groups::pass_note_on(conn, twin, bank)?;
+    // and the sidebar's bank label (#1467), the same way
+    crate::user_groups::pass_bank_label_on(conn, twin, bank)?;
     super::soft_delete_account(conn, twin)?;
+    Ok(())
+}
+
+/// A depot's positions and securities transactions go with it to the bank
+/// account, like `connections::deduplicate` moves them: positions only while
+/// the bank account has none and never fetched an inventory of its own (a
+/// confirmed fetch: one that brought only the balance doesn't count),
+/// else they are outdated and dropped (an empty inventory is one too: all
+/// sold); securities transactions once per external id.
+fn move_depot_data(conn: &Connection, twin: i64, bank: i64) -> CoreResult<()> {
+    let bank_has_inventory: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM holdings WHERE account_id = ?1)
+             OR EXISTS (SELECT 1 FROM depot_observations
+                         WHERE account_id = ?1 AND source = ?2 AND confirmed != 0)",
+        params![bank, crate::depot_values::observations::SOURCE_FETCH],
+        |r| r.get(0),
+    )?;
+    if bank_has_inventory {
+        conn.execute("DELETE FROM holdings WHERE account_id = ?1", [twin])?;
+    } else {
+        conn.execute(
+            "UPDATE holdings SET account_id = ?2 WHERE account_id = ?1",
+            params![twin, bank],
+        )?;
+    }
+    conn.execute(
+        "UPDATE OR IGNORE security_transactions SET account_id = ?2 WHERE account_id = ?1",
+        params![twin, bank],
+    )?;
     Ok(())
 }

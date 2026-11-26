@@ -57,7 +57,7 @@ public enum MenuBarActions {
         NSApp.activate()
     }
 
-    static func showMain() { show(window: "main") }
+    public static func showMain() { show(window: "main") }
 
     static func showSettings() {
         NSApp.setActivationPolicy(.regular)
@@ -91,7 +91,7 @@ public enum MenuBarActions {
         retained = []
         let unlocked = model?.isUnlocked ?? false
         let canLock = unlocked && (model?.holdsRealData ?? false)
-        let privateMode = UserDefaults.standard.bool(forKey: MenuBarSummary.privateKey)
+        let privateMode = AppDefaults.store.bool(forKey: MenuBarSummary.privateKey)
         let menu = NSMenu()
         menu.autoenablesItems = false
         menu.addItem(item(String(localized: "GiroCrab öffnen")) { showMain() })
@@ -102,7 +102,7 @@ public enum MenuBarActions {
         })
         menu.addItem(.separator())
         menu.addItem(item(String(localized: "Beträge in der Menüleiste verdecken"), checked: privateMode) {
-            UserDefaults.standard.set(!privateMode, forKey: MenuBarSummary.privateKey)
+            AppDefaults.store.set(!privateMode, forKey: MenuBarSummary.privateKey)
         })
         if unlocked {
             menu.addItem(item(String(localized: "Tresor sperren"), key: "l", enabled: canLock) { model?.lock() })
@@ -121,19 +121,13 @@ public enum MenuBarActions {
     }
 
     private static func settingsItems() -> [NSMenuItem] {
-        let defaults = UserDefaults.standard
+        let defaults = AppDefaults.store
         let display = MenuBarSummary.BarDisplay(rawValue: defaults.string(forKey: MenuBarSummary.barDisplayKey) ?? "") ?? .amount
-        let hours = (defaults.object(forKey: AutoSync.hoursKey) as? Int) ?? model?.autoSyncHours ?? 0
-        let intervals = AutoSync.hourOptions.map { h in
-            item(AutoSync.label(h), checked: h == hours) { defaults.set(h, forKey: AutoSync.hoursKey) }
-        }
         return [
             item(String(localized: "Betrag in der Menüleiste"), checked: display == .amount) {
                 defaults.set((display == .amount ? MenuBarSummary.BarDisplay.iconOnly : .amount).rawValue,
                              forKey: MenuBarSummary.barDisplayKey)
             },
-            submenu(String(localized: "Automatischer Abruf"), intervals),
-            .separator(),
             item(String(localized: "Alle Einstellungen …"), key: ",") { showSettings() },
         ]
     }
@@ -215,8 +209,6 @@ public struct MenuBarPopover: View {
     @AppStorage(MenuBarSummary.privateKey) private var privateMode = false
     @AppStorage(MenuBarSummary.accountsKey) private var accountsRaw = ""
     @AppStorage(MenuBarSummary.focusKey) private var focus = MenuBarSummary.totalFocus
-    /// -1 = never set (the former hidden setting may still apply); read here so the popover redraws on a change.
-    @AppStorage(AutoSync.hoursKey) private var storedHours = -1
     /// The list of all chosen accounts with their balances is unfolded.
     @State private var showList = false
 
@@ -225,7 +217,7 @@ public struct MenuBarPopover: View {
     public var body: some View {
         let visibility = MenuBarSummary.visibility(isUnlocked: model.isUnlocked, privateMode: privateMode)
         let selected = MenuBarSummary.selectedAccounts(model.allAccounts, raw: accountsRaw)
-        let notices = model.autoSyncStatus.notice(visibility, intervalOn: storedHours >= 0 ? storedHours > 0 : model.autoSyncHours > 0)
+        let notices = model.autoSyncStatus.notice(visibility, intervalOn: model.scheduledBankSyncPaused)
         let listing = showList && visibility == .visible && !selected.isEmpty
         // Either the overview or the list; the panel follows the height and
         // keeps its top edge under the menu bar.
@@ -393,10 +385,10 @@ public struct MenuBarPopover: View {
     }
 }
 
-/// Settings › Allgemein › Menüleiste: switch the item on (default off), what
-/// the bar shows, private mode, and which accounts it can switch between.
-struct MenuBarSettingsSection: View {
+/// Settings › Allgemein › Dock & Menüleiste.
+struct DockAndMenuBarSettingsSection: View {
     @Environment(AppModel.self) private var model
+    @AppStorage(DockKeepAlive.enabledKey) private var keepAppOpenInDock = false
     @AppStorage(MenuBarSummary.enabledKey) private var enabled = false
     @AppStorage(MenuBarSummary.privateKey) private var privateMode = false
     @AppStorage(MenuBarSummary.accountsKey) private var accountsRaw = ""
@@ -404,10 +396,20 @@ struct MenuBarSettingsSection: View {
 
     var body: some View {
         Section {
+            Toggle("GiroCrab nach Fensterschließen geöffnet lassen", isOn: $keepAppOpenInDock)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .accessibilityLabel(Text("Schließen"))
+                Text("schließt das Fenster. GiroCrab läuft weiter.")
+            }
+            .appFont(.caption).foregroundStyle(.secondary)
+            .accessibilityElement(children: .combine)
+
             Toggle("Konten in der Menüleiste anzeigen", isOn: $enabled)
-            Text("Zeigt das GiroCrab-Symbol in der Menüleiste. Ein Klick öffnet ein Popover mit dem Kontostand eines gewählten Kontos oder der Gesamtsumme, ein Rechtsklick ein Menü. Bei gesperrtem Tresor oder bei aktivem „Beträge in der Menüleiste verdecken“ erscheinen weder Beträge noch Kontonamen.")
-                .appFont(.caption).foregroundStyle(.secondary)
             if enabled {
+                Text("Zeigt das GiroCrab-Symbol in der Menüleiste. Ein Klick öffnet ein Popover mit dem Kontostand eines gewählten Kontos oder der Gesamtsumme, ein Rechtsklick ein Menü. Bei gesperrtem Tresor oder bei aktivem „Beträge in der Menüleiste verdecken“ erscheinen weder Beträge noch Kontonamen.")
+                    .appFont(.caption).foregroundStyle(.secondary)
                 Picker("In der Menüleiste", selection: $display) {
                     Text("Symbol und Betrag").tag(MenuBarSummary.BarDisplay.amount)
                     Text("Nur Symbol").tag(MenuBarSummary.BarDisplay.iconOnly)
@@ -425,8 +427,11 @@ struct MenuBarSettingsSection: View {
                         }
                     }
                 }
+            } else {
+                Text("Zeigt das GiroCrab-Symbol oben in der Menüleiste.")
+                    .appFont(.caption).foregroundStyle(.secondary)
             }
-        } header: { Text("Menüleiste").appSectionHeader() }
+        } header: { Text("Dock & Menüleiste").appSectionHeader() }
     }
 
     private func binding(for id: Int64) -> Binding<Bool> {

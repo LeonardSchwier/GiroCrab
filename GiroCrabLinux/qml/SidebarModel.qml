@@ -5,9 +5,9 @@ import QtCore
 // Sidebar state that came to the Mac app after 0.7.0, kept out of AppModel.qml:
 // the collapsible section headers (SidebarView.swift), the badge counts of „Geplant“ and
 // „Lastschriften“ (AppModel+Loading.swift › refreshSidebarCounts), the custom name of
-// „Ohne Kategorie“ (AppModel.swift › uncategorizedLabel, #597), account notes
-// (AppModel.swift › accountNote, #605), the remembered expanded categories (#633) and
-// „Duplizieren“ of a category (AppModel+CategoryDuplicate.swift, #510).
+// „Ohne Kategorie“ (AppModel.swift › uncategorizedLabel, #597), the remembered expanded
+// categories (#633), „Duplizieren“ of a category (AppModel+CategoryDuplicate.swift, #510) and the order of the
+// categories (drag & drop, „Nach oben“ / „Nach unten“, #977).
 QtObject {
     id: sm
 
@@ -42,13 +42,16 @@ QtObject {
     // MARK: badge counts (AppModel+Loading.swift › refreshSidebarCounts)
     property int plannedCount: 0
     property int mandateCount: 0
+    /// Unread documents (badge of „Belege & Postbox“, #934), a partial-index COUNT.
+    property int unseenDocumentCount: 0
     property int countGeneration: 0
-    /// Two `COUNT(*)`s off the GUI thread. Call after planned payments or mandates changed.
+    /// `COUNT(*)`s off the GUI thread. Call after planned payments, mandates or documents changed.
     function refreshCounts() {
-        if (!AppModel.isUnlocked) { plannedCount = 0; mandateCount = 0; return }
+        if (!AppModel.isUnlocked) { plannedCount = 0; mandateCount = 0; unseenDocumentCount = 0; return }
         const gen = ++countGeneration
         AppModel.coreAsync("count_planned_payments", {}, n => { if (gen === sm.countGeneration) sm.plannedCount = n }, () => {})
         AppModel.coreAsync("count_active_mandates", {}, n => { if (gen === sm.countGeneration) sm.mandateCount = n }, () => {})
+        AppModel.coreAsync("unseen_document_count", {}, n => { if (gen === sm.countGeneration) sm.unseenDocumentCount = n }, () => {})
     }
 
     // MARK: „Ohne Kategorie“ (#597): vault setting `ui.uncategorized_name`, empty = default
@@ -61,30 +64,8 @@ QtObject {
             uncategorizedName = t
     }
 
-    // MARK: account notes (vault setting `account.note.<id>`; `list_settings` only returns known keys)
-    property var noteCache: ({})
-    property int notesVersion: 0
-    function accountNote(id) {
-        void notesVersion
-        if (id === null || id === undefined || !AppModel.isUnlocked) return ""
-        if (!(id in noteCache)) {
-            let n = ""
-            try { n = (AppModel.core("get_setting", { key: "account.note." + id }) || "").trim() } catch (e) {}
-            noteCache[id] = n
-        }
-        return noteCache[id]
-    }
-    function setAccountNote(id, note) {
-        const t = (note || "").trim()
-        if (!AppModel.run(() => { AppModel.core("set_setting", { key: "account.note." + id, value: t }); return true })) return
-        noteCache[id] = t
-        notesVersion++
-    }
-
     /// The vault changed (unlocked, locked, demo ↔ own vault): its settings and counts.
     function reloadVaultState() {
-        noteCache = {}
-        notesVersion++
         let name = ""
         if (AppModel.isUnlocked) {
             try { name = (AppModel.core("get_setting", { key: "ui.uncategorized_name" }) || "").trim() } catch (e) {}
@@ -124,6 +105,8 @@ QtObject {
         function onVaultReplaced() { sm.reloadVaultState() }
         // accounts reload after a sync, an import or an edit: the counts may have changed too
         function onGroupsChanged() { sm.refreshCounts() }
+        // documents fetched, added, read (#934): the unread badge
+        function onDocumentsVersionChanged() { sm.refreshCounts() }
     }
 
     // MARK: AppModel+CategoryDuplicate.swift › duplicateCategory (#510)
@@ -147,6 +130,69 @@ QtObject {
         AppModel.reloadCategories()
         if (root.parent_id !== null && root.parent_id !== undefined) expandCategoryPath(root.parent_id)
         return newRoot === undefined ? null : newRoot
+    }
+
+    // MARK: AppModel+Editing.swift › category drag & drop, „Nach oben“ / „Nach unten“ (#977)
+    /// The ids of the categories under `parent` (null = top level) in sidebar order;
+    /// `AppModel.categories` is in tree order, so a filter keeps the siblings' order.
+    function siblingIDs(parent) {
+        return AppModel.categories.filter(c => (c.parent_id ?? null) === parent).map(c => c.id)
+    }
+    /// canDropCategory(_:on:): never on itself or on one of its own sub-categories.
+    function canDropCategory(id, target) {
+        return AppModel.categoryMoveTargets(id).some(c => c.id === target)
+    }
+    /// categoryTakesDropInto(_:): a drop on the lower half goes into a main category or a
+    /// row with sub-categories instead of right below it.
+    function categoryTakesDropInto(target) {
+        const c = AppModel.categoryByID(target)
+        if (!c) return false
+        return (c.parent_id ?? null) === null || AppModel.categories.some(x => x.parent_id === target)
+    }
+    /// placeCategory(_:relativeTo:place:): category `id` before / after `target` among its
+    /// siblings, or last below it (`place` "into"), in one core call.
+    function placeCategory(id, target, place) {
+        const t = AppModel.categoryByID(target)
+        if (!t || !canDropCategory(id, target)) return
+        const parent = place === "into" ? target : (t.parent_id ?? null)
+        const ids = siblingIDs(parent).filter(x => x !== id)
+        const at = ids.indexOf(target)
+        if (place === "into") ids.push(id)
+        else if (place === "before") ids.splice(at < 0 ? ids.length : at, 0, id)
+        else ids.splice(at < 0 ? ids.length : at + 1, 0, id)
+        reorderCategories(parent, ids)
+        if (parent !== null) expandCategoryPath(parent) // keep it in view
+    }
+    /// shiftCategory(_:by:): one place up (-1) or down (+1) among its siblings.
+    function shiftCategory(id, step) {
+        const c = AppModel.categoryByID(id)
+        if (!c) return
+        const parent = c.parent_id ?? null
+        const ids = siblingIDs(parent)
+        const i = ids.indexOf(id)
+        if (i < 0 || i + step < 0 || i + step >= ids.length) return
+        ids[i] = ids[i + step]; ids[i + step] = id
+        reorderCategories(parent, ids)
+    }
+    /// canShiftCategory(_:by:): whether there is a sibling above (-1) or below (+1).
+    function canShiftCategory(id, step) {
+        const c = AppModel.categoryByID(id)
+        if (!c) return false
+        const ids = siblingIDs(c.parent_id ?? null)
+        const i = ids.indexOf(id)
+        return i >= 0 && i + step >= 0 && i + step < ids.length
+    }
+    function reorderCategories(parent, ids) {
+        if (!AppModel.run(() => { AppModel.core("reorder_categories", { parent_id: parent, ids: ids }); return true })) return
+        const moved = []
+        for (let i = 0; i < ids.length; i++) {
+            const c = AppModel.categoryByID(ids[i])
+            if (c) moved.push(Object.assign({}, c, { parent_id: parent, sort_order: ids.length - i }))
+        }
+        for (let m of moved) AppModel.categories[AppModel.categories.findIndex(x => x.id === m.id)] = m
+        AppModel.categoriesChanged()
+        AppModel.reloadCategories()
+        AppModel.reloadBookings() // the booking list shows a category's path
     }
 
     Component.onCompleted: { loadExpanded(); reloadVaultState() }

@@ -18,6 +18,12 @@ extension AppModel {
         return selectedBookingIDs.compactMap(self.booking(withID:))
     }
 
+    /// Keep a booking's category source intact when it already has the chosen category.
+    func setCategoryFromPicker(_ categoryID: Int64?, for booking: Booking) {
+        let changed = categorizeTargets(for: booking).filter { $0.categoryId != categoryID }
+        setCategory(categoryID, for: changed)
+    }
+
     /// Bookings dragged onto a sidebar category (#366); false when `items`
     /// carry no loaded booking.
     func dropBookings(_ items: [String], onCategory categoryID: Int64) -> Bool {
@@ -32,16 +38,20 @@ extension AppModel {
     /// So the rows show the new category at once and everything derived from it
     /// (totals, counts, KPIs) follows from a background refresh.
     func setCategory(_ categoryID: Int64?, for bookings: [Booking]) {
-        guard let vault, !bookings.isEmpty else { return }
+        setCategory(categoryID, forBookingIDs: bookings.map(\.id))
+    }
+
+    private func setCategory(_ categoryID: Int64?, forBookingIDs bookingIDs: [Booking.ID]) {
+        guard let vault, !bookingIDs.isEmpty else { return }
         do {
-            for b in bookings { try vault.setTransactionCategory(transactionId: b.id, categoryId: categoryID) }
+            for id in bookingIDs { try vault.setTransactionCategory(transactionId: id, categoryId: categoryID) }
         } catch {
             // Partly written: show the database state as before (synchronous).
             errorMessage = describe(error)
             reloadAfterCategoryChange()
             return
         }
-        showCategory(categoryID, on: Set(bookings.map(\.id)))
+        showCategory(categoryID, on: Set(bookingIDs))
         // Merchant histories count categories: keep the shown one until the new one is in.
         refreshSelectedBookingHistory()
         // Rule counts and the investment dashboard: reload only when on screen,
@@ -108,26 +118,39 @@ extension AppModel {
                 let r = try await Self.offMain { () -> CategoryRefresh in
                     let page = try Perf.interval("listTransactions") { try vault.listTransactions(filter: filter) }
                     try Task.checkCancellation()
-                    let flow = listHasFlow ? page.flow : try vault.selectionFlow(accountIds: filter.accountIds, dateFrom: from, dateTo: to)
+                    // fallback in the filter's own calculation context (#337)
+                    let flow: SelectionFlow
+                    if listHasFlow {
+                        flow = page.flow
+                    } else if filter.respectInTotal {
+                        flow = try vault.selectionFlowForTotals(accountIds: filter.accountIds, dateFrom: from, dateTo: to)
+                    } else {
+                        flow = try vault.selectionFlow(accountIds: filter.accountIds, dateFrom: from, dateTo: to)
+                    }
                     try Task.checkCancellation()
                     return CategoryRefresh(
                         page: page,
                         flow: flow,
-                        categories: try vault.listCategoriesFilteredAmount(dateFrom: from, dateTo: to, accountIds: sums.accounts, checked: sums.checked, direction: sums.direction, amountMinCents: sums.amount.minCents, amountMaxCents: sums.amount.maxCents),
-                        uncategorized: try uncategorizedQuery.map { Int(try vault.countTransactions(filter: $0)) },
+                        categories: try vault.listCategoriesFilteredAmount(dateFrom: from, dateTo: to, accountIds: sums.accounts, checked: sums.checked, direction: sums.direction, amountMinCents: sums.amount.minCents, amountMaxCents: sums.amount.maxCents, tagIds: [], untaggedOnly: false),
+                        uncategorized: Int(try vault.countTransactions(filter: uncategorizedQuery)),
                         groups: try vault.listAccountGroups(),
                         userGroups: try vault.listUserGroups()
                     )
                 }
                 guard !Task.isCancelled, let self, self.vault === vault else { return }
+                self.categoryRefreshTask = nil // done (a newer edit cancels this one first)
                 if generation == self.listGeneration {
                     self.dropPendingPage()
-                    self.publish(r.page)
+                    self.publish(r.page, filter: filter)
                 }
                 let (nowFrom, nowTo) = self.periodRange
                 let nowSums = self.categorySumFilter
                 if nowFrom == from, nowTo == to, nowSums.accounts == sums.accounts, nowSums.checked == sums.checked, nowSums.direction == sums.direction, nowSums.amount == sums.amount {
-                    if self.currentFilter.accountIds == filter.accountIds {
+                    // same calculation context as the captured filter, not only
+                    // the same accounts: the totals switch changes the KPIs
+                    // without changing the account list (#337)
+                    if self.currentFilter.accountIds == filter.accountIds,
+                       self.currentFilter.respectInTotal == filter.respectInTotal {
                         self.selectionFlow = (r.flow.consumptionCents, r.flow.investedCents, r.flow.incomeCents)
                     }
                     self.categories = r.categories
@@ -182,24 +205,31 @@ extension AppModel {
     /// Belege (there the list would silently mean every account).
     var canMarkAllChecked: Bool { vault != nil && newCount > 0 && sidebarSelection != .documents }
 
-    func markAllChecked(accountIDs: [Int64]? = nil) {
+    func markAllChecked(accountIDs: [Int64]? = nil, quietWhenEmpty: Bool = false) {
         guard let vault else { return }
         if accountIDs == nil, sidebarSelection == .documents { return }
-        var f = currentFilter
+        var f: BookingFilter
         if let accountIDs {
-            f.accountIds = accountIDs; f.categoryId = nil; f.uncategorizedOnly = false
-            f.search = nil; f.dateFrom = nil; f.dateTo = nil; f.direction = .all
-            f.scope = .all; f.merchantKey = nil; f.tagIds = []; f.untaggedOnly = false
+            guard !accountIDs.isEmpty else { return }
+            f = BookingFilter(accountIds: accountIDs, categoryId: nil, includeSubcategories: false,
+                              uncategorizedOnly: false, search: nil, dateFrom: nil, dateTo: nil,
+                              limit: 0, offset: 0, scope: .all, merchantKey: nil, direction: .all,
+                              checked: false, wholeDays: false)
+        } else {
+            f = currentFilter
+            f.checked = false; f.limit = 0; f.offset = 0; f.wholeDays = false
         }
-        f.checked = false; f.limit = 0; f.offset = 0; f.wholeDays = false
         let filter = f
-        Task { [weak self] in
+        let previous = checkedWriteTask
+        checkedWriteTask = Task { [weak self] in
+            await previous?.value
+            guard let self, self.vault === vault else { return }
             do {
                 let ids = try await Self.offMain { try vault.setCheckedForFilter(filter: filter, checked: true) }
-                guard let self, self.vault === vault else { return }
+                guard self.vault === vault, !ids.isEmpty || !quietWhenEmpty else { return }
                 self.finishMarkChecked(ids)
             } catch {
-                self?.errorMessage = describe(error)
+                if self.vault === vault { self.errorMessage = describe(error) }
             }
         }
     }
@@ -274,9 +304,11 @@ extension AppModel {
     /// Select the booking and put the cursor into its note field in the inspector.
     func editNote(for booking: Booking) {
         #if os(macOS)
-        // the note lives in the inspector: show it if it was hidden (the field claims the focus when it appears)
-        UserDefaults.standard.set(true, forKey: ViewLayout.inspectorKey)
+        AppDefaults.store.set(true, forKey: ViewLayout.inspectorKey)
+        #else
+        showBookingSheet = true
         #endif
+        selectedBookingIDs = [booking.id]
         selectedBookingID = booking.id
         pendingNoteFocus = booking.id
     }
@@ -288,10 +320,14 @@ extension AppModel {
         patchLoadedRows([booking.id]) { $0.note = note }
     }
 
-    func createCategory(name: String, parent: Int64?, symbol: String, color: String) {
+    func createCategory(name: String, parent: Int64?, symbol: String, color: String,
+                        assigning bookingIDs: [Booking.ID] = []) {
         guard let vault else { return }
-        runCore { _ = try vault.createCategory(name: name, parentId: parent, sfSymbol: symbol, colorHex: color) }
-        reloadCategories()
+        runCore {
+            let id = try vault.createCategory(name: name, parentId: parent, sfSymbol: symbol, colorHex: color)
+            reloadCategories()
+            setCategory(id, forBookingIDs: bookingIDs)
+        }
     }
 
     /// Changes one property of a category and keeps the others (#168) –
@@ -319,6 +355,69 @@ extension AppModel {
     func moveCategory(_ id: Int64, to parent: Int64?) {
         editCategory(id) { $0.parentId = parent }
         if let parent { expandCategoryPath(to: parent) } // keep it in view
+    }
+
+    /// Whether category `id` may be dropped on `target` (#977): never on itself
+    /// or on one of its own sub-categories, which would put it below itself.
+    func canDropCategory(_ id: Int64, on target: Int64) -> Bool {
+        categoryMoveTargets(for: id).contains { $0.id == target }
+    }
+
+    /// Whether a drop on the lower half of `target` goes into it (it has
+    /// sub-categories, or is a main category that may still get its first one)
+    /// instead of right below it.
+    func categoryTakesDropInto(_ target: Int64) -> Bool {
+        guard let c = categories.first(where: { $0.id == target }) else { return false }
+        return c.parentId == nil || categories.contains { $0.parentId == target }
+    }
+
+    /// Drag and drop of a sidebar category (#977): reorders it among its siblings
+    /// or hangs it under another category, in one core call. `false` when the
+    /// payload is no category or the drop is not allowed.
+    func dropCategory(_ items: [String], onto target: Int64, place: CategoryDropPlace) -> Bool {
+        guard let id = items.lazy.compactMap(GroupDrag.categoryID).first,
+              canDropCategory(id, on: target) else { return false }
+        placeCategory(id, relativeTo: target, place: place)
+        return true
+    }
+
+    /// Puts category `id` before/after `target` among its siblings, or last
+    /// below it (`.into`).
+    func placeCategory(_ id: Int64, relativeTo target: Int64, place: CategoryDropPlace) {
+        guard let vault, let t = categories.first(where: { $0.id == target }) else { return }
+        let parent: Int64? = place == .into ? target : t.parentId
+        // `categories` is in tree order, so a filter keeps the siblings' order
+        var ids = categories.filter { $0.parentId == parent && $0.id != id }.map(\.id)
+        switch place {
+        case .into: ids.append(id)
+        case .before: ids.insert(id, at: ids.firstIndex(of: target) ?? ids.endIndex)
+        case .after: ids.insert(id, at: ids.firstIndex(of: target).map { $0 + 1 } ?? ids.endIndex)
+        }
+        reorderCategories(parent, ids: ids, vault: vault)
+        if let parent { expandCategoryPath(to: parent) } // keep it in view
+    }
+
+    /// "Nach oben" / "Nach unten" of a category: one place among its siblings
+    /// (the menu twin of the drag, also for the keyboard and iOS).
+    func shiftCategory(_ id: Int64, by step: Int) {
+        guard let vault, let c = categories.first(where: { $0.id == id }) else { return }
+        var ids = categories.filter { $0.parentId == c.parentId }.map(\.id)
+        guard let i = ids.firstIndex(of: id), ids.indices.contains(i + step) else { return }
+        ids.swapAt(i, i + step)
+        reorderCategories(c.parentId, ids: ids, vault: vault)
+    }
+
+    /// Whether category `id` has a sibling above (`step` -1) or below (+1) it.
+    func canShiftCategory(_ id: Int64, by step: Int) -> Bool {
+        guard let c = categories.first(where: { $0.id == id }) else { return false }
+        let ids = categories.filter { $0.parentId == c.parentId }.map(\.id)
+        return ids.firstIndex(of: id).map { ids.indices.contains($0 + step) } ?? false
+    }
+
+    private func reorderCategories(_ parent: Int64?, ids: [Int64], vault: Vault) {
+        runCore { try vault.reorderCategories(parentId: parent, ids: ids) }
+        reloadCategories()
+        reloadBookings() // the booking list shows a category's path
     }
 
     /// Opens `id` and every category above it, so what is placed under `id`
@@ -408,20 +507,26 @@ extension AppModel {
     func openRuleEditor(draft: Rule?) {
         ruleDraft = draft
         showRuleEditor = true
+        #if os(macOS)
+        ruleEditorRequest &+= 1
+        #endif
     }
 
-    @discardableResult
-    func saveRule(_ rule: Rule) -> Int64? {
-        guard let vault else { return nil }
+    func saveRule(_ rule: Rule, onlyUncategorized: Bool) async throws -> (id: Int64, application: Result<UInt32, Error>)? {
+        guard let pin = pinVault() else { throw CoreError.Database(message: "vault locked") }
+        let result: (id: Int64, application: Result<UInt32, Error>)
         do {
-            let id = try vault.saveRule(rule: rule)
-            _ = try vault.applyRules(onlyUncategorized: false)
-            reloadAll()
-            return id
+            result = try await pin.run { vault in
+                let id = try vault.saveRule(rule: rule)
+                return (id, Result { try vault.applyRule(ruleId: id, onlyUncategorized: onlyUncategorized) })
+            }
         } catch {
-            showError(String(localized: "Regel konnte nicht gespeichert werden"), describe(error))
-            return nil
+            guard isCurrent(pin) else { return nil }
+            throw error
         }
+        guard isCurrent(pin) else { return nil }
+        reloadAll()
+        return result
     }
 
     func deleteRule(_ id: Int64) {

@@ -32,7 +32,9 @@ struct AssetAccountFrame<Top: View, Header: View, Metrics: View, Analysis: View,
     let analysis: () -> Analysis
     let content: (Bool) -> Content
 
-    @State private var contentWidth: CGFloat = 0
+    /// Wide enough for the table layouts. Updated only when the layout switches, so a resize
+    /// does not re-run the frame at every step.
+    @State private var wide = false
 
     init(
         searchText: Binding<String>,
@@ -56,17 +58,17 @@ struct AssetAccountFrame<Top: View, Header: View, Metrics: View, Analysis: View,
         self.content = content
     }
 
-    private var wide: Bool { contentWidth >= 700 * textScale }
-
     var body: some View {
         VStack(spacing: 0) {
             BankingPolicyBanner()
             AnnouncementBanner()
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: ViewLayout.assetBlockSpacing) {
                     // Marketing screenshots (`--screenshot`) look like a real vault: no demo banner.
                     if model.demoActive && LaunchOptions.current.screenshotPath == nil {
+                        // same gap to the first card as above the booking list (#1538)
                         DemoBanner()
+                            .padding(.bottom, ViewLayout.demoBannerBottomPadding(stackSpacing: ViewLayout.assetBlockSpacing))
                     }
                     top()
                     header()
@@ -84,7 +86,7 @@ struct AssetAccountFrame<Top: View, Header: View, Metrics: View, Analysis: View,
                         Color.clear.contentShape(Rectangle()).onTapGesture(perform: backgroundTap)
                     }
                 }
-                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+                .onGeometryChange(for: Bool.self) { [textScale] in $0.size.width >= 700 * textScale } action: { wide = $0 }
             }
             .scrollBounceBehavior(.basedOnSize)
         }
@@ -97,7 +99,7 @@ struct AssetAccountFrame<Top: View, Header: View, Metrics: View, Analysis: View,
         #endif
         #if os(iOS)
         .modifier(MainToolbar())
-        .modifier(WindowTitle(title: model.title))
+        .modifier(WindowTitle())
         .refreshable { await model.refreshCurrentView() }
         #endif
         .bookingOutputSheets()
@@ -112,9 +114,11 @@ struct AssetAccountFrame<Top: View, Header: View, Metrics: View, Analysis: View,
 struct AssetHeaderCard<Subtitle: View, ValueNote: View, Accessory: View, Actions: View>: View {
     @Environment(AppModel.self) private var model
     @Environment(\.textScale) private var textScale
+    @Environment(\.reportRedaction) private var redaction
     @AppStorage(ViewLayout.compactHeaderKey) private var compactHeader = false
     @State private var showDocuments = false
-    @State private var width: CGFloat = 0
+    /// Too narrow for name and value side by side (iPhone, large text): one below the other.
+    @State private var stacked = false
 
     let account: Account
     let title: String
@@ -154,8 +158,6 @@ struct AssetHeaderCard<Subtitle: View, ValueNote: View, Accessory: View, Actions
     }
 
     private var currency: String { account.currency.isEmpty ? "EUR" : account.currency }
-    /// Too narrow for name and value side by side (iPhone, large text): one below the other.
-    private var stacked: Bool { width > 0 && width < 460 * textScale }
 
     private var compactTitle: LocalizedStringKey {
         compactHeader ? "Kopfbereich einblenden" : "Kopfbereich minimieren"
@@ -187,35 +189,54 @@ struct AssetHeaderCard<Subtitle: View, ValueNote: View, Accessory: View, Actions
             }
         }
         .card()
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+        .onGeometryChange(for: Bool.self) { [textScale] in $0.size.width > 0 && $0.size.width < 460 * textScale } action: { stacked = $0 }
         .capturableSheet(isPresented: $showDocuments) { AccountDocumentsSheet(account: account) }
         .capturablePopover(isPresented: $model.showCustomPeriod, arrowEdge: .bottom) { CustomPeriodForm() }
     }
 
+    /// Folded: "bank · IBAN · own note" next to the name (GitHub #1621).
+    private var compactLine: String {
+        let iban = account.iban.isEmpty ? "" : formatIBAN(account.iban)
+        let subtitle = [account.bankName, iban].filter { !$0.isEmpty }.joined(separator: " · ")
+        return CompactAccountLine.text(subtitle: subtitle, note: model.accountNote(for: account.id))
+    }
+
     private var titleBlock: some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: compactHeader ? .center : .top, spacing: 8) {
+            // Minimise the header: more room for the content (GitHub #358); the chart goes away with it.
+            // Left of the title, like in the cash views' header, so the button stays in one place (#1536).
+            CardChevron(collapsed: $compactHeader, customTitle: compactTitle)
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).sensitive()
-                    .appFont(compactHeader ? .headline : .title2, weight: .semibold)
-                    .foregroundStyle(Theme.text).lineLimit(stacked ? 2 : 1).minimumScaleFactor(stacked ? 1 : 0.7)
+                if compactHeader, !stacked, !compactLine.isEmpty {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(title).sensitive()
+                            .appFont(.headline, weight: .semibold)
+                            .foregroundStyle(Theme.text).lineLimit(1).minimumScaleFactor(0.7)
+                            .layoutPriority(1)
+                        Text(compactLine).sensitive()
+                            .appFont(.caption)
+                            .foregroundStyle(Theme.secondary)
+                            .lineLimit(1)
+                            .help(redaction.masking(compactLine))
+                    }
+                } else {
+                    Text(title).sensitive()
+                        .appFont(compactHeader ? .headline : .title2, weight: .semibold)
+                        .foregroundStyle(Theme.text).lineLimit(stacked ? 2 : 1).minimumScaleFactor(stacked ? 1 : 0.7)
+                }
+                if compactHeader, stacked, !compactLine.isEmpty {
+                    // narrow (iPhone): the line goes below the name instead of beside it
+                    Text(compactLine).sensitive()
+                        .appFont(.caption)
+                        .foregroundStyle(Theme.secondary)
+                        .lineLimit(1)
+                        .help(redaction.masking(compactLine))
+                }
                 if !compactHeader {
                     subtitle()
                 }
             }
             .contextMenu { AccountCopyMenu(account: account) }
-            // Minimise the header: more room for the content (GitHub #358); the chart goes away with it.
-            Button {
-                withAnimation(Motion.animation(.easeInOut(duration: 0.25))) { compactHeader.toggle() }
-            } label: {
-                Image(systemName: compactHeader ? "chevron.down" : "chevron.up")
-                    .appFont(.caption, weight: .semibold)
-                    .foregroundStyle(Theme.secondary)
-                    .padding(4)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help(compactTitle)
-            .accessibilityLabel(compactTitle)
             #if os(iOS)
             // long-press is invisible on iPhone/iPad: show an explicit entry too
             Menu { AccountCopyMenu(account: account) } label: {

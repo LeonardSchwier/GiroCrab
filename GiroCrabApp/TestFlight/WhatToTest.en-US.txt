@@ -1,12 +1,6 @@
-GiroCrab v0.8.5 (iOS Build under Version 0.7.5, Schema v27)
+What's new in Build 25 (v0.7.5):
 
-Note on the TestFlight version number:
-Because our development moves faster than Apple's version review for new release trains, the complete v0.8.5 release ships immediately as a new build under 0.7.5.
-
-What to test:
-- Built-in FinTS product registration & automatic encrypted vault backup before upgrade.
-- Tag filtering & analytics (#228, #777): Filter bookings by tags and analyze them in charts.
-- EquatePlus & per-holding currencies (#750, #625): New EquatePlus connector and native currency per holding.
-- Revolut OAuth popup (#289), ING Business (#721), Sparda Hannover (#619) & C24 categories (#763).
-- iOS Fix (#768): Paste Key sheet in Settings -> Security stays open reliably.
-- Performance & UI polish: ListCache (#760), split booking categories (#654), inline Analytics toggle (#757) and sidebar counts (#592).
+• 🔐 Enable Banking & iCloud Keychain: Sync per-connection Enable Banking applications via iCloud Keychain, resolve conflicts cleanly on save, and harden lock/reset handling.
+• ₿ Bitcoin Core & New Account Types: Track self-hosted Bitcoin Core wallets in Net Worth, add Building Savings (*Bausparen*) and Fixed-Term Deposit (*Festgeld*) account types, group accounts and cash by type, and support `girocrab://transfer` payment links.
+• 🧾 Document Matching, Merchant Rules & Categorization: Automatically match and re-sort bank documents by content while preserving manual unlinks, configure custom merchant patterns, scoped rules with tags, and a dedicated macOS Rule Editor window.
+• 🏦 FinTS, Transfers & Cross-Platform Improvements: Savings-to-reference transfers (`HKCUM`), IBAN bank-name hints, complete Monday statement fetches, per-connection polling intervals, expanded Windows CSV export and document read status, plus Android Keystore support.

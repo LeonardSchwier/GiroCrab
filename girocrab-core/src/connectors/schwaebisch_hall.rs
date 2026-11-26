@@ -32,11 +32,11 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rusqlite::{params, OptionalExtension};
-use serde_json::{json, Map, Value};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rusqlite::{OptionalExtension, params};
+use serde_json::{Map, Value, json};
 
-use super::{store_fetch, FetchResult, RemoteAccount, RemoteTransaction, SyncSummary};
+use super::{FetchResult, RemoteAccount, RemoteTransaction, SyncSummary, store_fetch};
 use crate::{
     dates::month_from_name,
     error::{CoreError, CoreResult},
@@ -55,9 +55,9 @@ const GATE: &str = "schwaebischhall";
 const MAX_BOOKINGS: usize = 20_000;
 
 fn invalid() -> CoreError {
-    CoreError::InvalidInput {
-        message: tr("Schwäbisch Hall: Unvollständige oder ungültige Portalantwort. Es wurden keine Daten übernommen.").into(),
-    }
+    CoreError::invalid(tr(
+        "Schwäbisch Hall: Unvollständige oder ungültige Portalantwort. Es wurden keine Daten übernommen.",
+    ))
 }
 
 /// Trimmed string field with whitespace collapsed and HTML entities decoded.
@@ -84,25 +84,13 @@ fn vtn(v: &Value) -> CoreResult<String> {
 }
 
 /// Portal amount (`&#43; 1.234,56`, `- 12,00 €`, `−5,00`, or a JSON number) in cents.
-/// Strict: anything but a leading sign, digits, separators, spaces and a
-/// currency (`€`/`EUR`) is rejected, so a debit/credit marker such as a
-/// trailing `S`/`H` or `-` can never be dropped and flip the sign.
+/// Strict: [`crate::money::parse_cents`] rejects letters, so a debit/credit
+/// marker such as a trailing `S`/`H` can never be dropped and flip the sign.
 fn amount(v: &Value) -> CoreResult<i64> {
     match v {
         Value::Number(_) => crate::money::json_number_to_cents_rounded(v),
         Value::String(s) => {
-            let decoded = decode_html_entities(s).replace(['\u{2212}', '\u{2013}'], "-");
-            let mut t = decoded.trim();
-            for currency in ["EUR", "eur", "€"] {
-                t = t.strip_suffix(currency).unwrap_or(t).trim_end();
-                t = t.strip_prefix(currency).unwrap_or(t).trim_start();
-            }
-            let cleaned: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-            let allowed = |c: char| c.is_ascii_digit() || matches!(c, '+' | '-' | ',' | '.');
-            if !cleaned.chars().all(allowed) || !cleaned.bytes().any(|b| b.is_ascii_digit()) {
-                return Err(invalid());
-            }
-            crate::money::parse_cents(&cleaned).map_err(|_| invalid())
+            crate::money::parse_cents(&decode_html_entities(s)).map_err(|_| invalid())
         }
         _ => Err(invalid()),
     }
@@ -185,11 +173,14 @@ fn day_parts(v: &Value) -> (Option<u32>, Option<u32>, Option<i32>) {
         Value::String(s) => s.trim().to_string(),
         _ => return (None, None, None),
     };
-    if let Some(iso) = s.get(..10).filter(|p| p.as_bytes().get(4) == Some(&b'-')) {
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(iso, "%Y-%m-%d") {
-            use chrono::Datelike;
-            return (Some(d.day()), Some(d.month()), Some(d.year()));
-        }
+    if let Some(iso) = s.get(..10).filter(|p| p.as_bytes().get(4) == Some(&b'-'))
+        && let Ok(d) = jiff::civil::Date::strptime("%Y-%m-%d", iso)
+    {
+        return (
+            Some(d.day() as u32),
+            Some(d.month() as u32),
+            Some(d.year().into()),
+        );
     }
     let parts: Vec<&str> = s.split('.').map(str::trim).collect();
     let num = |p: Option<&&str>| {
@@ -258,9 +249,9 @@ fn collect_bookings(
             let y = d_year.or(year).ok_or_else(invalid)?;
             let m = d_month.or(month).ok_or_else(invalid)?;
             let d = day.ok_or_else(invalid)?;
-            let date = chrono::NaiveDate::from_ymd_opt(y, m, d).ok_or_else(invalid)?;
+            let date = crate::dates::ymd(y, m, d).ok_or_else(invalid)?;
             out.push(Booking {
-                date: date.format("%Y-%m-%d").to_string(),
+                date: crate::dates::iso(date),
                 amount_cents: amount(&obj["amount"])?,
                 subject: text(v, "subject"),
             });
@@ -290,7 +281,8 @@ fn account_kind(contract: &Value, details: &Value) -> AccountKind {
     if words.contains("darlehen") || words.contains("kredit") {
         AccountKind::Loan
     } else {
-        AccountKind::Savings
+        // a Bausparvertrag in its savings phase (#1630)
+        AccountKind::BuildingSavings
     }
 }
 
@@ -400,18 +392,19 @@ fn document_date(v: &Value) -> Option<String> {
         } else {
             n
         };
-        return chrono::DateTime::from_timestamp_millis(ms)
-            .map(|d| d.date_naive().format("%Y-%m-%d").to_string());
+        return jiff::Timestamp::from_millisecond(ms)
+            .ok()
+            .map(|t| crate::dates::iso(crate::dates::utc_date(t)));
     }
     let s = v.as_str()?.trim();
     if let Some(d) = s
         .get(..10)
-        .and_then(|p| chrono::NaiveDate::parse_from_str(p, "%Y-%m-%d").ok())
+        .and_then(|p| jiff::civil::Date::strptime("%Y-%m-%d", p).ok())
     {
-        return Some(d.format("%Y-%m-%d").to_string());
+        return Some(crate::dates::iso(d));
     }
     let (d, m, y) = day_parts(&Value::String(s.into()));
-    chrono::NaiveDate::from_ymd_opt(y?, m?, d?).map(|d| d.format("%Y-%m-%d").to_string())
+    crate::dates::ymd(y?, m?, d?).map(crate::dates::iso)
 }
 
 /// Account a postbox attachment belongs to: the contract the message names
@@ -622,15 +615,9 @@ mod tests {
         );
         assert!(amount(&json!("")).is_err());
         assert!(amount(&json!("n/a")).is_err());
+        assert_eq!(amount(&json!("1.234,56-")).unwrap(), -123_456);
         // debit/credit markers must never be dropped (the sign would flip)
-        for bad in [
-            "12,00 S",
-            "5,00 H",
-            "1.234,56-",
-            "+ -5,00",
-            "--5,00",
-            "5,00 USD",
-        ] {
+        for bad in ["12,00 S", "5,00 H", "+ -5,00", "--5,00", "5,00 USD"] {
             assert!(amount(&json!(bad)).is_err(), "{bad}");
         }
         assert!(amount(&Value::Null).is_err());
@@ -674,22 +661,26 @@ mod tests {
         assert_eq!(r.transactions.len(), 1);
         // an unknown amount+date object without subject stops the import
         let tx = json!({"2025": {"Mai": [{"day": 3, "amount": "+ 9,00"}]}});
-        assert!(parse(json!([contract(
-            "0012345600101",
-            "Bausparvertrag",
-            "+ 9,00",
-            tx
-        )]))
-        .is_err());
+        assert!(
+            parse(json!([contract(
+                "0012345600101",
+                "Bausparvertrag",
+                "+ 9,00",
+                tx
+            )]))
+            .is_err()
+        );
         // bookings under a bare list index have no month: rejected, not January
         let tx = json!({"2025": {"1": {"day": 3, "subject": "a", "amount": "+ 1,00"}}});
-        assert!(parse(json!([contract(
-            "0012345600101",
-            "Bausparvertrag",
-            "+ 1,00",
-            tx
-        )]))
-        .is_err());
+        assert!(
+            parse(json!([contract(
+                "0012345600101",
+                "Bausparvertrag",
+                "+ 1,00",
+                tx
+            )]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -714,7 +705,7 @@ mod tests {
         assert_eq!(a.external_ref, "bsh:0012345600101");
         assert_eq!(a.name, "Bausparvertrag 123456 A 01");
         assert_eq!(a.account_number, "123456 A 01");
-        assert_eq!(a.kind, AccountKind::Savings);
+        assert_eq!(a.kind, AccountKind::BuildingSavings);
         assert_eq!((a.balance_cents, a.balance_date.as_str()), (109_050, TODAY));
         let mut got: Vec<_> = r
             .transactions
@@ -733,10 +724,11 @@ mod tests {
         );
         // no bank id: store_fetch numbers the two identical rates as two content ids
         assert!(r.transactions.iter().all(|t| t.external_id.is_empty()));
-        assert!(r
-            .transactions
-            .iter()
-            .all(|t| t.value_date == t.booking_date));
+        assert!(
+            r.transactions
+                .iter()
+                .all(|t| t.value_date == t.booking_date)
+        );
     }
 
     /// The portal's real shape (anonymised sample from the issue author, #290):
@@ -765,7 +757,7 @@ mod tests {
         );
         c["details"] = portal_sample_details();
         let r = parse(json!([c])).unwrap();
-        assert_eq!(r.accounts[0].kind, AccountKind::Savings);
+        assert_eq!(r.accounts[0].kind, AccountKind::BuildingSavings);
         let got: Vec<_> = r
             .transactions
             .iter()
@@ -908,18 +900,24 @@ mod tests {
         no_details["details"] = Value::Null;
         assert!(parse(json!([no_details])).is_err());
         // a booking without year/month, with an impossible date or a broken amount
-        assert!(parse(json!([ok(
-            json!([{"day": 1, "subject": "x", "amount": "+ 1,00"}])
-        )]))
-        .is_err());
-        assert!(parse(json!([ok(
-            json!({"2025": {"Februar": [{"day": 30, "amount": "+ 1,00"}]}})
-        )]))
-        .is_err());
-        assert!(parse(json!([ok(
-            json!({"2025": {"Mai": [{"day": 3, "amount": "viel"}]}})
-        )]))
-        .is_err());
+        assert!(
+            parse(json!([ok(
+                json!([{"day": 1, "subject": "x", "amount": "+ 1,00"}])
+            )]))
+            .is_err()
+        );
+        assert!(
+            parse(json!([ok(
+                json!({"2025": {"Februar": [{"day": 30, "amount": "+ 1,00"}]}})
+            )]))
+            .is_err()
+        );
+        assert!(
+            parse(json!([ok(
+                json!({"2025": {"Mai": [{"day": 3, "amount": "viel"}]}})
+            )]))
+            .is_err()
+        );
         assert!(parse(json!([ok(json!("2025"))])).is_err());
     }
 
@@ -963,27 +961,35 @@ mod tests {
             .pending_schwaebisch_hall_documents(connection, list.clone())
             .unwrap();
         assert_eq!(pending.len(), 1);
-        assert!(vault
-            .clone()
-            .import_schwaebisch_hall_document(connection, doc.clone(), b"<html>".to_vec())
-            .is_err());
-        assert!(vault
-            .clone()
-            .import_schwaebisch_hall_document(
-                connection,
-                pending[0].clone(),
-                b"%PDF-1.7 x".to_vec()
-            )
-            .unwrap());
-        assert!(!vault
-            .clone()
-            .import_schwaebisch_hall_document(connection, doc, b"%PDF-1.7 x".to_vec())
-            .unwrap());
-        assert!(vault
-            .clone()
-            .pending_schwaebisch_hall_documents(connection, list)
-            .unwrap()
-            .is_empty());
+        assert!(
+            vault
+                .clone()
+                .import_schwaebisch_hall_document(connection, doc.clone(), b"<html>".to_vec())
+                .is_err()
+        );
+        assert!(
+            vault
+                .clone()
+                .import_schwaebisch_hall_document(
+                    connection,
+                    pending[0].clone(),
+                    b"%PDF-1.7 x".to_vec()
+                )
+                .unwrap()
+        );
+        assert!(
+            !vault
+                .clone()
+                .import_schwaebisch_hall_document(connection, doc, b"%PDF-1.7 x".to_vec())
+                .unwrap()
+        );
+        assert!(
+            vault
+                .clone()
+                .pending_schwaebisch_hall_documents(connection, list)
+                .unwrap()
+                .is_empty()
+        );
         let docs = vault.list_all_documents(Default::default()).unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(
@@ -996,22 +1002,28 @@ mod tests {
         // A contract that is not imported (held back, skipped, archived) gets
         // none of its documents, and they never fall back to another contract.
         let unknown = json!({"id": "att-2", "title": "Fremd", "vtn": "0099999900101"}).to_string();
-        assert!(vault
-            .clone()
-            .pending_schwaebisch_hall_documents(connection, format!("[{unknown}]"))
-            .unwrap()
-            .is_empty());
-        assert!(vault
-            .clone()
-            .import_schwaebisch_hall_document(connection, unknown, b"%PDF-1.7 x".to_vec())
-            .is_err());
+        assert!(
+            vault
+                .clone()
+                .pending_schwaebisch_hall_documents(connection, format!("[{unknown}]"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            vault
+                .clone()
+                .import_schwaebisch_hall_document(connection, unknown, b"%PDF-1.7 x".to_vec())
+                .is_err()
+        );
         vault.set_account_archived(named.unwrap(), true).unwrap();
         let archived = json!({"id": "att-3", "vtn": "0012345600202"}).to_string();
-        assert!(vault
-            .clone()
-            .pending_schwaebisch_hall_documents(connection, format!("[{archived}]"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            vault
+                .clone()
+                .pending_schwaebisch_hall_documents(connection, format!("[{archived}]"))
+                .unwrap()
+                .is_empty()
+        );
         // without a named contract: the first imported one
         let plain = json!({"id": "att-4", "date": 1_767_225_600_i64}).to_string();
         assert_eq!(
@@ -1024,32 +1036,40 @@ mod tests {
         );
         // malformed vtn, oversized input
         let bad = json!({"id": "att-5", "vtn": "1 OR 1=1"}).to_string();
-        assert!(vault
-            .clone()
-            .pending_schwaebisch_hall_documents(connection, format!("[{bad}]"))
-            .is_err());
+        assert!(
+            vault
+                .clone()
+                .pending_schwaebisch_hall_documents(connection, format!("[{bad}]"))
+                .is_err()
+        );
         let mut huge = b"%PDF-".to_vec();
         huge.resize(super::super::MAX_DOC_BYTES + 1, b' ');
-        assert!(vault
-            .clone()
-            .import_schwaebisch_hall_document(connection, plain, huge)
-            .is_err());
-        assert!(vault
-            .clone()
-            .import_schwaebisch_hall_snapshot(
-                connection,
-                " ".repeat(super::super::MAX_TEXT_BYTES + 1)
-            )
-            .is_err());
+        assert!(
+            vault
+                .clone()
+                .import_schwaebisch_hall_document(connection, plain, huge)
+                .is_err()
+        );
+        assert!(
+            vault
+                .clone()
+                .import_schwaebisch_hall_snapshot(
+                    connection,
+                    " ".repeat(super::super::MAX_TEXT_BYTES + 1)
+                )
+                .is_err()
+        );
 
         // another connector's login is refused
         let wrong = vault
             .add_bank_connection(ConnectorKind::PayPal, "Other".into(), "test".into())
             .unwrap();
-        assert!(vault
-            .clone()
-            .import_schwaebisch_hall_snapshot(wrong, "{}".into())
-            .is_err());
+        assert!(
+            vault
+                .clone()
+                .import_schwaebisch_hall_snapshot(wrong, "{}".into())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1076,10 +1096,12 @@ mod tests {
         import(json!([first, second.clone()]));
         assert_eq!(import(json!([second])).revoked_accounts.len(), 1);
         let doc = json!({"id": "att-x", "title": "Info"}).to_string();
-        assert!(vault
-            .clone()
-            .import_schwaebisch_hall_document(connection, doc, b"%PDF-1.7 x".to_vec())
-            .unwrap());
+        assert!(
+            vault
+                .clone()
+                .import_schwaebisch_hall_document(connection, doc, b"%PDF-1.7 x".to_vec())
+                .unwrap()
+        );
         let docs = vault.list_all_documents(Default::default()).unwrap();
         let delivered = vault
             .list_accounts()

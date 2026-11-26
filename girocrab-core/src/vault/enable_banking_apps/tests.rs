@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::PrivateKey;
+use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 
 use super::*;
 use crate::connectors::enable_banking::EnableBankingConnector;
@@ -89,9 +89,10 @@ fn second_application_does_not_move_existing_logins() {
     assert_eq!(kid_for(&v, bank1), "app-a");
 
     let bank2 = login(&v, "enablebanking:DE:N26", "Bank 2");
-    assert!(v
-        .set_connection_enable_banking_app(bank2, "app-b".into(), pem_b.clone())
-        .unwrap());
+    assert!(
+        v.set_connection_enable_banking_app(bank2, "app-b".into(), pem_b.clone())
+            .unwrap()
+    );
     assert_eq!(kid_for(&v, bank1), "app-a");
     assert_eq!(kid_for(&v, bank2), "app-b");
 
@@ -165,21 +166,24 @@ fn changing_a_logins_application_drops_only_its_session() {
     set_session(&v, bank2);
 
     // the same application as before: nothing changes
-    assert!(!v
-        .set_connection_enable_banking_app(bank1, " app-a ".into(), pem_a.clone())
-        .unwrap());
+    assert!(
+        !v.set_connection_enable_banking_app(bank1, " app-a ".into(), pem_a.clone())
+            .unwrap()
+    );
     assert!(has_session(&v, bank1));
 
-    assert!(v
-        .set_connection_enable_banking_app(bank1, "app-b".into(), pem())
-        .unwrap());
+    assert!(
+        v.set_connection_enable_banking_app(bank1, "app-b".into(), pem())
+            .unwrap()
+    );
     assert!(!has_session(&v, bank1));
     assert!(has_session(&v, bank2));
 
     // back to the default
-    assert!(v
-        .set_connection_enable_banking_app(bank1, String::new(), String::new())
-        .unwrap());
+    assert!(
+        v.set_connection_enable_banking_app(bank1, String::new(), String::new())
+            .unwrap()
+    );
     let app = v.connection_enable_banking_app(bank1).unwrap().unwrap();
     assert!(!app.own);
     assert_eq!(app.application_id, "app-a");
@@ -253,4 +257,66 @@ fn own_private_key_is_stored_as_secret() {
     };
     assert_eq!(secret(&pem_key), 1);
     assert_eq!(secret(&id_key), 0);
+}
+
+// --- cross-device assignment (#962) ---
+
+/// Same login in two vaults with different local ids: same `sync_key`, so
+/// the other device finds it.
+#[test]
+fn sync_key_is_the_same_across_vaults_with_other_ids() {
+    let (_d1, mac) = vault("eb-sync-mac");
+    let (_d2, phone) = vault("eb-sync-phone");
+    let pad = login(&phone, "enablebanking", "Andere Bank");
+    let on_mac = login(&mac, "enablebanking", "Bank 2");
+    let on_phone = login(&phone, "enablebanking", "Bank 2");
+    assert_ne!(on_mac, on_phone);
+    let key = |v: &Vault, id: i64| {
+        v.list_enable_banking_logins()
+            .unwrap()
+            .into_iter()
+            .find(|l| l.connection_id == id)
+            .unwrap()
+            .sync_key
+    };
+    assert_eq!(key(&mac, on_mac), key(&phone, on_phone));
+    assert_ne!(key(&phone, pad), key(&phone, on_phone));
+    // no login name in the key
+    assert!(!key(&mac, on_mac).contains("Bank"));
+}
+
+#[test]
+fn list_has_only_enable_banking_logins_with_their_own_application() {
+    let (_d, v) = vault("eb-sync-list");
+    let key = pem();
+    set_default(&v, "app-a", &key);
+    let plain = login(&v, "enablebanking", "Bank 1");
+    let own = login(&v, "enablebanking", "Bank 2");
+    login(&v, "fints:12030000", "Giro");
+    v.set_connection_enable_banking_app(own, "app-b".into(), pem())
+        .unwrap();
+    let list = v.list_enable_banking_logins().unwrap();
+    assert_eq!(list.len(), 2);
+    let get = |id| list.iter().find(|l| l.connection_id == id).unwrap();
+    assert_eq!(get(plain).application_id, "");
+    assert_eq!(get(own).application_id, "app-b");
+    assert_eq!(get(own).synced_application_id, None);
+}
+
+#[test]
+fn synced_marker_round_trips_default_and_is_forgotten() {
+    let (_d, v) = vault("eb-sync-marker");
+    let id = login(&v, "enablebanking", "Bank 1");
+    let synced = |v: &Vault| {
+        v.list_enable_banking_logins().unwrap()[0]
+            .synced_application_id
+            .clone()
+    };
+    v.mark_enable_banking_login_synced(id, "app-b".into())
+        .unwrap();
+    assert_eq!(synced(&v).as_deref(), Some("app-b"));
+    v.mark_enable_banking_login_synced(id, "  ".into()).unwrap();
+    assert_eq!(synced(&v).as_deref(), Some(""));
+    forget(&v.db().unwrap(), id).unwrap();
+    assert_eq!(synced(&v), None);
 }

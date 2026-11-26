@@ -73,7 +73,7 @@ impl BankConnector for DemoConnector {
     async fn begin(&mut self, _ctx: &ConnectContext) -> CoreResult<Phase> {
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         let c = match self.kind {
-            ConnectorKind::VolksbankKasselGoettingen | ConnectorKind::Direkt1822 | ConnectorKind::FinTsGeneric | ConnectorKind::Comdirect | ConnectorKind::ScalableCapital | ConnectorKind::VolkswagenBank | ConnectorKind::FordMoney | ConnectorKind::OpelDirektbank => Challenge {
+            ConnectorKind::VolksbankKasselGoettingen | ConnectorKind::Direkt1822 | ConnectorKind::FinTsGeneric | ConnectorKind::Comdirect | ConnectorKind::ScalableCapital | ConnectorKind::VolkswagenBank | ConnectorKind::FordMoney | ConnectorKind::OpelDirektbank | ConnectorKind::HanseaticBank | ConnectorKind::Kontist => Challenge {
                 kind: ChallengeKind::DecoupledPush,
                 title: tr("Bitte in der Banking-App freigeben").into(),
                 message: tr("Demo: Eine Push-Nachricht wurde „gesendet“. Die Freigabe wird nach wenigen Sekunden simuliert.").into(),
@@ -82,6 +82,8 @@ impl BankConnector for DemoConnector {
                     ConnectorKind::Direkt1822 | ConnectorKind::VolkswagenBank => "pushTAN (Demo)".into(),
                     ConnectorKind::FordMoney => "Security-App (Demo)".into(),
                     ConnectorKind::OpelDirektbank => "TwoVerify (Demo)".into(),
+                    ConnectorKind::Kontist => "Kontist-App (Demo)".into(),
+                    ConnectorKind::HanseaticBank => "Hanseatic Bank App (Demo)".into(),
                     ConnectorKind::ScalableCapital => "Browser-Anmeldung (Demo)".into(),
                     _ => "photoTAN push (Demo)".into(),
                 },
@@ -100,6 +102,16 @@ impl BankConnector for DemoConnector {
                 expires_in_seconds: Some(300),
                 poll_interval_seconds: 0,
             },
+            ConnectorKind::Bhw => Challenge {
+                kind: ChallengeKind::Code,
+                title: "myBHW".into(),
+                message: tr("Demo: beliebigen 6-stelligen Code eingeben.").into(),
+                method_name: tr("Einmal-Code per E-Mail (Demo)").into(),
+                redirect_url: None,
+                image: None,
+                expires_in_seconds: Some(300),
+                poll_interval_seconds: 0,
+            },
             ConnectorKind::TradeRepublic => Challenge {
                 kind: ChallengeKind::Code,
                 title: "Trade Republic 2FA".into(),
@@ -112,10 +124,16 @@ impl BankConnector for DemoConnector {
             },
             ConnectorKind::AmericanExpress
             | ConnectorKind::Advanzia
+            | ConnectorKind::Edenred
             | ConnectorKind::AmazonVisa
             | ConnectorKind::AmazonOrders
             | ConnectorKind::EquatePlus
             | ConnectorKind::Quirion
+            | ConnectorKind::Sharinbox
+            | ConnectorKind::AxaShareplan
+            | ConnectorKind::UnionInvestment
+            | ConnectorKind::AirPlus
+            | ConnectorKind::BerghausCie
             | ConnectorKind::SchwaebischHall
             | ConnectorKind::Fnz
             | ConnectorKind::EnableBanking => Challenge {
@@ -128,7 +146,7 @@ impl BankConnector for DemoConnector {
                 expires_in_seconds: Some(900),
                 poll_interval_seconds: 0,
             },
-            ConnectorKind::PayPal | ConnectorKind::Bunq | ConnectorKind::Ibkr | ConnectorKind::AlteLeipziger | ConnectorKind::Uberspace | ConnectorKind::Ffb => return Ok(Phase::Ready),
+            ConnectorKind::PayPal | ConnectorKind::Bunq | ConnectorKind::Ibkr | ConnectorKind::AlteLeipziger | ConnectorKind::Uberspace | ConnectorKind::BitcoinCore | ConnectorKind::Ffb | ConnectorKind::Finpension | ConnectorKind::Monefit | ConnectorKind::Bitcoin | ConnectorKind::GoAndGrow => return Ok(Phase::Ready),
         };
         self.challenge = Some(c.clone());
         Ok(Phase::Challenge(c))
@@ -296,7 +314,7 @@ impl BankConnector for DemoConnector {
 
     async fn fetch(&mut self, _ctx: &ConnectContext) -> CoreResult<FetchResult> {
         let today = super::today();
-        let stamp = chrono::Local::now().timestamp();
+        let stamp = jiff::Timestamp::now().as_second();
         let mut out = FetchResult::default();
         // A magic-login connection at a bank without own demo accounts (generic
         // FinTS, comdirect, …) shows the demo giro bank's accounts.
@@ -367,12 +385,8 @@ mod tests {
     fn ctx() -> ConnectContext {
         ConnectContext {
             connection_id: 1,
-            login_name: String::new(),
             secret: SecretString::new("pin".into()),
-            settings: Default::default(),
-            state: serde_json::Value::Null,
-            since: String::new(),
-            since_by_account: Default::default(),
+            ..Default::default()
         }
     }
 

@@ -5,8 +5,18 @@ import GiroCrabCore
 extension AppModel {
     // MARK: - Loading
 
+    /// A totals reload supersedes category snapshots and refreshes the cashflow
+    /// card even when the proof list keeps exactly the same bookings.
+    func invalidateTotals() {
+        categoryRefreshTask?.cancel()
+        categoryRefreshTask = nil
+        totalsVersion += 1
+    }
+
     func reloadAll() {
+        invalidateTotals()
         assetClassificationVersion += 1
+        merchantSettingsRevision += 1
         let all = Perf.signposter.beginInterval("reloadAll")
         defer { Perf.signposter.endInterval("reloadAll", all) }
         reloadAccounts()
@@ -28,7 +38,11 @@ extension AppModel {
     /// background and replaces the shown data in one go.
     func reloadAllInBackground() {
         guard isUnlocked else { return }
+        // a sync can change the effective total set: supersede edit snapshots
+        // that still carry the pre-sync totals (#337), like `reloadAll` does
+        invalidateTotals()
         assetClassificationVersion += 1
+        merchantSettingsRevision += 1
         reloadAccounts()
         refreshSidebarCounts()
         mirrorDocumentsIfEnabled()
@@ -39,6 +53,8 @@ extension AppModel {
         merchantStatsCache = [:]
         loadMerchantStats(keepShown: true)
         startSelectionLoad(keepingShown: true)
+        // merchant settings from another device may leave the merchant filter empty (#1373)
+        if merchantFocus != nil { Task { [weak self] in await self?.leaveStaleMerchantFocus() } }
     }
 
     func reloadAccounts() {
@@ -75,9 +91,9 @@ extension AppModel {
         let (from, to) = periodRange
         runCore {
             let sums = categorySumFilter
-            categories = try vault.listCategoriesFilteredAmount(dateFrom: from, dateTo: to, accountIds: sums.accounts, checked: sums.checked, direction: sums.direction, amountMinCents: sums.amount.minCents, amountMaxCents: sums.amount.maxCents)
+            categories = try vault.listCategoriesFilteredAmount(dateFrom: from, dateTo: to, accountIds: sums.accounts, checked: sums.checked, direction: sums.direction, amountMinCents: sums.amount.minCents, amountMaxCents: sums.amount.maxCents, tagIds: [], untaggedOnly: false)
             categoryTree = Self.buildTree(categories)
-            uncategorizedFilteredCount = try uncategorizedCountFilter(sums).map { Int(try vault.countTransactions(filter: $0)) }
+            uncategorizedFilteredCount = Int(try vault.countTransactions(filter: uncategorizedCountFilter(sums)))
         }
     }
 
@@ -91,7 +107,15 @@ extension AppModel {
         if case .bank(let key) = sidebarSelection, bankGroup(for: key) == nil {
             sidebarSelection = .allAccounts
         }
+        // a section whose last account left (another kind, #1630): no account ids would filter
+        // as "all accounts" while the sidebar still names the section
+        if case .group(let id) = sidebarSelection, groups.first(where: { $0.id == id })?.accounts.isEmpty ?? true {
+            sidebarSelection = .allAccounts
+        }
         rebuildAccountIndex()
+        accountsLoaded = true
+        // After unlocking or a sync: a transfer link that came meanwhile.
+        resumePaymentLink()
     }
 
     func reloadDashboard() {
@@ -231,49 +255,90 @@ extension AppModel {
 
     /// Every full reload calls this first: a page still on its way belongs to the old list.
     func dropPendingPage() {
+        refundRevision &+= 1
         listGeneration += 1
         loadMoreTask?.cancel()
         loadMoreTask = nil
         isLoadingMoreBookings = false
+        isSelectingAllBookings = false
     }
 
     /// More bookings match the current filter than are loaded (list limit reached).
     var hasMoreBookings: Bool {
         // the previous selection's page may still show during a selection load
         guard selectionLoadTask == nil, let total = page?.totalCount else { return false }
-        return UInt32(bookings.count) < total
+        return UInt32(loadedMatchingCount) < total
     }
 
     var remainingBookingCount: Int {
-        max(0, Int(page?.totalCount ?? 0) - bookings.count)
+        max(0, Int(page?.totalCount ?? 0) - loadedMatchingCount)
+    }
+
+    /// The lingering row, when it is on screen without matching the filter.
+    var lingeringRowOutsideFilterID: Booking.ID? {
+        guard lingeringRowOutsideFilter, let id = lingeringBookingID, booking(withID: id) != nil else { return nil }
+        return id
+    }
+
+    /// Loaded bookings that match the filter: the core's offset counts only those.
+    var loadedMatchingCount: Int {
+        bookings.count - (lingeringRowOutsideFilterID == nil ? 0 : 1)
     }
 
     /// Fetches the next page off the main thread and appends it. Nothing loaded
     /// so far is fetched again, so scrolling stays smooth.
     func loadMoreBookings() {
-        guard let vault, hasMoreBookings, !isLoadingMoreBookings, selectionLoadTask == nil else { return }
-        var next = listFilter
-        next.offset = UInt32(bookings.count)
-        next.limit = appendPageSize
+        guard !isLoadingMoreBookings else { return }
+        appendBookings(limit: appendPageSize)
+    }
+
+    /// Appends up to `limit` further bookings in the background, then runs `done` with
+    /// the error, if any (only when the page belongs to the list still on screen).
+    /// False: nothing to fetch.
+    @discardableResult
+    func appendBookings(limit: UInt32, then done: (@MainActor (Error?) -> Void)? = nil) -> Bool {
+        guard let vault, hasMoreBookings, selectionLoadTask == nil, let shown = shownListFilter else { return false }
+        // a page still on its way would only fetch part of the rest again
+        loadMoreTask?.cancel()
+        // the offset counts the list on screen: page on with its filter, never with a newer one
+        var next = shown
+        next.offset = UInt32(loadedMatchingCount)
+        next.limit = limit
         let filter = next
         let generation = listGeneration
         isLoadingMoreBookings = true
         loadMoreTask = Task { [weak self] in
-            let next = try? await Self.offMain {
-                try Perf.interval("listTransactions") { try vault.listTransactions(filter: filter) }
+            let result: Result<BookingPage, Error>
+            do {
+                result = .success(try await Self.offMain {
+                    try Perf.interval("listTransactions") { try vault.listTransactions(filter: filter) }
+                })
+            } catch {
+                result = .failure(error)
             }
             // A full reload in the meantime has replaced the list this page belongs to.
             guard let self, !Task.isCancelled, generation == self.listGeneration else { return }
             self.loadMoreTask = nil
             self.isLoadingMoreBookings = false
-            guard let next, !next.transactions.isEmpty else { return }
-            Perf.interval("publishBookings") {
-                self.listBalances.merge(next)
-                self.bookings.append(contentsOf: next.transactions)
+            if case .success(let next) = result, !next.transactions.isEmpty {
+                // the lingering row was put in place without being on the loaded pages: when
+                // it matches after all, its own place in the list takes over (#1696)
+                if let id = self.lingeringRowOutsideFilterID, next.transactions.contains(where: { $0.id == id }) {
+                    self.bookings.removeAll { $0.id == id }
+                    self.lingeringRowOutsideFilter = false
+                    // the row is a regular one now: a later selection change must not remove it
+                    self.lingeringBookingID = nil
+                }
+                Perf.interval("publishBookings") {
+                    self.listBalances.merge(next)
+                    self.bookings.append(contentsOf: next.transactions)
+                }
+                // an edit reloads exactly what is on screen
+                self.listLimit = UInt32(self.bookings.count)
             }
-            // an edit reloads exactly what is on screen
-            self.listLimit = UInt32(self.bookings.count)
+            if case .failure(let error) = result { done?(error) } else { done?(nil) }
         }
+        return true
     }
 
     /// Loads the list far enough back to contain `day` (plus some older context).
@@ -305,10 +370,12 @@ extension AppModel {
 
     /// The list offers the account filter (#357): the category views, „Alle Konten“, account
     /// groups and „Neue Umsätze“. A single account has nothing to choose from.
-    var showsAccountFilter: Bool {
-        switch sidebarSelection {
+    var showsAccountFilter: Bool { Self.offersAccountFilter(shownSelection) }
+
+    static func offersAccountFilter(_ selection: SidebarItem?) -> Bool {
+        switch selection {
         case .category, .uncategorized, .allAccounts, .group, .bank, .userGroup, .newBookings: true
-        case .account, .documents, .planned, .directDebits, .wealth, .none: false
+        case .account, .documents, .planned, .directDebits, .subscriptions, .wealth, .none: false
         }
     }
 
@@ -349,10 +416,79 @@ extension AppModel {
         categoryAccountFilter = next.count == accountFilterCandidates.count ? [] : next
     }
 
+    /// The account filter's choices grouped like the sidebar's account section (#357):
+    /// by user group (top-level groups with their subgroups, then "Ohne Gruppe"), by
+    /// bank or by account type. Only groups that hold accounts the filter offers; empty
+    /// while a sidebar group, bank or user group is selected (the menu stays flat).
+    var accountFilterGroups: [AccountFilterGroup] {
+        if accountFilterIsRestrictedBySidebar { return [] }
+        let offered = accountFilterCandidates
+        let offeredIDs = Set(offered.map(\.id))
+        // the candidates' order (sidebar order) inside every group
+        func pick(_ ids: [Int64]) -> [Account] {
+            let wanted = Set(ids).intersection(offeredIDs)
+            return offered.filter { wanted.contains($0.id) }
+        }
+        let groups: [AccountFilterGroup]
+        switch accountView {
+        case .byGroup:
+            groups = userGroups.filter { $0.depth == 0 }.map { g in
+                AccountFilterGroup(
+                    id: "group:" + g.uuid,
+                    name: g.name.isEmpty ? String(localized: "Ohne Gruppe") : g.name,
+                    symbol: g.sfSymbol.isEmpty ? "folder" : g.sfSymbol,
+                    accounts: pick(userGroupAccountIDs(g.uuid)))
+            }
+        case .byBank:
+            groups = bankGroups.map {
+                AccountFilterGroup(id: "bank:" + $0.id, name: $0.name, symbol: $0.sfSymbol,
+                                   accounts: pick($0.accounts.map(\.id)))
+            }
+        case .byKind:
+            groups = self.groups.map {
+                AccountFilterGroup(id: "kind:\($0.id)", name: $0.name, symbol: $0.sfSymbol,
+                                   accounts: pick($0.accounts.map(\.id)))
+            }
+        }
+        return groups.filter { !$0.accounts.isEmpty }
+    }
+
+    /// The sidebar selection already limits the filter to one group, bank or user group
+    /// (`accountFilterCandidates`), so the filter menu does not group its accounts again.
+    private var accountFilterIsRestrictedBySidebar: Bool {
+        switch sidebarSelection {
+        case .group, .bank, .userGroup: true
+        default: false
+        }
+    }
+
+    /// Every account of the group is chosen (an empty filter, "Alle Konten", chooses none
+    /// on its own, like the single accounts).
+    func isCategoryGroupChosen(_ group: AccountFilterGroup) -> Bool {
+        let chosen = Set(categoryAccountIDs)
+        return !chosen.isEmpty && Set(group.accountIDs).isSubset(of: chosen)
+    }
+
+    /// Adds all accounts of the group, or removes them when all of them are chosen
+    /// already; like `toggleCategoryAccount`, choosing every account means no filter.
+    func toggleCategoryGroup(_ group: AccountFilterGroup) {
+        var next = Set(categoryAccountIDs)
+        // only accounts the filter still offers: a menu built before a reload may hold stale ids
+        let ids = Set(group.accountIDs).intersection(accountFilterCandidates.map(\.id))
+        if !next.isEmpty && ids.isSubset(of: next) { next.subtract(ids) } else { next.formUnion(ids) }
+        categoryAccountFilter = next.count == accountFilterCandidates.count ? [] : next
+    }
+
     /// What the sidebar's category sums count besides the period (#621): the same status, type and
     /// amount range as the booking list, and its accounts only in the category views (#406).
     var categorySumFilter: (accounts: [Int64], checked: Bool?, direction: BookingDirection, amount: AmountFilter) {
         (showsCategoryAccountFilter ? categoryAccountIDs : [], statusFilter == .all ? nil : statusFilter == .checked, directionFilter, amountFilter)
+    }
+
+    /// Period and `categorySumFilter` the sidebar sums load for now.
+    var categorySumsRequest: CategorySumsRequest {
+        let (from, to) = periodRange, sums = categorySumFilter
+        return CategorySumsRequest(from: from, to: to, accounts: sums.accounts, checked: sums.checked, direction: sums.direction, amount: sums.amount)
     }
 
     /// Hint under the sidebar's „Kategorien“ header while a filter narrows the sums; nil = none.
@@ -390,7 +526,7 @@ extension AppModel {
         case .category(let id): category = id; accountIDs = chosen
         case .uncategorized: uncategorized = true; accountIDs = chosen
         case .allAccounts: accountIDs = chosen
-        case .documents, .newBookings, .planned, .directDebits, .wealth, .none: break
+        case .documents, .newBookings, .planned, .directDebits, .subscriptions, .wealth, .none: break
         }
         // Everything new, whatever the other list filters say; only the account and amount filters narrow it.
         if sidebarSelection == .newBookings {
@@ -404,9 +540,9 @@ extension AppModel {
         return BookingFilter(
             accountIds: accountIDs,
             categoryId: category,
-            includeSubcategories: true,
+            includeSubcategories: category == nil || includeSubcategories,
             uncategorizedOnly: uncategorized,
-            search: searchText.isEmpty ? nil : searchText,
+            search: coreSearchText.isEmpty ? nil : coreSearchText,
             dateFrom: from,
             dateTo: to,
             limit: listLimit,
@@ -419,7 +555,11 @@ extension AppModel {
             tagIds: tagFilter.untagged ? [] : tagFilter.tagIDs.sorted(),
             untaggedOnly: tagFilter.untagged,
             amountMinCents: amountFilter.minCents,
-            amountMaxCents: amountFilter.maxCents
+            amountMaxCents: amountFilter.maxCents,
+            // Overall money contexts (#337) — overview, kind / bank / user
+            // group, also with exactly one account — sum the effective total
+            // set; single account, category and proof views keep their sums.
+            respectInTotal: sidebarSelection?.usesTotalsContext ?? true
         )
     }
 
@@ -460,8 +600,12 @@ extension AppModel {
         runCore {
             let filter = listFilter
             let p = try Perf.interval("listTransactions") { try vault.listTransactions(filter: filter) }
-            Perf.interval("publishBookings") { publish(p) }
+            Perf.interval("publishBookings") { publish(p, filter: filter) }
         }
+        // a failed reload ends a ⌘A waiting for it (#1696); on success `publish` has taken it
+        selectAllAfterReload = false
+        // a failed load published nothing: the switch is over (#1808)
+        viewSwitchPending = false
         reloadSelectionKPIs()
         reloadCategoryHistory()
         // Every edit, sync and import ends up here: cached merchant histories may be
@@ -490,17 +634,36 @@ extension AppModel {
     /// Shows a freshly loaded list page. A selected booking the page no longer
     /// contains falls back to the first row, unless it is sticky (kept in the
     /// inspector after an edit moved it out of the filter).
-    func publish(_ p: BookingPage) {
+    func publish(_ p: BookingPage, filter: BookingFilter) {
+        shownListFilter = filter
+        // taken first: the fallback selection below would otherwise cancel it
+        let selectAll = selectAllAfterReload
+        selectAllAfterReload = false
         page = p
+        if viewSwitchPending {
+            // a booking kept in the inspector after an edit belongs to the list it left: the other
+            // view neither shows nor selects it (#1808)
+            let shown = Set(p.transactions.map(\.id))
+            if let id = lingeringBookingID, !shown.contains(id) { lingeringBookingID = nil }
+            if let sticky = stickyBooking, !shown.contains(sticky.id) { stickyBooking = nil }
+        }
         var balances = ListBalances(currency: balanceCurrency)
         balances.merge(p)
         listBalances = balances
         bookings = keepingLingeringRow(p.transactions)
         if let id = selectedBookingID, booking(withID: id) == nil, stickyBooking?.id != id {
-            // „Neue Umsätze“: no booking selected unasked, auto review would check it
-            selectedBookingID = sidebarSelection == .newBookings ? nil : p.transactions.first?.id
+            if viewSwitchPending {
+                // a switch keeps what the new list still shows and otherwise selects nothing: a booking
+                // chosen unasked would start the auto review (#1808)
+                selectedBookingID = bookings.first { selectedBookingIDs.contains($0.id) }?.id
+            } else {
+                // „Neue Umsätze“: no booking selected unasked, auto review would check it
+                selectedBookingID = sidebarSelection == .newBookings ? nil : p.transactions.first?.id
+            }
         }
+        viewSwitchPending = false
         pruneMultiSelection()
+        if selectAll { selectAllShownBookings() }
     }
 
     /// Running balances (#577) fit only a selection of accounts (one account, a
@@ -515,13 +678,26 @@ extension AppModel {
 
     /// The list shows running balances: Ansicht › Saldo anzeigen and a selection of accounts.
     var listHasBalances: Bool {
-        UserDefaults.standard.bool(forKey: ViewLayout.runningBalanceKey) && selectionHasBalances
+        AppDefaults.store.bool(forKey: ViewLayout.runningBalanceKey) && selectionHasBalances
     }
 
-    /// Currency of the running balances: one account's own, else the EUR sum (as the core sums).
-    var balanceCurrency: String {
-        if case .account(let id) = sidebarSelection, let a = account(for: id) { return a.currency }
+    /// Currency the core sums a selection of accounts in (#1049, as `counts_in_sums`): exactly one
+    /// account its own, otherwise (none, several, all) EUR only.
+    func sumCurrency(forAccounts ids: [Int64]) -> String {
+        if ids.count == 1, let a = account(for: ids[0]), !a.currency.isEmpty { return a.currency.uppercased() }
         return "EUR"
+    }
+
+    /// Currency of the sidebar's category sums: they follow the account filter of the category views.
+    var categorySumCurrency: String { sumCurrency(forAccounts: categorySumFilter.accounts) }
+
+    /// Currency of the running balances, KPIs and chart: that of the accounts the list shows
+    /// (one account, also a group or filter that narrows to one, its own; else the EUR sum).
+    var balanceCurrency: String {
+        switch sidebarSelection {
+        case .documents, .planned, .directDebits, .subscriptions, .wealth, .none: return "EUR"
+        default: return sumCurrency(forAccounts: currentFilter.accountIds)
+        }
     }
 
     /// Ansicht › Saldo anzeigen changed (also from the settings window): switching it on
@@ -537,9 +713,11 @@ extension AppModel {
     /// The lingering booking (checked while selected) at its old place in a
     /// new page that no longer contains it: before the row that followed it.
     private func keepingLingeringRow(_ rows: [Booking]) -> [Booking] {
+        lingeringRowOutsideFilter = false
         guard let id = lingeringBookingID, let kept = stickyBooking, kept.id == id,
               !rows.contains(where: { $0.id == id }),
               let old = bookings.firstIndex(where: { $0.id == id }) else { return rows }
+        lingeringRowOutsideFilter = true
         let ids = Set(rows.map(\.id))
         let next = bookings[(old + 1)...].first { ids.contains($0.id) }
         var out = rows
@@ -551,7 +729,11 @@ extension AppModel {
     /// the background (the menu closes at once, the old list stays until the new one is in);
     /// set from code it stays synchronous, callers read the list right after.
     func reloadAfterFilterChange() {
-        if loadsFilterInBackground, vault != nil {
+        let inBackground = loadsFilterInBackground && vault != nil
+        // rows chosen in the previous list would stay selected without being shown, like a
+        // sidebar or period change (#1696); a ⌘A pressed before waits for the new list
+        dropMultiSelection(keepingPendingSelectAll: inBackground)
+        if inBackground {
             startSelectionLoad(keepingShown: true)
         } else {
             reloadBookings()
@@ -562,6 +744,8 @@ extension AppModel {
     /// The search text only narrows the list: the KPIs, history and merchant data do not
     /// depend on it, so just the page reloads, in the background.
     func reloadListInBackground() {
+        // another search: same rule as a status change (#1696)
+        dropMultiSelection(keepingPendingSelectAll: true)
         if selectionLoadTask != nil { startSelectionLoad() } else { reloadScopeBookings() }
     }
 
@@ -573,6 +757,8 @@ extension AppModel {
         guard let vault else { return }
         let filter = listFilter
         scopeLoadTask = Task { [weak self] in
+            // a newer request cancels this one first: not cancelled = still the current task
+            defer { if !Task.isCancelled { self?.scopeLoadTask = nil } }
             guard !Task.isCancelled else { return }
             let load = Task.detached(priority: .userInitiated) {
                 try Task.checkCancellation()
@@ -589,13 +775,59 @@ extension AppModel {
                 guard !Task.isCancelled, let self else { return }
                 // a page requested while this scope was loading belongs to no list
                 self.dropPendingPage()
-                self.publish(p)
+                self.scopeLoadTask = nil // done: a ⌘A taken over by `publish` may load the rest
+                self.publish(p, filter: filter)
                 // selectionFlow always uses scope .all and is unchanged here.
             } catch {
                 guard !Task.isCancelled, let self else { return }
+                // no new list: a ⌘A waiting for it ends with the error (#1696)
+                self.selectAllAfterReload = false
                 self.errorMessage = describe(error)
             }
         }
+    }
+
+    /// Reads what the EUR-only sums leave out (#1049) for the current selection: the KPI tiles per
+    /// further currency and the sidebar totals per category. Runs after every reload of the sums; a newer
+    /// call cancels an older one, and both queries return at once while no booking has another currency.
+    func refreshOtherCurrencies() {
+        otherCurrenciesTask?.cancel()
+        guard vault != nil else {
+            if !otherCurrencyFlows.isEmpty { otherCurrencyFlows = [] }
+            if !categoryOtherTotals.isEmpty { categoryOtherTotals = [:] }
+            return
+        }
+        let (from, to) = periodRange
+        let filter = currentFilter
+        let followsList = filter.listHasFlow || kpiFollowsList
+        let sums = categorySumFilter
+        otherCurrenciesTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let loaded = try await self.vaultOffMain { vault -> ([CurrencyFlow], [CategoryCurrencyAmount]) in
+                    let flows = followsList && !filter.listHasFlow
+                        ? try vault.flowOtherCurrencies(filter: filter)
+                        : try vault.selectionFlowOtherCurrencies(accountIds: filter.accountIds, dateFrom: from, dateTo: to, respectInTotal: filter.respectInTotal)
+                    let totals = try vault.categoryOtherCurrencyTotals(dateFrom: from, dateTo: to, accountIds: sums.accounts, checked: sums.checked, direction: sums.direction, amountMinCents: sums.amount.minCents, amountMaxCents: sums.amount.maxCents, tagIds: [], untaggedOnly: false)
+                    return (flows, totals)
+                }
+                guard !Task.isCancelled, let loaded else { return }
+                if self.otherCurrencyFlows != loaded.0 { self.otherCurrencyFlows = loaded.0 }
+                let grouped = Dictionary(grouping: loaded.1, by: \.categoryId).mapValues { $0.map { CurrencyAmount(currency: $0.currency, cents: $0.cents) } }
+                if self.categoryOtherTotals != grouped { self.categoryOtherTotals = grouped }
+            } catch {
+                // a missing "Zusätzlich" line is not worth an error alert
+            }
+        }
+    }
+
+    /// "Zusätzlich: −30,00 $ · …" for one KPI tile (nil: nothing in other currencies); `pick` reads the tile's value.
+    func otherCurrencyText(_ pick: (CurrencyFlow) -> Int64) -> String? {
+        let parts = otherCurrencyFlows.compactMap { f -> String? in
+            let cents = pick(f)
+            return cents == 0 ? nil : Money.format(cents, currency: f.currency)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     /// KPI tiles: same flow rules as the dashboard, but for the selected
@@ -610,8 +842,13 @@ extension AppModel {
             return
         }
         let ids = filter.accountIds
+        let forTotals = filter.respectInTotal
         runCore {
-            let f = try vault.selectionFlow(accountIds: ids, dateFrom: from, dateTo: to)
+            // the fallback must run in the filter's own calculation context
+            // (#337): overall figures respect the effective total set
+            let f = try (forTotals
+                ? vault.selectionFlowForTotals(accountIds: ids, dateFrom: from, dateTo: to)
+                : vault.selectionFlow(accountIds: ids, dateFrom: from, dateTo: to))
             selectionFlow = (f.consumptionCents, f.investedCents, f.incomeCents)
         }
     }
@@ -619,7 +856,7 @@ extension AppModel {
     /// Bar width actually used: own choice (also quarters, #634), else the global setting, else months.
     var effectiveCategoryBarUnit: BalanceBarUnit {
         if categoryBarUnit != .automatic { return categoryBarUnit }
-        let global = BalanceBarUnit(rawValue: UserDefaults.standard.string(forKey: BalanceBarUnit.defaultsKey) ?? "") ?? .automatic
+        let global = BalanceBarUnit(rawValue: AppDefaults.store.string(forKey: BalanceBarUnit.defaultsKey) ?? "") ?? .automatic
         return global == .automatic ? .month : global
     }
 
@@ -634,9 +871,13 @@ extension AppModel {
     func reloadCategoryHistory() {
         guard let vault, let r = categoryHistoryRequest else {
             if !categoryHistory.isEmpty { categoryHistory = [] }
+            if !categoryOtherCurrencies.isEmpty { categoryOtherCurrencies = [] }
             return
         }
-        runCore { categoryHistory = try vault.categoryHistoryByUnit(categoryId: r.id, accountIds: r.accounts, dateFrom: r.from, dateTo: r.to, keyLength: r.keyLength) }
+        runCore {
+            categoryHistory = try vault.categoryHistoryByUnit(categoryId: r.id, accountIds: r.accounts, dateFrom: r.from, dateTo: r.to, keyLength: r.keyLength)
+            categoryOtherCurrencies = try vault.categoryOtherCurrencies(categoryId: r.id, accountIds: r.accounts, dateFrom: r.from, dateTo: r.to)
+        }
     }
 
     func reloadHistory() {
@@ -650,16 +891,7 @@ extension AppModel {
 
     /// Accounts and day count of the balance chart for the current selection and period.
     var historyRequest: (ids: [Int64], days: UInt32) {
-        var ids: [Int64]
-        switch sidebarSelection {
-        case .account(let id): ids = [id]
-        // same accounts as the group's sum in the header (#208)
-        case .group(let gid): ids = groups.first(where: { $0.id == gid })?.accounts.filter { !$0.isArchived }.map(\.id) ?? []
-        case .bank(let key): ids = bankGroup(for: key)?.accounts.filter { !$0.isArchived }.map(\.id) ?? []
-        case .userGroup(let uuid): ids = userGroupBalanceAccountIDs(uuid)
-        default: ids = liquidAccounts.map(\.id)
-        }
-        if ids.isEmpty { ids = [-1] }
+        let ids = chartAccountIDs(sidebarSelection)
         // The chart follows the selected period. "Gesamter Zeitraum": up to ~15 years back,
         // then the flat lead-in before the first booking is cut off.
         let today = Calendar.current.startOfDay(for: Date())
@@ -668,8 +900,24 @@ extension AppModel {
         return (ids, UInt32(days))
     }
 
-    /// Accounts behind the header chart (balance history, expense pie #634).
-    var headerChartAccountIDs: [Int64] { historyRequest.ids }
+    /// Accounts behind the header chart (balance history, expense pie #634) of a selection.
+    private func chartAccountIDs(_ selection: SidebarItem?) -> [Int64] {
+        let ids: [Int64]
+        switch selection {
+        case .account(let id): ids = [id]
+        // same accounts as the group's sum in the header (#208), and like that
+        // sum only the effectively included ones (#337; `inTotal` also covers
+        // archiving and the account's own switch)
+        case .group(let gid): ids = groups.first(where: { $0.id == gid })?.accounts.filter(\.inTotal).map(\.id) ?? []
+        case .bank(let key): ids = bankGroup(for: key)?.accounts.filter(\.inTotal).map(\.id) ?? []
+        case .userGroup(let uuid): ids = userGroupBalanceAccountIDs(uuid)
+        default: ids = liquidAccounts.map(\.id)
+        }
+        return ids.isEmpty ? [-1] : ids
+    }
+
+    /// Accounts behind the header's expense pie: those of the selection shown (#1413).
+    var headerChartAccountIDs: [Int64] { chartAccountIDs(shownSelection) }
 
     static func trimmedHistory(_ all: [DailyBalance], from: String?, to: String?) -> [DailyBalance] {
         var points = all
@@ -696,6 +944,7 @@ extension AppModel {
         runCore {
             settings = try vault.listSettings()
             logoProvider = try vault.onlineLogoProvider()
+            merchantRecognitionEnabled = try vault.merchantRecognitionEnabled()
         }
         reloadProductIDState(vault)
     }
@@ -705,7 +954,7 @@ extension AppModel {
     /// The loaded bookings; every filter of the list is applied by the core.
     /// „Neue Umsätze“ shows the bookings per account: ↑/↓ and ranges follow the cards.
     var visibleBookings: [Booking] {
-        sidebarSelection == .newBookings ? newBookingSections.flatMap(\.bookings) : bookings
+        shownSelection == .newBookings ? newBookingSections.flatMap(\.bookings) : bookings
     }
 
     /// „Neue Umsätze“: the loaded bookings as one card per account.
@@ -738,7 +987,7 @@ extension AppModel {
         rebuildDayGroups()
     }
 
-    private func rebuildDayGroups() {
+    func rebuildDayGroups() {
         var out: [DayGroup] = []
         var current: [Booking] = []
         var day = ""
@@ -765,28 +1014,34 @@ extension AppModel {
 
     var allAccounts: [Account] { groups.flatMap(\.accounts) }
     var hasArchivedAccounts: Bool { allAccounts.contains(where: \.isArchived) }
-    /// Everyday accounts counted in "Verfügbar" (skips groups excluded from the total).
-    var liquidAccounts: [Account] { allAccounts.filter { $0.inTotal && [.checking, .savings, .paymentService, .creditCard, .cash].contains($0.kind) } }
+    /// Everyday accounts counted in "Verfügbar" (skips groups excluded from the total): the kinds of
+    /// liquidity grade 1 in the wealth view (#1632), card debts included.
+    var liquidAccounts: [Account] { allAccounts.filter { $0.inTotal && LiquidityGrade.of($0.kind) == .immediate } }
     var liquidBalance: Int64 { liquidAccounts.reduce(0) { $0 + $1.balanceCents } }
     var newCount: Int { allAccounts.reduce(0) { $0 + Int($1.newCount) } }
-    /// Bookings without a category (badge of „Ohne Kategorie“): all of them, or, while list filters
-    /// narrow the sums, those matching the filters (#357). Not tied to the period.
+    /// Bookings without a category (badge of „Ohne Kategorie“): the number the „Ohne Kategorie“ list shows for the
+    /// selected period and the same status, type, amount and account filters as the category sums (#1439).
+    /// Until the first count has loaded, the accounts' own counts (all time) stand in.
     var uncategorizedCount: Int {
         uncategorizedFilteredCount ?? allAccounts.filter { $0.kind != .loan }.reduce(0) { $0 + Int($1.uncategorizedCount) }
     }
 
-    /// The query behind the filtered badge; nil while no filter narrows the sums (the accounts' own counts apply).
-    func uncategorizedCountFilter(_ sums: (accounts: [Int64], checked: Bool?, direction: BookingDirection, amount: AmountFilter)) -> BookingFilter? {
-        guard !sums.accounts.isEmpty || sums.checked != nil || sums.direction != .all || sums.amount.isActive else { return nil }
-        let accounts = sums.accounts.isEmpty ? allAccounts.filter { $0.kind != .loan }.map(\.id) : sums.accounts
+    /// The query behind the badge: what the „Ohne Kategorie“ list loads (`currentFilter`, which leaves out detected own
+    /// transfers like the list, #302) for the sidebar's period and `categorySumFilter`, counted in SQL (limit 1).
+    /// No chosen accounts = all of them, as in the list.
+    func uncategorizedCountFilter(_ sums: (accounts: [Int64], checked: Bool?, direction: BookingDirection, amount: AmountFilter)) -> BookingFilter {
+        let (from, to) = periodRange
         return BookingFilter(
-            accountIds: accounts, categoryId: nil, includeSubcategories: true, uncategorizedOnly: true,
-            search: nil, dateFrom: nil, dateTo: nil, limit: 1, offset: 0, scope: .all,
-            merchantKey: nil, direction: sums.direction, checked: sums.checked, wholeDays: false,
+            accountIds: sums.accounts, categoryId: nil, includeSubcategories: true, uncategorizedOnly: true,
+            search: nil, dateFrom: from, dateTo: to, limit: 1, offset: 0, scope: .all,
+            merchantKey: nil, direction: sums.direction, checked: sums.checked, wholeDays: true,
             amountMinCents: sums.amount.minCents, amountMaxCents: sums.amount.maxCents)
     }
 
     /// Everyday spending this month (never includes ETF plans / perks).
+    /// The tiles have no figures for the shown selection: it is loading, or its load failed
+    /// (`selectionFlow` may still hold the previous selection's).
+    var selectionFiguresMissing: Bool { isLoadingSelection || page == nil }
     /// Selected account/group and period; falls back to the dashboard month.
     var consumptionThisMonth: Int64 { selectionFlow?.consumption ?? dashboard?.monthly.last?.consumptionCents ?? 0 }
     var investedThisMonth: Int64 { selectionFlow?.invested ?? dashboard?.monthly.last?.investmentCents ?? 0 }
@@ -798,7 +1053,7 @@ extension AppModel {
     }
 
     var title: String {
-        switch sidebarSelection {
+        switch shownSelection {
         case .allAccounts, .none: return String(localized: "Alle Konten")
         case .group(let id): return groups.first { $0.id == id }?.name ?? String(localized: "Gruppe")
         case .bank(let key): return bankGroup(for: key)?.name ?? String(localized: "Bank")
@@ -806,21 +1061,25 @@ extension AppModel {
         case .account(let id): return allAccounts.first { $0.id == id }?.name ?? String(localized: "Konto")
         case .category(let id): return categories.first { $0.id == id }?.path ?? String(localized: "Kategorie")
         case .uncategorized: return uncategorizedLabel
-        case .documents: return String(localized: "Belege & PostBox")
+        case .documents: return String(localized: "Belege & Postbox")
         case .newBookings: return String(localized: "Neue Umsätze")
         case .planned: return String(localized: "Geplant")
         case .directDebits: return String(localized: "Lastschriften")
+        case .subscriptions: return String(localized: "Abos & Verträge")
         case .wealth: return String(localized: "Vermögen")
         }
     }
 
     /// Accounts behind the header total of the current selection (nil: single account / not a total).
+    /// Like the sum it shows: only effectively included accounts (#337).
     private var headerTotalAccounts: [Account]? {
-        switch sidebarSelection {
+        switch shownSelection {
         case .allAccounts, .none: return liquidAccounts
-        case .group(let id): return groups.first { $0.id == id }?.accounts
-        case .bank(let key): return bankGroup(for: key)?.accounts
-        case .userGroup(let uuid): let ids = Set(userGroupAccountIDs(uuid)); return allAccounts.filter { ids.contains($0.id) }
+        case .group(let id): return groups.first { $0.id == id }?.accounts.filter(\.inTotal)
+        case .bank(let key): return bankGroup(for: key)?.accounts.filter(\.inTotal)
+        case .userGroup(let uuid):
+            let ids = Set(userGroupAccountIDs(uuid))
+            return allAccounts.filter { ids.contains($0.id) && $0.inTotal }
         default: return nil
         }
     }
@@ -839,11 +1098,11 @@ extension AppModel {
 
     private var headerBalanceUnsplit: (label: String, cents: Int64)? {
         // A group's or all accounts' total covers every account: no figure while accounts are filtered (#357).
-        switch sidebarSelection {
+        switch shownSelection {
         case .group, .bank, .userGroup, .allAccounts: if !categoryAccountIDs.isEmpty { return nil }
         default: break
         }
-        switch sidebarSelection {
+        switch shownSelection {
         case .account(let id): return allAccounts.first { $0.id == id }.map { (isTangible(id) ? String(localized: "Wert heute") : depotKind(of: id) == .securities ? String(localized: "Depotwert") : String(localized: "Kontostand"), $0.balanceCents) }
         case .group(let id): return groups.first { $0.id == id }.map { (String(localized: "Summe"), $0.balanceCents) }
         case .bank(let key): return bankGroup(for: key).map { (String(localized: "Summe"), $0.balanceCents) }
@@ -851,7 +1110,7 @@ extension AppModel {
         case .allAccounts, .none: return (String(localized: "Verfügbar (Giro, Tagesgeld, Karten)"), liquidBalance)
         // The category total covers all accounts: no figure while accounts are filtered (#406).
         case .category(let id): return categoryAccountIDs.isEmpty ? categories.first { $0.id == id }.map { (String(localized: "Summe im Zeitraum"), $0.totalCents) } : nil
-        case .uncategorized, .documents, .newBookings, .planned, .directDebits, .wealth: return nil
+        case .uncategorized, .documents, .newBookings, .planned, .directDebits, .subscriptions, .wealth: return nil
         }
     }
 
@@ -903,8 +1162,12 @@ extension AppModel {
     }
 
     /// Markers only where the list mixes bookings of several accounts.
-    var showsAccountMarkers: Bool {
-        switch sidebarSelection {
+    func refreshAccountMarkerVisibility() {
+        showsAccountMarkers = listShowsSeveralAccounts // equal values do not notify
+    }
+
+    private var listShowsSeveralAccounts: Bool {
+        switch shownSelection {
         case .account: false
         case .group(let id): (groups.first { $0.id == id }?.accounts.count ?? 0) > 1
         case .bank(let key): (bankGroup(for: key)?.accounts.count ?? 0) > 1
@@ -942,11 +1205,6 @@ extension AppModel {
         if let vault {
             uncategorizedName = (((try? vault.getSetting(key: "ui.uncategorized_name")) ?? nil) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            accountNotes = Dictionary(accounts.compactMap { a in
-                let n = ((try? vault.getSetting(key: "account.note.\(a.id)")) ?? nil)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                return n.isEmpty ? nil : (a.id, n)
-            }, uniquingKeysWith: { a, _ in a })
         }
         // " (MoneyMoney)": suffix that earlier versions appended to accounts created by a file import.
         func base(_ a: Account) -> String {

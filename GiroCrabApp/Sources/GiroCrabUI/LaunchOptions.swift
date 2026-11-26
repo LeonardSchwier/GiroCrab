@@ -6,7 +6,7 @@ import Foundation
 ///  GIROCRAB_DEMO_SEED=1   same, via environment (works for Xcode schemes / iOS)
 ///  --demo-sync            (with demo data) start "Sync All" right away, to
 ///                         see the push-TAN / code / redirect 2FA sheets
-///  --view alltag|sparplaene|belege|vermoegen|vermoegen-wertpapiere|vermoegen-sachwerte|geplant  start in "Alltag & Konsum" / "Sparpläne & Perks" / "Belege & PostBox" / "Vermögen"
+///  --view alltag|sparplaene|belege|vermoegen|vermoegen-wertpapiere|vermoegen-sachwerte|geplant|neu  start in "Alltag & Konsum" / "Sparpläne & Perks" / "Belege & Postbox" / "Vermögen" / "Neue Umsätze"
 ///  --fresh-vault          (developer) empty personal vault in a temp folder,
 ///                         fixed key, no Keychain – to try onboarding/setup
 ///  --keep-fresh-vault     (developer) like --fresh-vault, but reopen the temp vault
@@ -20,7 +20,7 @@ import Foundation
 ///  --demo-sheet account-selection|transfer|moneymoney|moneymoney-db|recurring|print|export|rules|palette|
 ///               categorizer|payee-match|payee-close|payee-nomatch|error|rule-edit|icon-color|category|icon-color-category|
 ///               asset|asset-edit|asset-values|asset-quantities|mandate|collection|collection-files|mandate-select|
-///               tags|tags-accounts|tag-filter|rule-tags|position-history
+///               tags|tags-accounts|tag-filter|rule-tags|position-history|split
 ///                         (demo) open that sheet pre-filled with fictional data,
 ///                         for README / PR screenshots
 ///  --demo-settings general|banks|groups|documents|security|external[:edit|:add|:remove|:select]
@@ -77,6 +77,7 @@ public struct LaunchOptions: Sendable {
     /// (demo) preselect the account whose name contains this text
     public var selectAccount: String?
     /// (demo) preselect the booking whose merchant/counterparty contains this text
+    /// (in „Belege & Postbox“: the document whose title contains it; on the iPhone it also opens the booking sheet)
     public var pickBooking: String?
     /// (demo) `--depot-tab activities|plans`: tab of the securities depot view
     public var depotTab: String?
@@ -94,7 +95,8 @@ public struct LaunchOptions: Sendable {
     public var inspectorEdit = false
     /// (demo) "transfer", "moneymoney", "moneymoney-db" or "print": open that sheet with fictional data
     /// ("transfer-confirm": its review step, "transfer-girocode": its GiroCode step,
-    /// "transfer-clipboard": the empty form with the clipboard banner)
+    /// "transfer-clipboard": the empty form with the clipboard banner, "transfer-recipients":
+    /// "Empfänger verwalten" over the form, "transfer-suggestions": the known recipients under the name)
     public var demoSheet: String?
     /// `demoSheet` without the `report:` prefix (#384): `--demo-sheet report:transfer`
     /// opens the same sheet as `--demo-sheet transfer`, with the bug report over it.

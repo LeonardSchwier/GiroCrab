@@ -22,10 +22,12 @@ fn banks() -> &'static [Bank] {
     BANKS.get_or_init(|| rows(FINTS_TSV).map(|[b, n, u]| (b, n, u)).collect())
 }
 
-/// (BLZ, BIC) from the Bundesbank BLZ list, sorted by BLZ.
-fn bics() -> &'static [(&'static str, &'static str)] {
-    static BICS: OnceLock<Vec<(&str, &str)>> = OnceLock::new();
-    BICS.get_or_init(|| rows(BIC_TSV).map(|[b, c]| (b, c)).collect())
+/// (BLZ, BIC, bank name) from the Bundesbank BLZ list, sorted by BLZ.
+type BicEntry = (&'static str, &'static str, &'static str);
+
+fn bics() -> &'static [BicEntry] {
+    static BICS: OnceLock<Vec<BicEntry>> = OnceLock::new();
+    BICS.get_or_init(|| rows(BIC_TSV).map(|[b, c, n]| (b, c, n)).collect())
 }
 
 /// Name and FinTS endpoint of a bank in the built-in directory.
@@ -46,14 +48,22 @@ fn info(entry: &Bank) -> FinTsBankInfo {
 }
 
 /// Keeps only the digits ("1005 0000" -> "10050000").
-fn digits(s: &str) -> String {
+pub(crate) fn digits(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
-/// comdirect's bank codes; the code of an account is in its IBAN.
-pub(crate) const COMDIRECT_BLZ: [&str; 4] = ["20041111", "20041133", "20041144", "20041155"];
+/// Bank code of the Miles & More credit cards (Deutsche Bank), used by the bank
+/// only for these cards (`docs/miles-and-more-connector.md`).
+pub(crate) const MILES_AND_MORE_BLZ: &str = "50070439";
 
-/// comdirect's FinTS 3.0 PIN/TAN endpoint, the same for all four bank codes
+/// comdirect's bank codes (Bundesbank: "Commerzbank, GF comdirect"); the
+/// code of an account is in its IBAN. The FinTS login may need another one of
+/// them than the IBAN shows, see `FinTsConnector::login`.
+pub(crate) const COMDIRECT_BLZ: [&str; 8] = [
+    "20041111", "20041133", "20041144", "20041155", "20041166", "20041177", "20041188", "20041199",
+];
+
+/// comdirect's FinTS 3.0 PIN/TAN endpoint, the same for all its bank codes
 /// (DK institute list).
 pub(crate) const COMDIRECT_FINTS_URL: &str = "https://fints.comdirect.de/fints";
 
@@ -61,11 +71,15 @@ pub(crate) const COMDIRECT_FINTS_URL: &str = "https://fints.comdirect.de/fints";
 /// contract and API credentials). Resolved by bank code only: the generated
 /// table and the name search leave comdirect out, so the bank picker lists
 /// it once (`bank_directory::search`) instead of once per bank code.
-static COMDIRECT: [Bank; 4] = [
+static COMDIRECT: [Bank; 8] = [
     (COMDIRECT_BLZ[0], "comdirect", COMDIRECT_FINTS_URL),
     (COMDIRECT_BLZ[1], "comdirect", COMDIRECT_FINTS_URL),
     (COMDIRECT_BLZ[2], "comdirect", COMDIRECT_FINTS_URL),
     (COMDIRECT_BLZ[3], "comdirect", COMDIRECT_FINTS_URL),
+    (COMDIRECT_BLZ[4], "comdirect", COMDIRECT_FINTS_URL),
+    (COMDIRECT_BLZ[5], "comdirect", COMDIRECT_FINTS_URL),
+    (COMDIRECT_BLZ[6], "comdirect", COMDIRECT_FINTS_URL),
+    (COMDIRECT_BLZ[7], "comdirect", COMDIRECT_FINTS_URL),
 ];
 
 fn find(blz: &str) -> Option<&'static Bank> {
@@ -94,6 +108,23 @@ pub fn lookup(blz: &str) -> Option<FinTsBankInfo> {
 /// FinTS URL for a BLZ (used as fallback when a connection has no stored URL).
 pub fn url_for_blz(blz: &str) -> Option<&'static str> {
     find(blz).map(|e| e.2)
+}
+
+/// Endpoints earlier directory versions handed out that the bank no longer serves
+/// (apoBank left Atruvia in 2020, #1385; the Sparkassen host hs5 of 1822direkt
+/// no longer resolves).
+const RETIRED_URLS: &[(&str, &str)] = &[
+    ("30060601", "https://fints1.atruvia.de/cgi-bin/hbciservlet"),
+    ("50050201", "https://banking-hs5.s-fints-pt-hs.de/fints30"),
+];
+
+/// Current directory URL when a connection stored a retired endpoint for `blz`.
+pub fn replacement_for_retired_url(blz: &str, url: &str) -> Option<&'static str> {
+    RETIRED_URLS
+        .iter()
+        .any(|e| e.0 == blz && e.1 == url.trim())
+        .then(|| url_for_blz(blz))
+        .flatten()
 }
 
 /// Lower-cases and folds German umlauts / ß so "Münchner" matches "muenchner".
@@ -177,10 +208,10 @@ pub fn search_by_bic(query: &str, limit: usize) -> Vec<FinTsBankInfo> {
     };
     bics()
         .iter()
-        .filter(|(_, bic)| {
+        .filter(|(_, bic, _)| {
             bic.starts_with(&q[..8]) && branch.is_none_or(|br| bic.len() == 8 || &bic[8..] == br)
         })
-        .filter_map(|(blz, _)| find(blz))
+        .filter_map(|(blz, _, _)| find(blz))
         .take(limit)
         .map(info)
         .collect()
@@ -225,14 +256,25 @@ fn lookup_fints_bank_by_input(input: String) -> Option<FinTsBankInfo> {
     blz_from_input(&input).and_then(|b| lookup(&b))
 }
 
-/// BIC of a German IBAN's bank, from the Bundesbank BLZ list in
-/// `data/bic_directory.tsv` ("INGDDEFF"). `None` for non-German or invalid IBANs.
-pub fn bic_for_iban(iban: String) -> Option<String> {
-    let blz = blz_from_german_iban(&iban)?;
+/// Entry of a German IBAN's bank in the Bundesbank BLZ list
+/// (`data/bic_directory.tsv`). `None` for non-German or invalid IBANs.
+fn bic_entry(iban: &str) -> Option<&'static BicEntry> {
+    let blz = blz_from_german_iban(iban)?;
     let bics = bics();
     bics.binary_search_by(|e| e.0.cmp(blz.as_str()))
         .ok()
-        .map(|i| bics[i].1.to_string())
+        .map(|i| &bics[i])
+}
+
+/// BIC of a German IBAN's bank ("INGDDEFF"). `None` for non-German or invalid IBANs.
+pub fn bic_for_iban(iban: String) -> Option<String> {
+    bic_entry(&iban).map(|e| e.1.to_string())
+}
+
+/// Name of a German IBAN's bank ("Commerzbank"), shown next to the recipient's
+/// IBAN in the transfer form (#1563). `None` for non-German or invalid IBANs.
+pub fn bank_name_for_iban(iban: String) -> Option<String> {
+    bic_entry(&iban).map(|e| e.2.to_string())
 }
 
 #[cfg(test)]
@@ -243,8 +285,14 @@ mod tests {
 
     #[test]
     fn every_data_row_parses() {
-        assert_eq!(malformed_rows(BIC_TSV, 2, 2), Vec::<&str>::new());
+        assert_eq!(malformed_rows(BIC_TSV, 3, 3), Vec::<&str>::new());
         assert_eq!(malformed_rows(FINTS_TSV, 3, 3), Vec::<&str>::new());
+        // every bank has a name, without the Bundesbank's "-alt-" merger marker
+        let bad: Vec<_> = bics()
+            .iter()
+            .filter(|e| e.2.is_empty() || e.2.contains("-alt"))
+            .collect();
+        assert_eq!(bad, Vec::<&BicEntry>::new());
     }
 
     #[test]
@@ -260,6 +308,14 @@ mod tests {
         );
         assert_eq!(bic_for_iban("AT611904300234573201".into()), None);
         assert_eq!(bic_for_iban("".into()), None);
+        assert_eq!(
+            bank_name_for_iban("DE89 3704 0044 0532 0130 00".into()).as_deref(),
+            Some("Commerzbank")
+        );
+        assert_eq!(bank_name_for_iban("AT611904300234573201".into()), None);
+        assert_eq!(bank_name_for_iban("DE89370400440532013001".into()), None);
+        // valid checksum, BLZ not in the list
+        assert_eq!(bank_name_for_iban("DE44999999990532013000".into()), None);
     }
 
     #[test]
@@ -287,11 +343,12 @@ mod tests {
             ("76030080", "https://brokerage-hbci.consorsbank.de/hbci"),
             ("10077777", "https://fints.norisbank.de/"),
             ("66090800", ATRUVIA),
-            ("30060601", ATRUVIA),
+            ("30060601", "https://fints.apobank.de/FinTs30PinTanHttpGate"),
             ("83094495", ATRUVIA),
             ("10070000", "https://fints.deutsche-bank.de/"),
             ("70020270", "https://hbci.hypovereinsbank.de/hbci/hbci.do"),
             ("12096597", ATRUVIA),
+            ("50050201", "https://banking-hs6.s-fints-pt-hs.de/fints30"),
             ("10010010", "https://hbci.postbank.de/banking/hbci.do"),
             ("10050000", "https://banking-be3.s-fints-pt-be.de/fints30"),
         ];
@@ -302,6 +359,34 @@ mod tests {
         }
         assert_eq!(lookup("50010517").unwrap().name, "ING");
         assert_eq!(url_for_blz("43060967"), Some(ATRUVIA));
+    }
+
+    #[test]
+    fn server_setting_defaults_match_the_directory() {
+        for (key, .., default) in crate::vault::KNOWN_SETTINGS {
+            if let Some(blz) = key.strip_prefix("fints.url.") {
+                assert_eq!(url_for_blz(blz), Some(*default), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn retired_urls_are_replaced_only_for_their_bank() {
+        const ATRUVIA: &str = "https://fints1.atruvia.de/cgi-bin/hbciservlet";
+        assert_eq!(
+            replacement_for_retired_url("30060601", ATRUVIA),
+            url_for_blz("30060601")
+        );
+        assert_ne!(url_for_blz("30060601"), Some(ATRUVIA));
+        // Atruvia still serves the other banks; a URL set by hand stays.
+        assert_eq!(replacement_for_retired_url("66090800", ATRUVIA), None);
+        assert_eq!(
+            replacement_for_retired_url("30060601", "https://x.example/fints"),
+            None
+        );
+        for (blz, url) in RETIRED_URLS {
+            assert!(url_for_blz(blz).is_some_and(|u| u != *url), "{blz}");
+        }
     }
 
     #[test]
@@ -328,7 +413,14 @@ mod tests {
                 .blz,
             "20041155"
         );
-        // not part of the generated table: one row in the picker, not four
+        // newer accounts carry one of the later codes
+        assert_eq!(
+            lookup_fints_bank_by_input("DE04 2004 1177 0123 4567 89".into())
+                .unwrap()
+                .blz,
+            "20041177"
+        );
+        // not part of the generated table: one row in the picker, not one per code
         assert!(search("comdirect", 10).is_empty());
         assert!(search("2004111", 10).is_empty());
         assert!(banks().iter().all(|e| !COMDIRECT_BLZ.contains(&e.0)));
@@ -388,9 +480,11 @@ mod tests {
         assert_eq!(search("sparkasse", 7).len(), 7);
         let ing = search("ING", 20);
         assert!(ing.iter().any(|b| b.blz == "50010517"));
-        assert!(search("Sparda Berlin", 5)
-            .iter()
-            .any(|b| b.blz == "12096597"));
+        assert!(
+            search("Sparda Berlin", 5)
+                .iter()
+                .any(|b| b.blz == "12096597")
+        );
         assert!(search("postbank", 5).iter().all(|b| b.name == "Postbank"));
         assert!(search("apobank", 5).iter().any(|b| b.blz == "30060601"));
         assert!(search("ethik", 5).iter().any(|b| b.blz == "83094495"));
@@ -422,9 +516,12 @@ mod tests {
             .collect();
         assert!(sparda.len() >= 10);
         assert!(sparda.iter().all(|b| is_valid_fints_url(&b.url)));
-        assert!(sparda
-            .iter()
-            .all(|b| b.url == ATRUVIA || b.url == "https://fints2.atruvia.de/cgi-bin/hbciservlet"));
+        assert!(
+            sparda
+                .iter()
+                .all(|b| b.url == ATRUVIA
+                    || b.url == "https://fints2.atruvia.de/cgi-bin/hbciservlet")
+        );
         assert!(!banks().iter().any(|e| e.2.contains("bankingonline.de")));
     }
 
@@ -458,8 +555,10 @@ mod tests {
             .collect();
         assert_eq!(all.len(), PSD_BLZ.len());
         assert!(search("psd west", 5).iter().any(|b| b.blz == "37060993"));
-        assert!(search("psd stuttgart", 5)
-            .iter()
-            .any(|b| b.blz == "60090900"));
+        assert!(
+            search("psd stuttgart", 5)
+                .iter()
+                .any(|b| b.blz == "60090900")
+        );
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
 use super::Vault;
@@ -43,7 +43,7 @@ impl Vault {
         let conn_map = crate::sync_merge::merge_connections(&tx)?;
         let (acc_map, acc_inserted) =
             crate::sync_merge::merge_accounts(&tx, &conn_map, &group_map, &mut st)?;
-        // user groups, account placements and names (newest edit wins)
+        // user groups and account fields (newest edit wins)
         st.groups_updated = crate::user_groups::merge_attached(&tx, &acc_map, &acc_inserted)?;
 
         // categories and rules (newest edit wins, deletions stay deleted)
@@ -56,7 +56,12 @@ impl Vault {
         // tags (by uuid, newest edit wins), before the bookings that carry them
         crate::tags::merge::merge_attached(&tx)?;
         // bookings, splits and tag sets (newest edit per field wins, deletions stay)
-        crate::sync_merge::merge_bookings(&tx, &acc_map, &cat_map, &rule_map, &mut st)?;
+        let booking_map =
+            crate::sync_merge::merge_bookings(&tx, &acc_map, &cat_map, &rule_map, &mut st)?;
+        // refund links only write `refund_links`: the change delta is their count
+        let before = tx.total_changes();
+        crate::refunds::merge_attached(&tx, &booking_map)?;
+        st.refund_links_updated = u32::try_from(tx.total_changes() - before).unwrap_or(u32::MAX);
         crate::loans::merge_attached(&tx, &acc_map)?;
         crate::opening_balance::merge_attached(&tx, &acc_map)?;
         crate::assets::merge_attached(&tx, &acc_map)?;
@@ -66,6 +71,16 @@ impl Vault {
         crate::asset_classification::store::merge_attached(&tx)?;
         crate::mandates::merge_attached(&tx, &acc_map)?;
         crate::mandates::merge_ack(&tx, &acc_map)?;
+        crate::recipients::merge_attached(&tx)?;
+        crate::merchants::custom::merge_attached(&tx)?;
+        let refund_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM main.refund_links WHERE changed_ms > 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        st.refund_links_changed = u64::try_from(refund_changes.max(0)).unwrap_or(0);
         tx.commit()?;
         Ok(st)
     }
@@ -80,11 +95,19 @@ pub struct MergeStats {
     pub rules_added: u32,
     pub bookings_added: u32,
     pub bookings_updated: u32,
-    /// User groups and account placements taken over from the other vault.
+    /// User groups and account fields taken over from the other vault (rows
+    /// changed by `user_groups::merge_attached`).
     pub groups_updated: u32,
+    /// Refund-link rows taken over from the other vault (`refunds::merge_attached`): a merge
+    /// that changed only links still refreshes the booking markers.
+    #[uniffi(default = 0)]
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub refund_links_updated: u32,
     /// Rows this merge changed in the vault (part of [`Vault::change_count`]),
     /// so the app can tell its own changes from merged ones.
     pub changes: u64,
+    /// Refund-link rows written or updated during this merge.
+    pub refund_links_changed: u64,
 }
 
 #[uniffi::export]
@@ -92,7 +115,7 @@ impl Vault {
     /// Merges another device's sync snapshot using this vault's own key
     /// (see [`merge_other_vault`](Self::merge_other_vault)).
     pub fn merge_peer_snapshot(&self, other_path: String) -> Result<MergeStats, CoreError> {
-        let key = self.kept_key()?.to_vec();
+        let key = self.kept_key().to_vec();
         self.merge_other_vault(other_path, key)
     }
 
@@ -120,8 +143,13 @@ impl Vault {
             Self::apply_key(&o, &key)?;
             let has_uuid =
                 crate::schema::has_column(&o, "main", "categories", "uuid").unwrap_or(true);
+            let has_notes =
+                crate::schema::has_column(&o, "main", "accounts", "note").unwrap_or(true);
             Self::migrate(&mut o)?;
             crate::sync_merge::fill_missing_uuids(&o)?;
+            if !has_notes {
+                crate::user_groups::mark_old_build_notes(&o)?;
+            }
             !has_uuid
         };
         let conn = self.db()?;
@@ -138,6 +166,8 @@ impl Vault {
         let res = res.and_then(|st| {
             detach_res?;
             let _ = crate::sync_merge::twins::fold_twins(&conn);
+            // … and card holds an older build turned into bookings on a switch (#1134)
+            let _ = super::connections::drop_switched_holds(&conn);
             Ok(st)
         });
         // Fold WAL frames into the main file so a plain file copy is complete.
@@ -341,6 +371,40 @@ mod merge_tests {
         a.write_snapshot(snap.clone()).unwrap();
         assert!(Vault::open(snap.clone(), vec![7u8; 32]).is_err());
         assert!(Vault::open(snap, vec![9u8; 32]).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// CodeRabbit (#1852): a merge that brings only a refund link reports it on its own.
+    #[test]
+    fn merge_counts_refund_link_rows() {
+        let dir = temp_dir("merge-refunds");
+        let a = Vault::open(path_in(&dir, "a.db"), vec![7u8; 32]).unwrap();
+        let b = Vault::open(path_in(&dir, "b.db"), vec![7u8; 32]).unwrap();
+        let account = a
+            .create_offline_account(
+                "W".into(),
+                crate::models::AccountKind::Cash,
+                "EUR".into(),
+                0,
+            )
+            .unwrap();
+        let setup = |cents| crate::offline::ManualBookingSetup {
+            booking_date: "2026-01-10".into(),
+            amount_cents: cents,
+            counterparty: "Shop".into(),
+            purpose: String::new(),
+            category_id: None,
+            note: String::new(),
+        };
+        let o = a.save_manual_booking(account, None, setup(-100)).unwrap();
+        let r = a.save_manual_booking(account, None, setup(100)).unwrap();
+        let first = b.merge_other_vault(a.file_path(), vec![7; 32]).unwrap();
+        assert_eq!(first.refund_links_updated, 0);
+        a.link_refund(r, String::new(), o, String::new()).unwrap();
+        let st = b.merge_other_vault(a.file_path(), vec![7; 32]).unwrap();
+        assert!(st.refund_links_updated > 0);
+        let again = b.merge_other_vault(a.file_path(), vec![7; 32]).unwrap();
+        assert_eq!(again.refund_links_updated, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

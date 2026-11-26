@@ -27,6 +27,12 @@ public struct ReportRedaction: OptionSet, Sendable, Hashable {
         contains(.personal) ? union(.amounts) : self
     }
 
+    /// A whole booking contains original text, category labels and amounts.
+    var allowsWholeBookingCopy: Bool { isEmpty }
+
+    /// Sender, purpose and order-item text stay visible when only amounts are hidden.
+    var allowsBookingTextCopy: Bool { !contains(.personal) }
+
     /// Stands in for a hidden name inside a text, and for search text in
     /// the captured window.
     static let placeholder = "•••"
@@ -63,6 +69,10 @@ public enum PrivacyMode {
         }
     }
 
+    /// Scope until the user picks one in Einstellungen › Allgemein: names, IBANs and purposes
+    /// too, so switching privacy mode on (⇧⌘H, toolbar) hides more than balances (#1007).
+    public static let defaultScope: Scope = .personal
+
     /// What privacy mode adds to the redaction of a window.
     public static func redaction(enabled: Bool, scope: Scope) -> ReportRedaction {
         enabled ? scope.redaction : []
@@ -73,7 +83,7 @@ public enum PrivacyMode {
 /// redaction of everything below, sheets and popovers included.
 private struct PrivacyModeEnvironment: ViewModifier {
     @AppStorage(PrivacyMode.enabledKey) private var enabled = false
-    @AppStorage(PrivacyMode.scopeKey) private var scope = PrivacyMode.Scope.amounts
+    @AppStorage(PrivacyMode.scopeKey) private var scope = PrivacyMode.defaultScope
 
     func body(content: Content) -> some View {
         let added = PrivacyMode.redaction(enabled: enabled, scope: scope).union(LaunchOptions.current.redaction)

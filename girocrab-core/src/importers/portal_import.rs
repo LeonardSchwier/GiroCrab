@@ -14,16 +14,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use chrono::{Datelike, NaiveDate};
 use regex::Regex;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
-use crate::connectors::{store_fetch, FetchResult, RemoteAccount, RemoteTransaction, SyncSummary};
-use crate::dates::{find_de_date, iso, month_from_name};
+use crate::connectors::{FetchResult, RemoteAccount, RemoteTransaction, SyncSummary, store_fetch};
+use crate::dates::{day_month_on_or_before, de_dates, iso, month_from_name};
 use crate::error::CoreError;
 use crate::i18n::{tr, trf};
 use crate::models::{AccountKind, ConnectorKind};
+use crate::money::{json_number_to_cents_rounded, parse_cents};
 use crate::vault::Vault;
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -44,85 +44,6 @@ fn charges_positive(kind: ConnectorKind) -> bool {
 
 // ------------------------------------------------------------------ primitives
 
-/// "1.234,56", "1,234.56", "-12,30", "12,30-", "€ 5", "(5,00)" -> cents.
-pub fn parse_amount(s: &str) -> Option<i64> {
-    let mut t: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '€' && *c != '\u{a0}')
-        .collect();
-    t = t.replace("EUR", "").replace("eur", "");
-    let mut neg = false;
-    if t.starts_with('(') && t.ends_with(')') {
-        neg = true;
-        t = t[1..t.len() - 1].to_string();
-    }
-    if t.ends_with('-') {
-        neg = true;
-        t.pop();
-    }
-    if t.ends_with('+') {
-        t.pop();
-    }
-    if let Some(r) = t.strip_prefix('-') {
-        neg = !neg;
-        t = r.to_string();
-    }
-    if let Some(r) = t.strip_prefix('+') {
-        t = r.to_string();
-    }
-    if t.is_empty()
-        || !t
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
-        || !t.chars().any(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-    let last_dot = t.rfind('.');
-    let last_comma = t.rfind(',');
-    let dec_pos = match (last_dot, last_comma) {
-        (Some(d), Some(c)) => Some(d.max(c)),
-        (Some(p), None) | (None, Some(p)) => {
-            let digits_after = t.len() - p - 1;
-            let sep_count = t
-                .matches(if t.as_bytes()[p] == b'.' { '.' } else { ',' })
-                .count();
-            if sep_count == 1 && digits_after != 3 {
-                Some(p)
-            } else if sep_count == 1 && digits_after == 3 && t.as_bytes()[p] == b',' && p <= 1 {
-                Some(p)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-    let (int_part, frac_part) = match dec_pos {
-        Some(p) => (&t[..p], &t[p + 1..]),
-        None => (&t[..], ""),
-    };
-    let int_digits: String = int_part.chars().filter(|c| c.is_ascii_digit()).collect();
-    let mut frac = frac_part.to_string();
-    if !frac.chars().all(|c| c.is_ascii_digit())
-        || frac.len() > 2 && frac[2..].chars().any(|c| c != '0')
-    {
-        return None;
-    }
-    frac.truncate(2);
-    while frac.len() < 2 {
-        frac.push('0');
-    }
-    let int: i64 = if int_digits.is_empty() {
-        0
-    } else {
-        int_digits.parse().ok()?
-    };
-    let cents = int
-        .checked_mul(100)?
-        .checked_add(frac.parse::<i64>().ok()?)?;
-    Some(if neg { -cents } else { cents })
-}
-
 /// Many date spellings -> "YYYY-MM-DD".
 pub fn parse_date(s: &str) -> Option<String> {
     static ISO: LazyLock<Regex> =
@@ -135,16 +56,16 @@ pub fn parse_date(s: &str) -> Option<String> {
     static MONTH_NAME_DAY: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})").unwrap());
     let s = s.trim();
-    let ymd = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).map(iso);
-    let year = |y: &str| -> Option<i32> {
-        let n: i32 = y.parse().ok()?;
-        Some(if y.len() == 2 { 2000 + n } else { n })
-    };
+    let ymd = |y, m, d| crate::dates::ymd(y, m, d).map(iso);
     if let Some(c) = ISO.captures(s) {
         return ymd(c[1].parse().ok()?, c[2].parse().ok()?, c[3].parse().ok()?);
     }
     if let Some(c) = DMY.captures(s) {
-        return ymd(year(&c[3])?, c[2].parse().ok()?, c[1].parse().ok()?);
+        return ymd(
+            crate::dates::year(&c[3])?,
+            c[2].parse().ok()?,
+            c[1].parse().ok()?,
+        );
     }
     if let Some(c) = DAY_MONTH_NAME.captures(s) {
         return ymd(
@@ -243,10 +164,10 @@ const INDICATOR_KEYS: &[&str] = &[
 
 fn get_ci<'a>(obj: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     for k in keys {
-        if let Some((_, v)) = obj.iter().find(|(name, _)| name.to_lowercase() == *k) {
-            if !v.is_null() {
-                return Some(v);
-            }
+        if let Some((_, v)) = obj.iter().find(|(name, _)| name.to_lowercase() == *k)
+            && !v.is_null()
+        {
+            return Some(v);
         }
     }
     None
@@ -270,17 +191,17 @@ fn value_text(v: &Value) -> Option<String> {
 }
 
 /// Largest amount accepted from portal JSON: 10 trillion euro in cents.
-const MAX_PORTAL_CENTS: f64 = 1e15;
+const MAX_PORTAL_CENTS: i64 = 1_000_000_000_000_000;
 
 fn value_cents(v: &Value) -> Option<i64> {
     match v {
-        Value::Number(n) => {
-            let cents = (n.as_f64()? * 100.0).round();
-            // no real account holds more than this; beyond it `as i64` would saturate
-            // and the sign handling (`abs`, `-`) downstream would overflow
-            (cents.is_finite() && cents.abs() <= MAX_PORTAL_CENTS).then_some(cents as i64)
-        }
-        Value::String(s) => parse_amount(s),
+        // Rounded from the number's text (1.005 -> 101, not 100 as in f64).
+        // No real account holds more than the cap; the sign handling (`abs`,
+        // `-`) downstream would overflow near i64::MAX.
+        Value::Number(_) => json_number_to_cents_rounded(v)
+            .ok()
+            .filter(|c| c.abs() <= MAX_PORTAL_CENTS),
+        Value::String(s) => parse_cents(s).ok(),
         // a single-currency list such as Open Bank's `amounts: [{…}]`
         Value::Array(a) => a.first().and_then(value_cents),
         Value::Object(o) => get_ci(
@@ -439,6 +360,9 @@ pub(crate) struct Capture {
     pub pending: Vec<Parsed>,
     /// A pending list (possibly empty) was among the captured responses (diagnostics).
     pub pending_listed: bool,
+    /// The portal's own booking list was among the responses (Edenred): even when
+    /// none of its entries counts (all declined), the visible table is not read instead.
+    pub bookings_listed: bool,
     pub balance: Option<(String, i64)>,
 }
 
@@ -521,13 +445,20 @@ fn norm_key(k: &str) -> String {
         .collect()
 }
 
+/// An object that lists several balance fields side by side (the card's balance
+/// summary): a zero there is a real balance, e.g. Amex `statement_balance_amount`
+/// once the last statement is paid. A lone zero elsewhere is a placeholder.
+fn is_balance_summary(o: &serde_json::Map<String, Value>) -> bool {
+    o.keys().filter(|k| norm_key(k).contains("balance")).count() >= 3
+}
+
 fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     match v {
         Value::Object(o) => {
-            if let Some((_, x)) = o
-                .iter()
-                .find(|(k, x)| norm_key(k) == key && value_cents(x).is_some_and(|c| c != 0))
-            {
+            let zero_counts = is_balance_summary(o);
+            if let Some((_, x)) = o.iter().find(|(k, x)| {
+                norm_key(k) == key && value_cents(x).is_some_and(|c| c != 0 || zero_counts)
+            }) {
                 return Some(x);
             }
             o.values().find_map(|x| find_key(x, key))
@@ -541,7 +472,10 @@ fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
 /// Returns the matched key and the balance in cents.
 fn find_balance(v: &Value, kind: ConnectorKind) -> Option<(String, i64)> {
     let owed = |c: i64| {
-        if charges_positive(kind) || c > 0 {
+        // a benefit card holds a credit, not a debt
+        if kind == ConnectorKind::Edenred {
+            c
+        } else if charges_positive(kind) || c > 0 {
             -c.abs()
         } else {
             c
@@ -571,10 +505,9 @@ fn find_balance(v: &Value, kind: ConnectorKind) -> Option<(String, i64)> {
                         ]
                         .iter()
                         .any(|x| kl.contains(x))
+                        && let Some(c) = value_cents(val).filter(|c| *c != 0)
                     {
-                        if let Some(c) = value_cents(val).filter(|c| *c != 0) {
-                            return Some((k.clone(), c));
-                        }
+                        return Some((k.clone(), c));
                     }
                 }
                 o.values().find_map(generic)
@@ -612,16 +545,146 @@ pub fn parse_json_bodies(bodies: &[String], kind: ConnectorKind) -> (Vec<Parsed>
     (c.posted, c.balance.map(|(_, c)| c))
 }
 
+/// Edenred (`nutzer.edenred.de`): the portal's card list and card operations in
+/// the shape the generic reader understands. Operations become a `transactions`
+/// list (`operation_ref`, `date`, the merchant `outlet.name`, the sum of the
+/// wallet amounts: negative = payment; a top-up is named after the `employer`, as
+/// its `outlet.name` holds only the portal's greeting); the card list becomes the card balance,
+/// the sum of the wallets' `total_balance` (a credit, not a debt), written as a
+/// balance summary so that 0 counts too. Edenred gives amounts and balances in
+/// cents. Other bodies stay as they are.
+fn edenred_body(v: &Value, employer: Option<&str>) -> Option<Value> {
+    let data = v.get("data")?;
+    let items = data
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| vec![data.clone()]);
+    // An empty list is the booking list of a card without (or with only declined)
+    // operations: it must count as present, or the visible table would be read instead.
+    if items.is_empty() || items.iter().any(|i| i.get("operation_ref").is_some()) {
+        let tx: Vec<Value> = items
+            .iter()
+            .filter(|i| {
+                let status = format!("{} {}", text_of(i, "status"), text_of(i, "cleared_status"))
+                    .to_lowercase();
+                !["declin", "reject", "cancel", "fail", "refus"]
+                    .iter()
+                    .any(|w| status.contains(w))
+            })
+            .filter_map(|i| {
+                let wallets = i.pointer("/transaction_details/wallets")?.as_array()?;
+                let cents: i64 = wallets
+                    .iter()
+                    .filter_map(|w| edenred_cents(w.get("amount")?))
+                    .sum();
+                let kind = text_of(i, "type").to_lowercase();
+                let outlet = text_of(i, "/outlet/name");
+                let text = match employer {
+                    // a top-up: the outlet name is a greeting ("Viel Spaß beim Shoppen!")
+                    Some(e) if cents > 0 && EDENRED_TOP_UPS.contains(&kind.as_str()) => {
+                        e.to_string()
+                    }
+                    _ if outlet.is_empty() => text_of(i, "type"),
+                    _ => outlet,
+                };
+                Some(serde_json::json!({
+                    "date": text_of(i, "date"),
+                    "amount": cents as f64 / 100.0,
+                    "description": text,
+                    "identifier": text_of(i, "operation_ref"),
+                }))
+            })
+            .collect();
+        return Some(serde_json::json!({ "transactions": tx }));
+    }
+    let wallets: Vec<&Value> = items
+        .iter()
+        .filter_map(|i| i.get("wallets")?.as_array())
+        .flatten()
+        .collect();
+    if wallets.iter().any(|w| w.get("total_balance").is_some()) {
+        let cents: i64 = wallets
+            .iter()
+            .filter_map(|w| edenred_cents(w.get("total_balance")?))
+            .sum();
+        let amount = cents as f64 / 100.0;
+        return Some(serde_json::json!({
+            "current_balance": amount,
+            "card_balance": amount,
+            "wallet_balance": amount,
+        }));
+    }
+    None
+}
+
+/// Operation types of an Edenred top-up by the employer.
+const EDENRED_TOP_UPS: [&str; 3] = ["topup", "top_up", "load"];
+
+/// The employer that loads the cards, from the portal's card list (`employer.name`).
+fn edenred_employer(v: &Value) -> Option<String> {
+    let data = v.get("data")?;
+    let items = data
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| vec![data.clone()]);
+    items
+        .iter()
+        .map(|i| text_of(i, "/employer/name"))
+        .find(|n| !n.trim().is_empty())
+}
+
+/// An Edenred amount: a number of cents (2406 = 24,06 €).
+fn edenred_cents(v: &Value) -> Option<i64> {
+    v.as_f64()
+        .or_else(|| v.as_str()?.trim().parse().ok())
+        .map(|c| c.round() as i64)
+}
+
+/// The text at `key` (a field name or a JSON pointer), "" if missing.
+fn text_of(v: &Value, key: &str) -> String {
+    let x = if key.starts_with('/') {
+        v.pointer(key)
+    } else {
+        v.get(key)
+    };
+    x.and_then(value_text).unwrap_or_default()
+}
+
 pub(crate) fn parse_capture(bodies: &[String], kind: ConnectorKind) -> Capture {
     let mut c = Capture::default();
     let mut cards = HashMap::new();
+    // Edenred: the card list names the employer that top-ups come from.
+    let employer = (kind == ConnectorKind::Edenred)
+        .then(|| {
+            bodies
+                .iter()
+                .filter_map(|b| serde_json::from_str::<Value>(b).ok())
+                .find_map(|v| edenred_employer(&v))
+        })
+        .flatten();
     for b in bodies {
         let Ok(v) = serde_json::from_str::<Value>(b) else {
             continue;
         };
+        let v = match kind {
+            ConnectorKind::Edenred => match edenred_body(&v, employer.as_deref()) {
+                Some(t) => {
+                    c.bookings_listed |= t.get("transactions").is_some();
+                    t
+                }
+                None => v,
+            },
+            _ => v,
+        };
         walk(&v, kind, false, &mut c);
         card_directory(&v, &mut cards);
-        if c.balance.is_none() {
+        // Edenred reloads its card list while the portal is open: the latest
+        // reported balance counts; a body without one keeps the earlier one.
+        if kind == ConnectorKind::Edenred {
+            if let Some(b) = find_balance(&v, kind) {
+                c.balance = Some(b);
+            }
+        } else if c.balance.is_none() {
             c.balance = find_balance(&v, kind);
         }
     }
@@ -688,13 +751,13 @@ pub fn parse_dom_rows(rows: &[Vec<String>], kind: ConnectorKind) -> Vec<Parsed> 
             .iter()
             .rev()
             .find(|c| c.contains(',') || c.contains('.'))
-            .and_then(|c| parse_amount(c));
+            .and_then(|c| parse_cents(c).ok());
         let (Some(date), Some(raw)) = (date, amount) else {
             continue;
         };
         let text = cells
             .iter()
-            .filter(|c| parse_date(c).is_none() && parse_amount(c).is_none())
+            .filter(|c| parse_date(c).is_none() && parse_cents(c).is_err())
             .max_by_key(|c| c.len())
             .map(|c| c.to_string())
             .unwrap_or_default();
@@ -823,7 +886,7 @@ pub fn parse_csv(text: &str, kind: ConnectorKind) -> Vec<Parsed> {
     for r in rows.iter().skip(hi + 1) {
         let (Some(d), Some(a)) = (
             r.get(di).and_then(|x| parse_date(x)),
-            r.get(ai).and_then(|x| parse_amount(x)),
+            r.get(ai).and_then(|x| parse_cents(x).ok()),
         ) else {
             continue;
         };
@@ -863,22 +926,31 @@ pub fn parse_statement_text(text: &str, kind: ConnectorKind) -> Vec<Parsed> {
     static LINE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^\s*(\d{1,2}\.\d{1,2}\.(?:\d{4}|\d{2})?)\s+(?:(\d{1,2}\.\d{1,2}\.(?:\d{4}|\d{2})?)\s+)?(.+?)\s+(-?\d{1,3}(?:\.\d{3})*,\d{2}|-?\d+,\d{2})\s*(-|CR|H|S|\+)?\s*$").unwrap()
     });
-    // statement year from any full date or "Abrechnung … 2025"
-    let default_year = find_de_date(text).map_or_else(|| chrono::Local::now().year(), |d| d.year());
+    // A "DD.MM." line falls on or before the statement's latest date. Dates after
+    // today are fine print (new terms, card expiry), not the statement's.
+    let today = crate::dates::today();
+    let latest = de_dates(text)
+        .filter(|d| *d <= today)
+        .max()
+        .unwrap_or(today);
     let mut out = Vec::new();
     for line in text.lines() {
         let Some(c) = LINE.captures(line) else {
             continue;
         };
-        let date_s = if c[1].matches('.').count() == 2 && c[1].ends_with('.') {
-            format!("{}{}", &c[1], default_year)
-        } else {
-            c[1].to_string()
+        let date = match c[1].strip_suffix('.').and_then(|dm| dm.split_once('.')) {
+            Some((d, m)) => d
+                .parse()
+                .ok()
+                .zip(m.parse().ok())
+                .and_then(|(d, m)| day_month_on_or_before(d, m, latest))
+                .map(iso),
+            None => parse_date(&c[1]),
         };
-        let Some(date) = parse_date(&date_s) else {
+        let Some(date) = date else {
             continue;
         };
-        let Some(raw) = parse_amount(&c[4]) else {
+        let Ok(raw) = parse_cents(&c[4]) else {
             continue;
         };
         let suffix = c.get(5).map(|m| m.as_str()).unwrap_or("");
@@ -956,7 +1028,7 @@ fn to_fetch(
     holds: Vec<Parsed>,
     balance: Option<i64>,
 ) -> FetchResult {
-    let (account, transactions) = card_account(
+    let (mut account, transactions) = card_account(
         &account_ref(kind, connection_id),
         name,
         "",
@@ -964,7 +1036,17 @@ fn to_fetch(
         holds,
         balance,
     );
+    // a benefit card holds a credit: no credit-card rules (open amount, settlement)
+    if kind == ConnectorKind::Edenred {
+        account.kind = AccountKind::PaymentService;
+    }
     FetchResult {
+        // a reported balance, even 0, replaces the stored one
+        balances_reported: if balance.is_some() {
+            vec![account.external_ref.clone()]
+        } else {
+            Vec::new()
+        },
         accounts: vec![account],
         transactions,
         state: None,
@@ -1034,12 +1116,43 @@ fn card_account(
     (account, transactions)
 }
 
-fn account_ref(kind: ConnectorKind, connection_id: i64) -> String {
+pub(crate) fn account_ref(kind: ConnectorKind, connection_id: i64) -> String {
     format!(
         "portal-{}-{}",
         kind.as_str().replace(':', "-"),
         connection_id
     )
+}
+
+/// Connector of a portal the app reads in its embedded browser (Edenred): a
+/// sync always goes through the portal window, never through the core.
+pub struct PortalOnlyConnector;
+
+#[async_trait::async_trait]
+impl crate::connectors::BankConnector for PortalOnlyConnector {
+    async fn begin(
+        &mut self,
+        _: &crate::connectors::ConnectContext,
+    ) -> crate::error::CoreResult<crate::connectors::Phase> {
+        Err(CoreError::BrowserLoginRequired {
+            message: tr("Bitte im Portal-Fenster anmelden und abrufen.").into(),
+        })
+    }
+    async fn respond(
+        &mut self,
+        ctx: &crate::connectors::ConnectContext,
+        _: crate::connectors::ChallengeResponse,
+    ) -> crate::error::CoreResult<crate::connectors::Phase> {
+        self.begin(ctx).await
+    }
+    async fn fetch(
+        &mut self,
+        _: &crate::connectors::ConnectContext,
+    ) -> crate::error::CoreResult<FetchResult> {
+        Err(CoreError::BrowserLoginRequired {
+            message: tr("Bitte im Portal-Fenster anmelden und abrufen.").into(),
+        })
+    }
 }
 
 // ------------------------------------------------------------------ several cards (#243)
@@ -1174,10 +1287,8 @@ fn cards_fetch(
         && (cards.len() == 1
             || stored.is_empty()
             || stored.iter().any(|s| s.account_ref == base_ref));
-    if base_free {
-        if let Some(t) = target.iter_mut().find(|t| t.is_none()) {
-            *t = Some(base_ref.to_string());
-        }
+    if base_free && let Some(t) = target.iter_mut().find(|t| t.is_none()) {
+        *t = Some(base_ref.to_string());
     }
     let adjust_balances = cards.iter().all(|c| c.balance.is_none());
     let mut out = FetchResult {
@@ -1200,6 +1311,11 @@ fn cards_fetch(
                     format!("{name} {}", i + 1)
                 }
             });
+        // A balance the portal reported, even 0 (statement paid), replaces the
+        // stored one; a card without one keeps it.
+        if c.balance.is_some() {
+            out.balances_reported.push(account_ref.clone());
+        }
         let (account, transactions) = card_account(
             &account_ref,
             &account_name,
@@ -1364,6 +1480,19 @@ fn convert_legacy_copies(db: &rusqlite::Connection, account_id: i64) -> Result<u
     };
     for id in &copies {
         db.execute(&copy_sql, [id])?;
+        // only a live copy takes the links: a deleted hold that already owns the id (the insert
+        // was ignored) never does; then the links stay on the converted row, inactive with it
+        let survivor: Option<i64> = rusqlite::OptionalExtension::optional(db.query_row(
+            "SELECT c.id FROM transactions c JOIN transactions old
+                ON c.account_id=old.account_id AND c.external_id=?2 || old.external_id
+               AND c.deleted_ms IS NULL
+             WHERE old.id=?1",
+            params![id, HOLD_PREFIX],
+            |r| r.get(0),
+        ))?;
+        if let Some(survivor) = survivor {
+            crate::refunds::move_booking(db, *id, survivor)?;
+        }
         crate::sync_merge::soft_delete_booking(db, *id)?;
     }
     Ok(copies.len() as u32)
@@ -1442,41 +1571,101 @@ pub(crate) fn merge_imported_split_parts(
             continue;
         }
         // the portal booking with this reference (exactly one, not split yet)
-        let bank: Vec<(i64, i64, bool, String)> = {
+        let bank: Vec<(i64, i64, bool)> = {
             let mut q = db.prepare(
-                "SELECT t.id, t.amount_cents, t.checked, t.category_source FROM transactions t
+                "SELECT t.id, t.amount_cents, t.checked FROM transactions t
                   WHERE t.account_id = ?1 AND t.deleted_ms IS NULL AND substr(t.external_id, 1, ?3) = ?2
                     AND NOT EXISTS (SELECT 1 FROM transaction_splits s WHERE s.transaction_id = t.id)",
             )?;
             let prefix = format!("id:{reference}---");
             let rows = q.query_map(params![account_id, prefix, prefix.len() as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?;
             rows.collect::<Result<_, _>>()?
         };
-        let [(bank_id, bank_cents, bank_checked, ref source)] = bank[..] else {
+        let [(bank_id, bank_cents, bank_checked)] = bank[..] else {
             continue;
         };
         if parts.iter().map(|p| p.1).sum::<i64>() != bank_cents {
             continue;
         }
-        for (_, cents, cat, note, _) in &parts {
+        let lines: Vec<_> = parts
+            .iter()
+            .map(
+                |(_, cents, cat, note, _)| crate::models::TransactionSplitInput {
+                    uuid: None,
+                    category_id: *cat,
+                    amount_cents: *cents,
+                    note: note.clone(),
+                },
+            )
+            .collect();
+        crate::planning::store_splits(db, bank_id, &lines)?;
+        // Same import on two devices -> same part UUIDs (CodeRabbit #1853): derive each part's
+        // identity from the portal booking and the imported part it came from. A UUID already
+        // taken keeps the random one.
+        let bank_key = crate::sync_merge::booking_key(db, bank_id)?;
+        let stored: Vec<String> = db
+            .prepare_cached(
+                "SELECT uuid FROM transaction_splits WHERE transaction_id=?1 ORDER BY position,id",
+            )?
+            .query_map([bank_id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for (part, uuid) in parts.iter().zip(&stored) {
+            let source = crate::sync_merge::booking_key(db, part.0)?;
+            let identity = serde_json::to_vec(&("girocrab.import-part.v1", &bank_key, source))
+                .expect("import part identity");
+            let stable = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &identity).to_string();
             db.execute(
-                "INSERT INTO transaction_splits(transaction_id, category_id, amount_cents, note) VALUES (?1, ?2, ?3, ?4)",
-                params![bank_id, cat, cents, note.trim()],
+                "UPDATE OR IGNORE transaction_splits SET uuid=?2 WHERE transaction_id=?1 AND uuid=?3",
+                params![bank_id, stable, uuid],
             )?;
         }
-        db.execute(
-            "UPDATE transactions SET splits_ms = ?2 WHERE id = ?1",
-            params![bank_id, now],
+        let uuids = db
+            .prepare_cached(
+                "SELECT uuid FROM transaction_splits WHERE transaction_id=?1 ORDER BY position,id",
+            )?
+            .query_map([bank_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut endpoints: std::collections::HashMap<_, _> = parts
+            .iter()
+            .zip(uuids.iter())
+            .map(|(part, uuid)| {
+                (
+                    crate::refunds::Endpoint(part.0, String::new()),
+                    crate::refunds::Endpoint(bank_id, uuid.clone()),
+                )
+            })
+            .collect();
+        let matching: Vec<_> = lines
+            .iter()
+            .zip(uuids)
+            .filter(|(line, _)| line.amount_cents == bank_cents)
+            .map(|(_, uuid)| uuid)
+            .collect();
+        if let [uuid] = matching.as_slice() {
+            endpoints.insert(
+                crate::refunds::Endpoint(bank_id, String::new()),
+                crate::refunds::Endpoint(bank_id, uuid.clone()),
+            );
+        }
+        // only when a link names one of these bookings (no link-table scan otherwise)
+        let touched = parts
+            .iter()
+            .map(|p| p.0)
+            .chain([bank_id])
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let linked: bool = db.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM refund_links WHERE refund_id IN ({touched}) OR original_id IN ({touched}))"),
+            [],
+            |r| r.get(0),
         )?;
-        if source != "manual" {
-            db.execute(
-                "UPDATE transactions SET category_id = NULL, category_source = 'none', rule_id = NULL, category_ms = ?2
-                  WHERE id = ?1 AND category_id IS NOT NULL",
-                params![bank_id, now],
-            )?;
+        if linked {
+            crate::refunds::move_endpoints(db, &endpoints)?;
         }
+        crate::planning::clear_split_category(db, bank_id)?;
         if !bank_checked && parts.iter().all(|p| p.4) {
             db.execute(
                 "UPDATE transactions SET checked = 1, checked_ms = ?2 WHERE id = ?1",
@@ -1531,6 +1720,7 @@ pub(crate) fn hand_over(db: &rusqlite::Connection, from: i64, to: i64) -> Result
           WHERE id = ?2 AND checked = 0 AND (SELECT checked FROM transactions WHERE id = ?1) = 1",
         params![from, to, now],
     )?;
+    crate::refunds::move_booking(db, from, to)?;
     crate::sync_merge::soft_delete_booking(db, from)
 }
 
@@ -1633,7 +1823,9 @@ impl Vault {
         balance: Option<i64>,
     ) -> Result<SyncSummary, CoreError> {
         let (kind, name) = self.portal_connection(connection_id)?;
-        if parsed.is_empty() && (holds.is_empty() || balance.is_none()) {
+        // Edenred: the balance alone is worth storing (a card without bookings)
+        let balance_only = kind == ConnectorKind::Edenred && balance.is_some();
+        if parsed.is_empty() && !balance_only && (holds.is_empty() || balance.is_none()) {
             return Err(CoreError::InvalidInput {
                 message: tr("Keine Umsätze erkannt.").into(),
             });
@@ -1754,11 +1946,12 @@ impl Vault {
             posted: mut parsed,
             pending,
             pending_listed,
+            bookings_listed,
             ..
         } = capture;
         let from_json = parsed.len();
         // The visible table only when the JSON held no bookings at all (it may mix in pending rows).
-        if parsed.is_empty() && pending.is_empty() {
+        if parsed.is_empty() && pending.is_empty() && !bookings_listed {
             let rows: Vec<Vec<String>> = serde_json::from_str(&dom_rows_json).unwrap_or_default();
             parsed = parse_dom_rows(&rows, kind);
         }
@@ -1791,9 +1984,13 @@ impl Vault {
             0
         };
         let mut n = c.posted.len() + holds;
-        if c.posted.is_empty() && c.pending.is_empty() {
+        if c.posted.is_empty() && c.pending.is_empty() && !c.bookings_listed {
             let rows: Vec<Vec<String>> = serde_json::from_str(&dom_rows_json).unwrap_or_default();
             n = parse_dom_rows(&rows, kind).len();
+        }
+        // Edenred: a card without bookings (new or used up) still brings its balance
+        if n == 0 && kind == ConnectorKind::Edenred && c.balance.is_some() {
+            n = 1;
         }
         Ok(n as u32)
     }
@@ -2071,6 +2268,16 @@ mod tests {
     }
 
     #[test]
+    fn json_amounts_round_from_their_text_not_from_f64() {
+        use serde_json::json;
+        // 1.005 * 100.0 is 100.4999… in f64
+        assert_eq!(super::value_cents(&json!(1.005)), Some(101));
+        assert_eq!(super::value_cents(&json!(-0.285)), Some(-29));
+        assert_eq!(super::value_cents(&json!(42)), Some(4200));
+        assert_eq!(super::value_cents(&json!(1e10)), Some(1_000_000_000_000));
+    }
+
+    #[test]
     fn candidate_keys_are_names_only() {
         // the debug log may name fields, never their amounts
         let v = serde_json::json!({
@@ -2086,6 +2293,170 @@ mod tests {
     }
 
     #[test]
+    fn edenred_operations_and_card_balance() {
+        let cards = r#"{"data":[{"card_ref":"C1","account_ref":"A1","status":"active","wallets":[{"currency":"EUR","product_ref":"P","product_type":"meal","total_balance":4250}]},{"card_ref":"C0","account_ref":"A0","status":"expired","wallets":[{"currency":"EUR","product_ref":"P","product_type":"meal","total_balance":0}]}],"meta":{"status":"ok"}}"#;
+        let ops = r#"{"data":[
+            {"operation_ref":"OP1","date":"2026-11-12T11:30:00.000Z","currency":"EUR","status":"accepted","cleared_status":"cleared","type":"payment","outlet":{"name":"Kantine Musterhaus","ref":"O1"},"transaction_details":{"wallets":[{"amount":-740,"product_ref":"P","status":"ok"}]}},
+            {"operation_ref":"OP2","date":"2026-11-01T00:00:00.000Z","currency":"EUR","status":"accepted","cleared_status":"cleared","type":"load","outlet":{"name":"","ref":""},"transaction_details":{"wallets":[{"amount":5000,"product_ref":"P","status":"ok"}]}},
+            {"operation_ref":"OP3","date":"2026-11-13T12:00:00.000Z","currency":"EUR","status":"declined","cleared_status":"","type":"payment","outlet":{"name":"Bistro","ref":"O2"},"transaction_details":{"wallets":[{"amount":-990,"product_ref":"P","status":"ko"}]}}
+        ],"meta":{"status":"ok"}}"#;
+        let c = parse_capture(
+            &[cards.to_string(), ops.to_string()],
+            ConnectorKind::Edenred,
+        );
+        // a credit in cents, the sum of the cards' wallets
+        assert_eq!(c.balance.map(|(_, b)| b), Some(4250));
+        let got: Vec<(String, i64, String, Option<String>)> = c
+            .posted
+            .iter()
+            .map(|p| (p.date.clone(), p.cents, p.text.clone(), p.id.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "2026-11-12".to_string(),
+                    -740,
+                    "Kantine Musterhaus".to_string(),
+                    Some("OP1".to_string())
+                ),
+                (
+                    "2026-11-01".to_string(),
+                    5000,
+                    "load".to_string(),
+                    Some("OP2".to_string())
+                ),
+            ]
+        );
+        // a balance of 0 counts (cards used up)
+        let empty = r#"{"data":[{"card_ref":"C1","wallets":[{"total_balance":0}]}]}"#;
+        let c = parse_capture(&[empty.to_string()], ConnectorKind::Edenred);
+        assert_eq!(c.balance.map(|(_, b)| b), Some(0));
+    }
+
+    #[test]
+    fn an_edenred_top_up_is_named_after_the_employer() {
+        let cards = r#"{"data":[{"card_ref":"C1","status":"active","employer":{"name":"Beispiel GmbH"},"wallets":[{"currency":"EUR","total_balance":5000}]}]}"#;
+        let ops = r#"{"data":[
+            {"operation_ref":"OP1","date":"2026-10-24T08:00:00.000Z","status":"accepted","type":"topup","outlet":{"name":"Viel Spaß beim Shoppen!"},"transaction_details":{"wallets":[{"amount":5000}]}},
+            {"operation_ref":"OP2","date":"2026-10-28T10:00:00.000Z","status":"accepted","type":"payment","outlet":{"name":"Drogerie, Musterstadt"},"transaction_details":{"wallets":[{"amount":-1135}]}}
+        ]}"#;
+        let names = |bodies: &[&str]| -> Vec<String> {
+            let bodies: Vec<String> = bodies.iter().map(|b| b.to_string()).collect();
+            parse_capture(&bodies, ConnectorKind::Edenred)
+                .posted
+                .iter()
+                .map(|p| p.text.clone())
+                .collect()
+        };
+        // the card list may come before or after the operations
+        for order in [[cards, ops], [ops, cards]] {
+            assert_eq!(names(&order), ["Beispiel GmbH", "Drogerie, Musterstadt"]);
+        }
+        // without an employer in the card list the portal's text stays
+        assert_eq!(
+            names(&[ops]),
+            ["Viel Spaß beim Shoppen!", "Drogerie, Musterstadt"]
+        );
+    }
+
+    #[test]
+    fn declined_edenred_operations_never_come_back_from_the_table() {
+        let declined = r#"{"data":[{"operation_ref":"OP3","date":"2026-11-13T12:00:00.000Z","status":"declined","outlet":{"name":"Bistro"},"transaction_details":{"wallets":[{"amount":-990}]}}]}"#;
+        let empty = r#"{"data":[],"meta":{"status":"ok"}}"#;
+        for (i, ops) in [declined, empty].into_iter().enumerate() {
+            let dir = crate::test_support::TempDir::new(&format!("girocrab-edenred-declined-{i}"));
+            let v = Vault::open(
+                dir.join("v.db").to_string_lossy().to_string(),
+                vec![3u8; 32],
+            )
+            .unwrap();
+            let conn = v
+                .add_bank_connection(ConnectorKind::Edenred, String::new(), "Edenred".into())
+                .unwrap();
+            let cards =
+                r#"{"data":[{"card_ref":"C1","wallets":[{"total_balance":2500}]}]}"#.to_string();
+            // the page (still) shows the declined payment in its table
+            let rows = r#"[["13.11.2026","Bistro","-9,90"]]"#.to_string();
+            let bodies = vec![ops.to_string(), cards];
+            let c = parse_capture(&bodies, ConnectorKind::Edenred);
+            assert!(c.bookings_listed, "case {i}");
+            v.clone().import_portal_capture(conn, bodies, rows).unwrap();
+            let n: i64 = v
+                .db()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM transactions WHERE deleted_ms IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "case {i}");
+        }
+    }
+
+    #[test]
+    fn edenred_takes_the_latest_balance() {
+        let cards = |cents: i64| {
+            format!(r#"{{"data":[{{"card_ref":"C1","wallets":[{{"total_balance":{cents}}}]}}]}}"#)
+        };
+        let other = r#"{"data":{"cardOrigin":"x"}}"#.to_string();
+        let c = parse_capture(
+            &[cards(4250), other.clone(), cards(3510), other],
+            ConnectorKind::Edenred,
+        );
+        assert_eq!(c.balance.map(|(_, b)| b), Some(3510));
+    }
+
+    #[test]
+    fn an_edenred_card_without_bookings_brings_its_balance() {
+        let dir = crate::test_support::TempDir::new("girocrab-edenred-balance-only");
+        let v = Vault::open(
+            dir.join("v.db").to_string_lossy().to_string(),
+            vec![3u8; 32],
+        )
+        .unwrap();
+        let conn = v
+            .add_bank_connection(ConnectorKind::Edenred, String::new(), "Edenred".into())
+            .unwrap();
+        let cards =
+            r#"{"data":[{"card_ref":"C1","wallets":[{"total_balance":2500}]}]}"#.to_string();
+        assert_eq!(
+            v.clone()
+                .preview_portal_capture(conn, vec![cards.clone()], "[]".into())
+                .unwrap(),
+            1
+        );
+        v.clone()
+            .import_portal_capture(conn, vec![cards], "[]".into())
+            .unwrap();
+        let (balance, kind): (i64, String) = v
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT balance_cents, kind FROM accounts WHERE deleted_ms IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((balance, kind.as_str()), (2500, "payment_service"));
+    }
+
+    #[test]
+    fn amex_paid_statement_leaves_a_zero_balance() {
+        // the last statement is paid by direct debit: nothing is owed any more
+        let b = r#"{"cash_advance_balance_amount":0,"charges_amount":0,"debits_balance_amount":0,"disputed_amount":0,"last_statement_balance_amount":123.45,"payment_due_amount":0,"payments_credits_amount":-123.45,"remaining_statement_balance_amount":0,"statement_balance_amount":0,"total_amount":0,"total_debits_balance_amount":0,"total_payments_credits_amount":-123.45}"#;
+        let (_, bal) =
+            super::parse_json_bodies(&[b.to_string()], super::ConnectorKind::AmericanExpress);
+        assert_eq!(bal, Some(0));
+        // a lone zero outside a balance summary is still no balance
+        let lone = r#"{"statement_balance_amount":0,"last_statement_balance_amount":123.45}"#;
+        let (_, bal) =
+            super::parse_json_bodies(&[lone.to_string()], super::ConnectorKind::AmericanExpress);
+        assert_eq!(bal, Some(-12345));
+    }
+
+    #[test]
     fn amex_statement_balance_wins() {
         let b = r#"{"charges_amount":1702.24,"debits_balance_amount":1702.24,"total_debits_balance_amount":1702.24,"last_statement_balance_amount":5515.59,"statement_balance_amount":6879.3,"totalAmount":0}"#;
         let (_, bal) =
@@ -2093,17 +2464,6 @@ mod tests {
         assert_eq!(bal, Some(-687930));
     }
     use super::*;
-
-    #[test]
-    fn amounts() {
-        assert_eq!(parse_amount("1.234,56"), Some(123456));
-        assert_eq!(parse_amount("1,234.56"), Some(123456));
-        assert_eq!(parse_amount("-12,30"), Some(-1230));
-        assert_eq!(parse_amount("12,30-"), Some(-1230));
-        assert_eq!(parse_amount("€ 5"), Some(500));
-        assert_eq!(parse_amount("1.234"), Some(123400));
-        assert_eq!(parse_amount("abc"), None);
-    }
 
     #[test]
     fn dates() {
@@ -2243,6 +2603,33 @@ mod tests {
     }
 
     #[test]
+    fn pdf_lines_without_year_before_the_statement_date() {
+        let dates = |t: &str| -> Vec<String> {
+            parse_statement_text(t, ConnectorKind::AmericanExpress)
+                .into_iter()
+                .map(|p| p.date)
+                .collect()
+        };
+        assert_eq!(
+            dates("Abrechnung vom 05.01.2026\n28.12. Hotel 120,00\n03.01. Taxi 12,00\n"),
+            ["2025-12-28", "2026-01-03"]
+        );
+        // A period names its start first; the end date decides.
+        assert_eq!(
+            dates("Zeitraum 01.12.2025 - 05.01.2026\n28.12. Hotel 120,00\n03.01. Taxi 12,00\n"),
+            ["2025-12-28", "2026-01-03"]
+        );
+        assert_eq!(
+            dates("Abrechnung vom 15.12.2025\n01.12. Hotel 120,00\n15.12. Taxi 12,00\n"),
+            ["2025-12-01", "2025-12-15"]
+        );
+        assert_eq!(
+            dates("Abrechnung vom 05.01.2026\n28.12. Hotel 120,00\nZinsänderung ab 01.04.2099\n"),
+            ["2025-12-28"]
+        );
+    }
+
+    #[test]
     fn dom_rows() {
         let rows = vec![vec!["03.04.2025".into(), "REWE".into(), "23,50 €".into()]];
         let p = parse_dom_rows(&rows, ConnectorKind::AmazonVisa);
@@ -2341,6 +2728,59 @@ mod hold_tests {
         }
         b.push('}');
         b
+    }
+
+    /// CodeRabbit (#1853): merging the same imported parts on two devices gives the same part
+    /// UUIDs, so a refund link to a part survives the sync of the split vector.
+    #[test]
+    fn imported_split_parts_get_the_same_uuids_on_every_device() {
+        let uuids = |reverse: bool| {
+            let (v, _, _dir) = vault();
+            let account = v
+                .create_offline_account(
+                    "Karte".into(),
+                    crate::models::AccountKind::Cash,
+                    "EUR".into(),
+                    0,
+                )
+                .unwrap();
+            let db = v.db().unwrap();
+            // the account key is synced, so it is the same on every device
+            db.execute(
+                "UPDATE accounts SET external_ref='offline-shared' WHERE id=?1",
+                [account],
+            )
+            .unwrap();
+            db.execute_batch(&format!(
+                "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, purpose) VALUES
+                   ({account}, 'id:REF1234567---1', '2026-01-02', -1000, '');"
+            ))
+            .unwrap();
+            // the imported parts arrive in either order on the two devices
+            let mut parts = [("mm-1", -400), ("mm-2", -600)];
+            if reverse {
+                parts.reverse();
+            }
+            for (ext, cents) in parts {
+                db.execute(
+                    "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, purpose)
+                     VALUES (?1, ?2, '2026-01-02', ?3, 'EREF: REF1234567')",
+                    params![account, ext, cents],
+                )
+                .unwrap();
+            }
+            assert_eq!(merge_imported_split_parts(&db, account).unwrap(), 1);
+            // each amount keeps its UUID, whatever the order
+            db.prepare("SELECT amount_cents, uuid FROM transaction_splits ORDER BY amount_cents")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let first = uuids(false);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, uuids(true));
     }
 
     fn sync(v: &Arc<Vault>, conn: i64, body: &str) -> Result<SyncSummary, CoreError> {
@@ -2872,6 +3312,58 @@ mod card_tests {
     }
 
     #[test]
+    fn a_paid_statement_brings_the_stored_card_balance_to_zero() {
+        let dir = crate::test_support::TempDir::new("girocrab-amex-paid");
+        let v = Vault::open(
+            dir.join("v.db").to_string_lossy().to_string(),
+            vec![3u8; 32],
+        )
+        .unwrap();
+        let conn = v
+            .add_bank_connection(ConnectorKind::AmericanExpress, String::new(), "Amex".into())
+            .unwrap();
+        let summary = |statement: f64, last: f64, payments: f64| {
+            format!(
+                r#"{{"cash_advance_balance_amount":0,"debits_balance_amount":0,"last_statement_balance_amount":{last},"remaining_statement_balance_amount":{statement},"statement_balance_amount":{statement},"total_payments_credits_amount":{payments}}}"#
+            )
+        };
+        let tx = r#"{"transactions":[{"charge_date":"2026-10-03","amount":10,"description":"REWE","identifier":"A1"}]}"#;
+        let paid = r#"{"transactions":[{"charge_date":"2026-11-12","amount":-123.45,"description":"ZAHLUNG/ÜBERWEISUNG ERHALTEN BESTEN DANK","identifier":"A2"}]}"#;
+        // stored and shown: a card stored with 0 shows its open amount, here
+        // nothing after the payment (the older charge is outside the fetch)
+        let balance = |v: &Vault| -> (i64, i64) {
+            let stored = v
+                .db()
+                .unwrap()
+                .query_row(
+                    "SELECT balance_cents FROM accounts WHERE deleted_ms IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (stored, v.list_accounts().unwrap()[0].balance_cents)
+        };
+        // a statement of 123.45 is open
+        v.clone()
+            .import_portal_capture(
+                conn,
+                vec![tx.into(), summary(123.45, 123.45, 0.0)],
+                "[]".into(),
+            )
+            .unwrap();
+        assert_eq!(balance(&v), (-12345, -12345));
+        // paid by direct debit: nothing is owed any more
+        v.clone()
+            .import_portal_capture(
+                conn,
+                vec![paid.into(), summary(0.0, 123.45, -123.45)],
+                "[]".into(),
+            )
+            .unwrap();
+        assert_eq!(balance(&v), (0, 0));
+    }
+
+    #[test]
     fn second_card_gets_its_own_account_after_the_choice() {
         let dir = crate::test_support::TempDir::new("girocrab-amex-two-cards");
         let v = Vault::open(
@@ -2960,10 +3452,11 @@ mod card_tests {
             .unwrap();
         assert_eq!(rows(&v, &new_ref), vec!["id:B1", "id:B2"]);
         assert_eq!(rows(&v, &base), vec!["id:A1", "id:A2", "id:A3"]);
-        assert!(v
-            .pending_account_selection_connections()
-            .unwrap()
-            .is_empty());
+        assert!(
+            v.pending_account_selection_connections()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3051,10 +3544,11 @@ mod card_tests {
         v.clone()
             .import_portal_capture_cards(conn, bodies, keys, cards, "[]".into())
             .unwrap();
-        assert!(v
-            .pending_account_selection_connections()
-            .unwrap()
-            .is_empty());
+        assert!(
+            v.pending_account_selection_connections()
+                .unwrap()
+                .is_empty()
+        );
         let choices = v.connection_account_choices(conn).unwrap();
         assert_eq!(
             choices

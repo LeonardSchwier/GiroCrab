@@ -309,36 +309,14 @@ fn signed_amount(s: &str) -> Option<(String, i64)> {
     if s.len() < 4 || !cur.chars().all(|c| c.is_ascii_uppercase()) {
         return None;
     }
-    let cents = decimal_cents(s.get(3..)?)?;
+    // "10718,73", "243,"; more decimals are rounded.
+    let cents = crate::money::decimal(s.get(3..)?, ',').and_then(crate::money::cents_rounded)?;
     Some((cur.to_string(), if neg { -cents } else { cents }))
-}
-
-/// "10718,73" → 1071873, "243," → 24300, "11,672" → 1167 (rounded half up).
-fn decimal_cents(s: &str) -> Option<i64> {
-    let (int, frac) = s.split_once(',').unwrap_or((s, ""));
-    if int.is_empty() && frac.is_empty() {
-        return None;
-    }
-    if !int.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let int: i64 = if int.is_empty() { 0 } else { int.parse().ok()? };
-    let mut digits: Vec<u8> = frac.bytes().map(|b| b - b'0').collect();
-    digits.resize(digits.len().max(3), 0);
-    let cents = (digits[0] as i64) * 10 + digits[1] as i64;
-    let round_up = digits[2] >= 5;
-    int.checked_mul(100)?
-        .checked_add(cents)?
-        .checked_add(i64::from(round_up))
 }
 
 /// "20261107" or "20261107120000" → "2026-11-07"
 fn date(s: &str) -> Option<String> {
-    let d = s.get(..8)?;
-    if !d.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..8]))
+    crate::dates::parse_yyyymmdd(s).map(crate::dates::iso)
 }
 
 #[cfg(test)]
@@ -381,7 +359,9 @@ mod tests {
     #[test]
     fn empty_depot_is_zero_and_percent_quotes_have_no_price() {
         assert_eq!(parse(":16R:GENL\n:16S:GENL\n-").value_cents(), Some(0));
-        let st = parse(":16R:FIN\n:35B:ISIN DE0000000003\n:90A::MRKT//PRCT/101,5\n:93B::AGGR//FAMT/1000,\n:16S:FIN\n-");
+        let st = parse(
+            ":16R:FIN\n:35B:ISIN DE0000000003\n:90A::MRKT//PRCT/101,5\n:93B::AGGR//FAMT/1000,\n:16S:FIN\n-",
+        );
         assert_eq!(st.holdings[0].price_cents, None);
         assert_eq!(st.holdings[0].quantity, 1000.0);
         assert_eq!(st.value_cents(), None);

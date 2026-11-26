@@ -136,11 +136,7 @@ pub fn group_by_day(rows: &[&Row]) -> Vec<DayBucket> {
 /// "+964,14 €" for income days, "-47,82 €" for expense days (`money` adds the minus itself).
 pub fn day_sum_text(cents: i64, money: &dyn Fn(i64, &str) -> String, currency: &str) -> String {
     let text = money(cents, currency);
-    if cents > 0 {
-        format!("+{text}")
-    } else {
-        text
-    }
+    if cents > 0 { format!("+{text}") } else { text }
 }
 
 /// "2026-03" -> "Mär", "2026-Q1" -> "Q1", "2026" -> "2026".
@@ -367,6 +363,10 @@ pub(crate) mod tests {
     pub(crate) fn row(date: &str, cents: i64, cat: &str) -> Row {
         Row {
             id: 1,
+            refund_linked: false,
+            refund_cents: 0,
+            refunded_cents: 0,
+            split_count: 0,
             account_name: "Giro".into(),
             booking_date: date.into(),
             value_date: String::new(),

@@ -288,6 +288,7 @@ Sheet {
                         label: qsTr("Feingold je Stück")
                         value: { const w = sheet.weight; if (!w) return ""; const fine = w.grams * w.purity / 1000
                                  return NumberText.format(fine, 3) + " g · " + NumberText.format(fine / NumberText.troyOunceGrams, 4) + " oz" }
+                        amounts: true   // how much gold the user owns
                     }
                 }
 
@@ -327,6 +328,7 @@ Sheet {
                             placeholderText: sheet.automatic ? qsTr("optional") : qsTr("z. B. %1").arg(Fmt.plain(2500000))
                             text: sheet.priceText; onTextEdited: sheet.priceText = text
                             Accessible.name: qsTr("Kaufpreis")
+                            Sensitive { amounts: true; when: parent.text !== "" }
                         }
                     }
                     // the other way round, read-only: per piece for a total and vice versa
@@ -334,6 +336,7 @@ Sheet {
                         visible: sheet.otherPrice !== null
                         label: sheet.priceMode === "total" ? qsTr("Kaufpreis je Stück") : qsTr("Kaufpreis gesamt")
                         value: sheet.otherPrice !== null ? Fmt.money(sheet.otherPrice) : ""
+                        amounts: true
                     }
                 }
 

@@ -2,11 +2,17 @@
 //! Unlock / create vault, demo mode (`GIROCRAB_DEMO_SEED=1`), accounts with balances,
 //! bookings of the selected account and bank sync (FinTS PIN/TAN dialog, PSD2 browser redirect).
 
+mod amount_filter;
 mod analytics;
 mod announcements;
 mod assets_loans;
 mod assets_loans_ui;
+// Only the text builder so far; the „Problem melden“ dialog wires it in #384 part 2.
+#[allow(dead_code)]
+mod bug_report;
+mod bug_report_ui;
 mod cockpit;
+mod command_palette;
 mod daily;
 mod girocode;
 mod groups;
@@ -18,16 +24,23 @@ mod manage_ui;
 mod mandates_ui;
 mod mandates_view;
 mod nav;
+mod offline;
+mod offline_ui;
 mod planning;
 mod policy;
 mod portfolio;
+mod position_history_ui;
+mod print;
+mod print_ui;
 mod recurring_ui;
 mod recurring_view;
+mod refunds_ui;
 mod settings_import;
 mod settings_import_ui;
 mod sync_flow;
 mod tags_ui;
 mod transfer_flow;
+mod updates;
 mod vault_key;
 mod views_ui;
 
@@ -38,8 +51,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use girocrab_core::connectors::bank_directory::{BankAccessMode, BankSearchResult};
 use girocrab_core::connectors::PayeeCheck;
+use girocrab_core::connectors::bank_directory::{BankAccessMode, BankSearchResult};
 use girocrab_core::sync_log::{SyncLogOutcome, SyncLogSource};
 use girocrab_core::{
     BookingFilter, Category, Challenge, ChallengeKind, ConnectorKind, PeriodGranularity, SyncStep,
@@ -50,6 +63,8 @@ use zeroize::Zeroizing;
 
 use daily::{Filter, Row, StatusFilter};
 use nav::Target;
+
+mod view_prefs;
 
 slint::include_modules!();
 
@@ -256,15 +271,57 @@ fn account_rows(vault: &Vault, privacy: bool) -> Result<(Vec<AccountRow>, String
 /// Most bookings the list keeps in memory per account scope; filters run on these without the vault.
 const ROW_LIMIT: u32 = 2000;
 
-/// Bookings of a listing target (one account, all, unchecked, uncategorized or one category).
-fn load_rows(vault: &Vault, target: Target) -> Result<Vec<Row>, String> {
-    let page = vault
-        .list_transactions(BookingFilter {
-            limit: ROW_LIMIT,
-            ..nav::booking_filter(target)
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(page.transactions.iter().map(Row::from).collect())
+/// Bookings of a listing target (one account, all, unchecked, uncategorized or one category),
+/// narrowed by the amount filter in the core (#357), so the row limit applies to the filtered set,
+/// plus the running and day balances when the target is one account (#577).
+fn load_rows(
+    vault: &Vault,
+    target: Target,
+    limit: u32,
+    amount: amount_filter::AmountFilter,
+) -> Result<(Vec<Row>, daily::Balances), String> {
+    let single = matches!(target, Target::Account(_));
+    let mut filter = BookingFilter {
+        limit,
+        with_balances: single,
+        ..nav::booking_filter(target)
+    };
+    amount.apply(&mut filter);
+    let page = vault.list_transactions(filter).map_err(|e| e.to_string())?;
+    let rows: Vec<Row> = page.transactions.iter().map(Row::from).collect();
+    let running = page
+        .running_balances
+        .iter()
+        .map(|b| (b.booking_id, b.balance_cents))
+        .collect();
+    let days = page
+        .day_balances
+        .iter()
+        .map(|d| (d.date.clone(), d.balance_cents))
+        .collect();
+    let balances = daily::Balances::for_scope(single, &rows, running, days);
+    Ok((rows, balances))
+}
+
+fn load_reveal_rows(
+    vault: &Vault,
+    target: Target,
+    limit: u32,
+    reveal: Option<i64>,
+    amount: amount_filter::AmountFilter,
+) -> Result<((Vec<Row>, daily::Balances), bool), String> {
+    let rows = load_rows(vault, target, limit, amount)?;
+    let Some(id) = reveal else {
+        return Ok((rows, false));
+    };
+    if rows.0.iter().any(|r| r.id == id) {
+        return Ok((rows, false));
+    }
+    let expanded = load_rows(vault, target, 0, amount)?;
+    if !expanded.0.iter().any(|r| r.id == id) {
+        return Ok((rows, true));
+    }
+    Ok((expanded, false))
 }
 
 /// UI-thread state behind the booking list, filter bar and inspector.
@@ -275,18 +332,26 @@ struct State {
     categories: Vec<Category>,
     filter: Filter,
     selected_booking: Option<i64>,
+    reveal_limit: u32,
     /// Bookings ticked for a batch action.
     marked: std::collections::HashSet<i64>,
     /// Drops the result of a superseded background load.
     generation: u64,
+    vault: std::sync::Weak<Vault>,
     /// (account id, label, bank name) of the accounts a transfer can start from.
     transfer_sources: Vec<(i64, String, String)>,
+    /// Recipient rule per entry of `transfer_sources` (savings → reference account, #582).
+    transfer_rules: Vec<transfer_flow::RecipientRule>,
     /// What the sidebar selected; decides which bookings `reload` loads.
     target: Target,
+    /// Amount range / direction (#357); applied by the core in `load_rows`, not in memory.
+    amount: amount_filter::AmountFilter,
     /// Decoded merchant logos by candidate key (`logos::key`); lives for the session.
     logos: std::collections::HashMap<String, slint::Image>,
     /// Keys already requested this session (hit or miss), so a miss is not retried on every redraw.
     logos_requested: std::collections::HashSet<String>,
+    /// Running/day balances of a one-account scope (#577); empty otherwise.
+    balances: daily::Balances,
 }
 
 /// One-booking edit run against the vault for the selected booking id.
@@ -335,6 +400,29 @@ fn expand_detail(b: &Row) -> String {
     parts.join(" · ")
 }
 
+fn refund_amount(b: &Row) -> String {
+    match (b.refund_cents > 0, b.refunded_cents > 0) {
+        (true, true) => {
+            if refunds_ui::english() {
+                format!(
+                    "Refund: {} · Refunded: {}",
+                    money(b.refund_cents, &b.currency),
+                    money(b.refunded_cents, &b.currency)
+                )
+            } else {
+                format!(
+                    "Erstattung: {} · Erstattet: {}",
+                    money(b.refund_cents, &b.currency),
+                    money(b.refunded_cents, &b.currency)
+                )
+            }
+        }
+        (true, false) => money(b.refund_cents, &b.currency),
+        (false, true) => money(b.refunded_cents, &b.currency),
+        _ => String::new(),
+    }
+}
+
 fn booking_row(st: &State, b: &Row, privacy: bool) -> BookingRow {
     let logo = logo_of(st, b, privacy);
     let detail = if b.booking_text.is_empty() {
@@ -344,6 +432,8 @@ fn booking_row(st: &State, b: &Row, privacy: bool) -> BookingRow {
     };
     BookingRow {
         id: b.id as i32,
+        refund_linked: b.refund_linked,
+        refund: daily::mask(&refund_amount(b), privacy).into(),
         counterparty: daily::mask(&b.counterparty, privacy).into(),
         account: b.account_name.clone().into(),
         category: if b.category_name.is_empty() {
@@ -354,6 +444,7 @@ fn booking_row(st: &State, b: &Row, privacy: bool) -> BookingRow {
         category_color: tint(&b.category_color_hex),
         detail: daily::mask(&detail, privacy).into(),
         amount: daily::mask(&money(b.amount_cents, &b.currency), privacy).into(),
+        balance: st.balances.row(&st.filter, b.id, privacy, money).into(),
         negative: b.amount_cents < 0 && !privacy,
         checked: b.checked,
         marked: st.marked.contains(&b.id),
@@ -417,7 +508,7 @@ fn render_analytics(win: &MainWindow, privacy: bool) {
                 .map(|s| {
                     let cents = s.cents;
                     BudgetLine {
-                        name: daily::mask(&s.name, false).into(),
+                        name: daily::mask(&s.name, privacy).into(),
                         amount: daily::mask(
                             &format!(
                                 "{} · {} Buch. · {:.0} %",
@@ -428,7 +519,7 @@ fn render_analytics(win: &MainWindow, privacy: bool) {
                             privacy,
                         )
                         .into(),
-                        progress: s.share,
+                        progress: if privacy { 0.0 } else { s.share },
                         over: false,
                         color: tint(&s.color_hex),
                     }
@@ -453,10 +544,44 @@ fn render_analytics(win: &MainWindow, privacy: bool) {
     );
 }
 
+thread_local! {
+    /// (vault, selected booking, list generation) the refund card and sheet were last loaded for.
+    static REFUND_SHOWN: std::cell::Cell<Option<(usize, Option<i64>, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn render_bookings(win: &MainWindow) {
+    // A presentation-only redraw (filter, search, privacy) keeps the refund card: it reloads
+    // only for another booking, another vault or a reloaded list (CodeRabbit #1728).
+    let key = with_state(|st| {
+        (
+            st.vault.as_ptr() as usize,
+            st.selected_booking,
+            st.generation,
+        )
+    });
+    if REFUND_SHOWN.with(|k| k.replace(Some(key))) != Some(key) {
+        refunds_ui::refresh_card(win);
+        if let Some(v) = with_state(|st| st.vault.upgrade()) {
+            refunds_ui::refresh(win, v);
+        }
+    }
+    render_booking_rows(win);
+}
+
+fn render_booking_rows(win: &MainWindow) {
+    win.set_rf_can_open(with_state(|st| {
+        st.rows
+            .iter()
+            .find(|r| Some(r.id) == st.selected_booking)
+            .is_some_and(|r| refunds_ui::can_open(r.amount_cents, r.split_count))
+    }));
     let privacy = privacy_on(win);
-    let (count, tags) = with_state(|st| (st.shown.len(), tag_names(&st.rows)));
+    let (count, tags, amount) = with_state(|st| (st.shown.len(), tag_names(&st.rows), st.amount));
     win.set_booking_count(format!("{count} Buchungen").into());
+    win.set_amount_filter_title(amount.title(privacy).into());
+    win.set_amount_filter_active(amount.is_active());
+    win.set_amount_filter_masked(privacy);
     let mut labels = vec![SharedString::from("Alle Tags")];
     labels.extend(tags.into_iter().map(SharedString::from));
     if win.get_tag_index() as usize >= labels.len() {
@@ -499,6 +624,7 @@ fn render_bookings(win: &MainWindow) {
                 )
                 .into(),
                 negative: d.sum_cents < 0 || privacy,
+                balance: st.balances.day(&st.filter, &d.date, privacy, money).into(),
                 rows: ModelRc::new(VecModel::from(
                     d.indices
                         .iter()
@@ -523,7 +649,29 @@ fn render_bookings(win: &MainWindow) {
         (days, insp, idx)
     });
     win.set_days(ModelRc::new(VecModel::from(days)));
-    win.set_marked_count(with_state(|st| st.marked.len()) as i32);
+    // Marks only ever cover bookings in the visible list: an account, filter or search change
+    // drops the rest, so the count, the sums and the batch actions use the same selection.
+    win.set_marked_count(with_state(|st| {
+        let visible: std::collections::HashSet<i64> = st
+            .shown
+            .iter()
+            .filter_map(|&i| st.rows.get(i))
+            .map(|r| r.id)
+            .collect();
+        prune_marked(&mut st.marked, &visible);
+        st.marked.len()
+    }) as i32);
+    // Sums of the ticked bookings from the cached rows (#878): no new `list_transactions`.
+    let summary = with_state(|st| {
+        daily::selection_summary(st.rows.iter().filter(|r| st.marked.contains(&r.id)))
+    });
+    let texts = daily::selection_texts(&summary, privacy, money);
+    win.set_selection_summary_visible(summary.count >= 2);
+    win.set_selection_count_text(texts.count.into());
+    win.set_selection_income(texts.income.into());
+    win.set_selection_expense(texts.expense.into());
+    win.set_selection_balance(texts.balance.into());
+    win.set_selection_extra(texts.extra.into());
     match inspector {
         Some((i, row, logo, recurring)) => {
             // The note box keeps unsaved typing while the same booking stays selected.
@@ -592,7 +740,7 @@ fn request_logos(win: &MainWindow, vault: Arc<Vault>) {
                     st.logos.insert(key, slint::Image::from_rgba8(buf));
                 }
             });
-            render_bookings(&win);
+            render_booking_rows(&win);
         });
     });
 }
@@ -618,9 +766,12 @@ fn refresh_dashboard(win: &MainWindow, vault: Arc<Vault>) {
     let weak = win.as_weak();
     std::thread::spawn(move || {
         // One account: sum its loaded bookings; everything else: the core's all-account figures.
+        // The overview is an overall money figure (#337): effective total set only.
         let flow = match account_flow {
             Some(f) => f,
-            None => vault.cashflow_by_period(gran, 6, None).unwrap_or_default(),
+            None => vault
+                .cashflow_by_period(gran, 6, None, true)
+                .unwrap_or_default(),
         };
         let status = vault
             .list_category_budget_progress(year, month)
@@ -631,20 +782,17 @@ fn refresh_dashboard(win: &MainWindow, vault: Arc<Vault>) {
             }
             let privacy = privacy_on(&win);
             let (bars, ticks) = cockpit::chart(&flow);
-            win.set_cashflow_bars(ModelRc::new(VecModel::from(
-                bars.into_iter()
-                    .map(|b| BarGroup {
-                        label: b.label.into(),
-                        income: if privacy { 0.0 } else { b.income },
-                        expense: if privacy { 0.0 } else { b.expense },
-                    })
-                    .collect::<Vec<_>>(),
-            )));
-            let ticks: Vec<SharedString> = ticks
+            let bars = bars
                 .into_iter()
-                .map(|t| if privacy { "•".into() } else { t.into() })
+                .map(|b| BarGroup {
+                    label: b.label.into(),
+                    income: b.income,
+                    expense: b.expense,
+                })
                 .collect();
-            win.set_cashflow_ticks(ModelRc::new(VecModel::from(ticks)));
+            let ticks = ticks.into_iter().map(SharedString::from).collect();
+            // Echte Werte merken, damit der Privatmodus-Schalter sofort umstellen kann.
+            cashflow_view::set(&win, bars, ticks, privacy);
             let mut lines = cockpit::budgets(&status);
             let has_budgets = !lines.is_empty();
             if !has_budgets {
@@ -713,24 +861,102 @@ fn apply_filter(win: &MainWindow) {
     render_bookings(win);
 }
 
-/// Loads the bookings of the current account scope on a worker thread, then redraws.
+thread_local! {
+    /// Amount filter of the newest load still running (UI thread only); see `PendingAmount`.
+    static PENDING_AMOUNT: std::cell::Cell<amount_filter::PendingAmount> =
+        const { std::cell::Cell::new(amount_filter::PendingAmount::NONE) };
+}
+
+/// Loads the bookings of the current account scope on a worker thread, then redraws. An amount
+/// filter that was accepted but is still loading is carried along instead of being dropped.
 fn reload(win: &MainWindow, vault: Arc<Vault>) {
+    let committed = with_state(|st| st.amount);
+    let amount = PENDING_AMOUNT.with(|p| p.get().resolve(committed));
+    reload_with(win, vault, amount);
+}
+
+/// Takes the loaded rows into the state; the amount filter and the marks follow the rows, so a
+/// failed load keeps the previous filter with the previous rows and no hidden booking stays marked.
+fn commit_load(
+    st: &mut State,
+    rows: Vec<Row>,
+    balances: daily::Balances,
+    cats: Vec<Category>,
+    amount: amount_filter::AmountFilter,
+) {
+    let ids: std::collections::HashSet<i64> = rows.iter().map(|r| r.id).collect();
+    st.marked.retain(|id| ids.contains(id));
+    st.rows = rows;
+    st.balances = balances;
+    st.categories = cats;
+    st.amount = amount;
+    // new rows: the next redraw reloads the refund card and sheet, even if a redraw between the
+    // start of this load and now already recorded the same booking and generation
+    REFUND_SHOWN.with(|k| k.set(None));
+}
+
+/// Clears the committed and the pending amount filter and its controls (e.g. before revealing a
+/// linked booking the filter could hide).
+pub(crate) fn clear_amount_filter(win: &MainWindow) {
+    PENDING_AMOUNT.with(|p| p.set(amount_filter::PendingAmount::NONE));
+    with_state(|st| st.amount = amount_filter::AmountFilter::default());
+    win.set_amount_from("".into());
+    win.set_amount_to("".into());
+    win.set_amount_direction(0);
+    win.set_amount_filter_open(false);
+    win.set_amount_filter_error("".into());
+}
+
+/// Like `reload`, but with a new amount filter that is committed only when the load succeeds.
+fn reload_with(win: &MainWindow, vault: Arc<Vault>, amount: amount_filter::AmountFilter) {
+    if !is_current(&vault) {
+        return;
+    }
+    views_ui::refresh_sidebar(win, &vault);
+    refresh_dashboard(win, vault.clone());
     let target = with_state(|st| st.target);
+    let limit = with_state(|st| st.reveal_limit.max(ROW_LIMIT));
+    let reveal = with_state(|st| {
+        (st.reveal_limit > 0)
+            .then_some(st.selected_booking)
+            .flatten()
+    });
     let generation = with_state(|st| {
+        st.vault = Arc::downgrade(&vault);
         st.generation += 1;
         st.generation
     });
+    PENDING_AMOUNT.with(|p| p.set(amount_filter::PendingAmount::of(amount)));
     let weak = win.as_weak();
     std::thread::spawn(move || {
-        let rows = load_rows(&vault, target);
+        let rows = load_reveal_rows(&vault, target, limit, reveal, amount);
         let cats = vault.list_categories(None, None).map_err(|e| e.to_string());
         let _ = weak.upgrade_in_event_loop(move |win| {
             let vault = vault.clone();
-            if !is_current(&vault) || with_state(|st| st.generation) != generation {
+            if !is_current(&vault)
+                || with_state(|st| st.generation != generation || st.target != target)
+            {
                 return;
             }
+            // Newest load settled: on success its filter is committed below, on failure the
+            // previous one stays; either way later reloads use the committed filter again.
+            PENDING_AMOUNT.with(|p| p.set(amount_filter::PendingAmount::NONE));
             match (rows, cats) {
-                (Ok(rows), Ok(cats)) => {
+                (Ok(((rows, balances), missing)), result) => {
+                    if missing && with_state(|st| st.selected_booking == reveal) {
+                        refunds_ui::cancel_reveal();
+                        with_state(|st| {
+                            st.reveal_limit = 0;
+                            st.selected_booking = None;
+                        });
+                    }
+                    let cats = match result {
+                        Ok(cats) => cats,
+                        Err(e) => {
+                            win.set_sync_status(e.into());
+                            with_state(|st| st.categories.clone())
+                        }
+                    };
                     let mut names = vec![SharedString::from("Ohne Kategorie")];
                     names.extend(cats.iter().map(|c| SharedString::from(c.path.as_str())));
                     win.set_category_names(ModelRc::new(VecModel::from(names)));
@@ -745,15 +971,17 @@ fn reload(win: &MainWindow, vault: Arc<Vault>) {
                         color: tint(&c.color_hex),
                     }));
                     win.set_category_tiles(ModelRc::new(VecModel::from(tiles)));
-                    with_state(|st| {
-                        st.rows = rows;
-                        st.categories = cats;
+                    // The tag list derives from the rows: keep the selected tag by name, not by index.
+                    let tag_index = with_state(|st| {
+                        let tag = st.filter.tag.clone();
+                        commit_load(st, rows, balances, cats, amount);
+                        amount_filter::tag_index(&tag_names(&st.rows), &tag)
                     });
+                    win.set_tag_index(tag_index);
                     apply_filter(&win);
                     request_logos(&win, vault.clone());
-                    refresh_dashboard(&win, vault);
                 }
-                (Err(e), _) | (_, Err(e)) => win.set_sync_status(e.into()),
+                (Err(e), _) => win.set_sync_status(e.into()),
             }
         });
     });
@@ -775,7 +1003,22 @@ impl DialogBridge {
             w.set_tan_mode(mode.into());
             w.set_tan_title(title.into());
             w.set_tan_message(message.into());
+            clear_tan_comparison(&w);
             w.set_tan_open(true);
+        });
+    }
+
+    /// Order comparison (#949); queued after `show`, so it lands on the same dialog.
+    fn show_comparison(&self, cmp: tan_comparison_ui::TanComparison) {
+        let _ = self.win.upgrade_in_event_loop(move |w| {
+            // a queued event may land after the vault was locked: no amounts then
+            if !w.get_unlocked() {
+                return;
+            }
+            w.set_tan_cmp_amount(cmp.amount.into());
+            w.set_tan_cmp_prefix(cmp.prefix.into());
+            w.set_tan_cmp_end(cmp.end_chars.into());
+            w.set_tan_cmp_visible(true);
         });
     }
 
@@ -784,6 +1027,7 @@ impl DialogBridge {
             w.set_tan_open(false);
             w.set_tan_image(Default::default());
             w.set_tan_has_image(false);
+            clear_tan_comparison(&w);
         });
     }
 
@@ -791,7 +1035,7 @@ impl DialogBridge {
         self.drain();
         self.show(
             "pin",
-            "Passwort der MoneyMoney-Datenbank".into(),
+            "Passwort der Datenbank".into(),
             "Das Passwort wird nur für diesen Import im Speicher gehalten.".into(),
             None,
         );
@@ -809,14 +1053,11 @@ impl DialogBridge {
         while self.replies.lock().unwrap().try_recv().is_ok() {}
     }
 
-    fn ask(&self, mode: &'static str, c: &Challenge) -> Option<Zeroizing<String>> {
+    /// One masked entry in the PIN dialog (`"pin"` = password field). Empty stays `Some("")`
+    /// so the flow can name the missing field.
+    fn ask_masked(&self, title: &str, message: String) -> Option<Zeroizing<String>> {
         self.drain();
-        let title = if c.title.is_empty() {
-            "TAN eingeben".to_string()
-        } else {
-            c.title.clone()
-        };
-        self.show(mode, title, challenge_text(c), c.image.clone());
+        self.show("pin", title.into(), message, None);
         self.replies
             .lock()
             .unwrap()
@@ -825,6 +1066,34 @@ impl DialogBridge {
             .flatten()
             .map(Zeroizing::new)
     }
+
+    fn ask(&self, mode: &'static str, c: &Challenge) -> Option<Zeroizing<String>> {
+        self.drain();
+        let title = if c.title.is_empty() {
+            "TAN eingeben".to_string()
+        } else {
+            c.title.clone()
+        };
+        self.show(mode, title, challenge_text(c), c.image.clone());
+        // #949: only the order's own TAN gets the comparison, never login SCA or an account sync
+        if let Some(cmp) = tan_comparison_ui::current() {
+            self.show_comparison(cmp);
+        }
+        self.replies
+            .lock()
+            .unwrap()
+            .recv()
+            .ok()
+            .flatten()
+            .map(Zeroizing::new)
+    }
+}
+
+fn clear_tan_comparison(w: &MainWindow) {
+    w.set_tan_cmp_visible(false);
+    w.set_tan_cmp_amount(Default::default());
+    w.set_tan_cmp_prefix(Default::default());
+    w.set_tan_cmp_end(Default::default());
 }
 
 fn challenge_text(c: &Challenge) -> String {
@@ -879,6 +1148,10 @@ impl sync_flow::Ui for DialogBridge {
             c.title.clone()
         };
         self.show("push", title, challenge_text(c), None);
+        // #949: the order's push approval shows the comparison as well; login push stays without
+        if let Some(cmp) = tan_comparison_ui::current() {
+            self.show_comparison(cmp);
+        }
         match self.replies.lock().unwrap().recv_timeout(interval) {
             Ok(None) | Err(RecvTimeoutError::Disconnected) => false,
             Ok(Some(_)) | Err(RecvTimeoutError::Timeout) => true,
@@ -887,6 +1160,36 @@ impl sync_flow::Ui for DialogBridge {
 
     fn open_url(&self, url: &str) -> Result<(), String> {
         sync_flow::open_in_browser(url)
+    }
+
+    fn ask_api_signature(&self, bank: &str) -> Option<sync_flow::ApiSignature> {
+        let hint = format!(
+            "API-Zugangsdaten für {bank} (PayPal › Kontoeinstellungen › API-Zugriff), nicht das \
+             Login-Passwort. Sie werden verschlüsselt im Tresor gespeichert."
+        );
+        Some(sync_flow::ApiSignature {
+            username: self.ask_masked("PayPal API-Benutzername", hint.clone())?,
+            password: self.ask_masked("PayPal API-Passwort", hint.clone())?,
+            signature: self.ask_masked("PayPal API-Signatur", hint)?,
+        })
+    }
+}
+
+/// PayPal's API signature lives in the vault's encrypted settings (`paypal.api_*`).
+impl sync_flow::SignatureStore for Vault {
+    fn stored_keys(&self) -> Result<Vec<String>, String> {
+        let settings = self.list_settings().map_err(|e| e.to_string())?;
+        Ok(settings
+            .into_iter()
+            .filter(|s| s.has_value)
+            .map(|s| s.key)
+            .collect())
+    }
+
+    fn store(&self, key: &str, value: &str) -> Result<(), String> {
+        // No `e.to_string()`: nothing near the value goes into the error text.
+        self.set_setting(key.to_string(), value.to_string())
+            .map_err(|_| "Die PayPal-Zugangsdaten konnten nicht gespeichert werden.".to_string())
     }
 }
 
@@ -941,6 +1244,26 @@ fn run_sync(vault: Arc<Vault>, demo: bool, ui: &DialogBridge) -> Result<String, 
             }
             continue;
         }
+        if sync_flow::auth_for(c.connector) == sync_flow::Auth::FileImport {
+            let result = import_export_file(&vault, c.id, &c.display_name);
+            log_file_import(&vault, c.id, &result);
+            match result {
+                Ok(Some(s)) => {
+                    done += 1;
+                    imported += s.transactions_imported;
+                }
+                Ok(None) => {}
+                Err(e) => problems.push(format!("{}: {e}", c.display_name)),
+            }
+            continue;
+        }
+        if sync_flow::auth_for(c.connector) == sync_flow::Auth::ApiSignature {
+            // On this worker thread like the sync itself: the vault writes never block the UI.
+            if let Err(e) = sync_flow::ensure_api_signature(&c.display_name, ui, &*vault) {
+                problems.push(format!("{}: {e}", c.display_name));
+                continue;
+            }
+        }
         let result = sync_flow::sync_connection(c.connector, &c.display_name, ui, |secret| {
             // `secret` moves into the core, which wipes it when the session ends.
             let session = vault
@@ -959,8 +1282,18 @@ fn run_sync(vault: Arc<Vault>, demo: bool, ui: &DialogBridge) -> Result<String, 
                 let _ = vault.log_sync(
                     Some(c.id),
                     SyncLogSource::Manual,
-                    SyncLogOutcome::Ok,
-                    String::new(),
+                    // what the bank would not give is no success (#1627)
+                    if s.warnings.is_empty() {
+                        SyncLogOutcome::Ok
+                    } else {
+                        SyncLogOutcome::Partial
+                    },
+                    s.warnings
+                        .iter()
+                        .chain(&s.hints)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" / "),
                     s.transactions_imported,
                 );
             }
@@ -1093,9 +1426,13 @@ fn add_bank(
                 .map_err(e)?;
         }
     }
+    let file_import = r
+        .connector
+        .is_some_and(|k| sync_flow::auth_for(k) == sync_flow::Auth::FileImport);
     Ok(format!(
-        "{} hinzugefügt. Mit „Jetzt abrufen“ starten Sie den ersten Abruf.",
-        r.name
+        "{} hinzugefügt. {}",
+        r.name,
+        sync_flow::added_hint(file_import)
     ))
 }
 
@@ -1104,6 +1441,103 @@ fn tokio_runtime() -> Result<tokio::runtime::Runtime, String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())
+}
+
+thread_local! {
+    /// Last fetch per account id, taken from its bank connection (#815): `Some(ms)` = last
+    /// successful fetch (Unix ms), `None` = connected but never synced. Accounts without a
+    /// connection (offline, import) get no entry. Filled by `render_header`; `apply_header`
+    /// reads it without touching the vault.
+    static FETCHED_MS: std::cell::RefCell<std::collections::HashMap<i64, Option<i64>>> =
+        Default::default();
+}
+
+/// Remembers when each account's bank connection last fetched successfully. Accounts without a
+/// connection (offline, import) get no entry; a connection that never synced maps to `None`.
+fn remember_fetch_times(vault: &Vault, accounts: &[girocrab_core::Account]) {
+    let synced: std::collections::HashMap<i64, Option<i64>> = vault
+        .list_bank_connections()
+        .map(|cs| {
+            cs.into_iter()
+                .map(|c| (c.id, c.last_sync_unix.map(|s| s * 1_000)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let map = accounts
+        .iter()
+        .filter_map(|a| Some((a.id, *synced.get(&a.connection_id?)?)))
+        .collect();
+    FETCHED_MS.with(|f| *f.borrow_mut() = map);
+}
+
+/// Header text for one account. `entry`: `None` = no bank connection (no text),
+/// `Some(None)` = connected but never fetched, `Some(Some(ms))` = last successful fetch.
+/// Hidden in privacy mode (as in the reference app).
+fn fetched_text(now_ms: i64, entry: Option<Option<i64>>, privacy: bool) -> String {
+    if privacy {
+        return String::new();
+    }
+    match entry {
+        None => String::new(),
+        Some(fetched) => daily::format_last_fetch(now_ms, fetched).map_or_else(
+            || "Noch nie abgerufen".to_string(),
+            |t| format!("Abgerufen {t}"),
+        ),
+    }
+}
+
+/// "Abgerufen vor 5 Minuten" / "Noch nie abgerufen" for the header of an account; empty for
+/// accounts without a bank connection and in privacy mode.
+fn fetched_label(account_id: i64, privacy: bool) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let entry = FETCHED_MS.with(|f| f.borrow().get(&account_id).copied());
+    fetched_text(now_ms, entry, privacy)
+}
+
+#[cfg(test)]
+mod fetched_label_tests {
+    use super::fetched_text;
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn locked_vault_hides_label() {
+        let privacy = crate::daily::effective_privacy(false, false);
+        assert_eq!(fetched_text(NOW, Some(None), privacy), "");
+        assert_eq!(fetched_text(NOW, Some(Some(NOW - 60_000)), privacy), "");
+    }
+
+    #[test]
+    fn never_synced_connection_says_so() {
+        assert_eq!(fetched_text(NOW, Some(None), false), "Noch nie abgerufen");
+        // A zero timestamp is not a real fetch either.
+        assert_eq!(
+            fetched_text(NOW, Some(Some(0)), false),
+            "Noch nie abgerufen"
+        );
+    }
+
+    #[test]
+    fn account_without_connection_shows_nothing() {
+        assert_eq!(fetched_text(NOW, None, false), "");
+    }
+
+    #[test]
+    fn recent_fetch_gets_prefix() {
+        assert_eq!(
+            fetched_text(NOW, Some(Some(NOW - 5 * 60_000)), false),
+            "Abgerufen vor 5 Minuten"
+        );
+    }
+
+    #[test]
+    fn privacy_hides_label() {
+        for entry in [None, Some(None), Some(Some(NOW - 5 * 60_000))] {
+            assert_eq!(fetched_text(NOW, entry, true), "");
+        }
+    }
 }
 
 /// Redraws the account list and header (balances follow privacy mode).
@@ -1139,6 +1573,7 @@ fn render_header(
             .map(|a| a.balance_cents)
             .sum();
         win.set_liquid_balance(daily::mask(&money(liquid, "EUR"), win.get_privacy()).into());
+        remember_fetch_times(vault, &accts);
     }
     let sel = selected.or(Some(0));
     win.set_selected(sel.map_or(-1, |s| s as i32));
@@ -1154,7 +1589,26 @@ fn render_header(
     win.set_selected_name(cur.0.into());
     win.set_selected_balance(cur.1.into());
     win.set_selected_currency(cur.2.into());
+    // "Alle Konten" (0) has no entry, so it stays empty; privacy mode and a locked vault hide it.
+    let privacy = daily::effective_privacy(win.get_privacy(), win.get_unlocked());
+    win.set_selected_fetched(
+        sel.map(|id| fetched_label(id, privacy))
+            .unwrap_or_default()
+            .into(),
+    );
     Ok(sel)
+}
+
+/// Like `show` after an edit (e.g. a new offline account), but keeps private mode on: `show`
+/// switches it off for the first paint after unlock. Restored and re-rendered in the same
+/// event-loop callback, so no frame shows unmasked values.
+fn refresh(win: &MainWindow, vault: &Arc<Vault>, selected: Option<i64>) {
+    let private = win.get_privacy();
+    show(win, vault, selected);
+    if private {
+        win.set_privacy(true);
+        win.invoke_privacy_changed();
+    }
 }
 
 /// Header plus the view of the selected target (bookings reload, or the depot / list view).
@@ -1163,22 +1617,65 @@ fn show(win: &MainWindow, vault: &Arc<Vault>, selected: Option<i64>) {
     if !is_current(vault) {
         return;
     }
-    // Privacy follows `toggle || !unlocked`: unlock first and start with the toggle off, so the
-    // first paint shows real balances instead of masks.
-    win.set_privacy(false);
+    if with_state(|st| !std::ptr::eq(st.vault.as_ptr(), Arc::as_ptr(vault))) {
+        // a direct switch (demo ↔ own vault) keeps the privacy toggle; only the first unlock (no
+        // live vault before) starts with it off, so that paint shows real balances (CodeRabbit #1855)
+        let switching = with_state(|st| st.vault.upgrade().is_some());
+        with_state(|st| {
+            st.vault = Arc::downgrade(vault);
+            st.reveal_limit = 0;
+            st.selected_booking = None;
+            // nothing of the previous vault stands in for a failed read or stays actionable
+            st.categories.clear();
+            st.marked.clear();
+            st.rows.clear();
+            st.shown.clear();
+            st.balances = daily::Balances::default();
+        });
+        REFUND_SHOWN.with(|k| k.set(None));
+        if !switching {
+            win.set_privacy(false);
+        }
+        win.set_busy(false);
+    }
     win.set_unlocked(true);
+    refresh_dashboard(win, vault.clone());
     match render_header(win, vault, selected) {
         Ok(sel) => {
             refresh_transfer_sources(win, vault);
+            // Offline accounts are marked (and masked in private mode) in the sidebar (#679).
+            nav::set_offline_accounts(vault.list_offline_account_ids().unwrap_or_default());
             // Fill the sidebar and the account count now; the background refresh follows.
             views_ui::set_accounts_now(win, vault);
+            let previous_target = with_state(|st| st.target);
             views_ui::sync_target(sel);
+            if previous_target != with_state(|st| st.target) {
+                refresh_dashboard(win, vault.clone());
+            }
             if sel.is_some() {
                 // First paint: load the scope's bookings synchronously (selects the first one);
                 // the background reload in `apply_view` then refreshes them.
-                let target = with_state(|st| st.target);
-                if let Ok(rows) = load_rows(vault, target) {
-                    with_state(|st| st.rows = rows);
+                // A pending reveal may need many more rows: that read stays in the background
+                // reload (`apply_view`), never on the UI thread.
+                let (target, amount) = with_state(|st| (st.target, st.amount));
+                let revealing = with_state(|st| st.reveal_limit > 0);
+                if !revealing
+                    && let Ok(((rows, balances), missing)) =
+                        load_reveal_rows(vault, target, ROW_LIMIT, None, amount)
+                {
+                    with_state(|st| {
+                        st.rows = rows;
+                        st.balances = balances;
+                        if missing {
+                            st.reveal_limit = 0;
+                            st.selected_booking = None;
+                        }
+                    });
+                    // new rows: the refund card follows them, like after `commit_load`
+                    REFUND_SHOWN.with(|k| k.set(None));
+                    if missing {
+                        refunds_ui::cancel_reveal();
+                    }
                     apply_filter(win);
                 }
                 views_ui::apply_view(win, vault);
@@ -1186,6 +1683,7 @@ fn show(win: &MainWindow, vault: &Arc<Vault>, selected: Option<i64>) {
                 with_state(|st| {
                     st.rows.clear();
                     st.shown.clear();
+                    st.balances = daily::Balances::default();
                     st.selected_booking = None;
                 });
                 render_bookings(win);
@@ -1199,21 +1697,110 @@ fn show(win: &MainWindow, vault: &Arc<Vault>, selected: Option<i64>) {
     }
 }
 
-/// Accounts a transfer can start from: those that belong to a bank connection.
+/// Accounts a transfer can start from: those that belong to a bank connection. A savings account
+/// may only send to its reference account (`transfer_flow::recipient_rule`, #582).
 fn refresh_transfer_sources(win: &MainWindow, vault: &Vault) {
-    let sources: Vec<(i64, String, String)> = vault
-        .list_accounts()
-        .unwrap_or_default()
+    let accounts = vault.list_accounts().unwrap_or_default();
+    let (sources, rules): (
+        Vec<(i64, String, String)>,
+        Vec<transfer_flow::RecipientRule>,
+    ) = accounts
         .iter()
         .filter(|a| a.connection_id.is_some())
-        .map(|a| (a.id, a.name.clone(), a.bank_name.clone()))
-        .collect();
+        .map(|a| {
+            (
+                (a.id, a.name.clone(), a.bank_name.clone()),
+                transfer_flow::recipient_rule(a, &accounts),
+            )
+        })
+        .unzip();
     let labels: Vec<SharedString> = sources
         .iter()
         .map(|s| SharedString::from(s.1.as_str()))
         .collect();
     win.set_transfer_accounts(ModelRc::new(VecModel::from(labels)));
-    with_state(|st| st.transfer_sources = sources);
+    // The rule shown so far: old index under the old rules.
+    let before = transfer_rule_at(win.get_tr_account_index());
+    with_state(|st| {
+        st.transfer_sources = sources;
+        st.transfer_rules = rules;
+    });
+    // A shorter list must not leave the index pointing past the sender the ComboBox shows.
+    let index = normalize_transfer_index(win);
+    if transfer_rule_at(index) != before {
+        // A shown GiroCode may carry a recipient the new rule no longer allows.
+        win.set_girocode_open(false);
+    }
+    apply_transfer_rule(win, index);
+}
+
+/// Clamps the saved sender index to the current sender list (the range the ComboBox uses) and
+/// stores it back, so the applied recipient rule always belongs to the sender shown.
+fn normalize_transfer_index(win: &MainWindow) -> i32 {
+    let last = (with_state(|st| st.transfer_sources.len()) as i32 - 1).max(0);
+    let index = win.get_tr_account_index().clamp(0, last);
+    win.set_tr_account_index(index);
+    index
+}
+
+/// Recipient rule of the sender at `index` of the transfer dialog (free when out of range).
+fn transfer_rule_at(index: i32) -> transfer_flow::RecipientRule {
+    with_state(|st| {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| st.transfer_rules.get(i).cloned())
+            .unwrap_or_default()
+    })
+}
+
+/// Locks or frees the recipient fields for the chosen sender. Shown values are masked in privacy
+/// mode; the real values stay in `State` and are enforced again on submit.
+fn apply_transfer_rule(win: &MainWindow, index: i32) {
+    use transfer_flow::RecipientRule;
+    wire_transfer_bank(win);
+    let rule = transfer_rule_at(index);
+    let privacy = privacy_on(win);
+    let (locked, name, iban, hint) = match &rule {
+        RecipientRule::Free => (false, String::new(), String::new(), ""),
+        RecipientRule::Fixed(r) => (
+            true,
+            daily::mask(&r.name, privacy),
+            daily::mask(&r.iban, privacy),
+            transfer_flow::SAVINGS_HINT,
+        ),
+        RecipientRule::Unavailable => (
+            true,
+            String::new(),
+            String::new(),
+            transfer_flow::SAVINGS_NO_REFERENCE,
+        ),
+    };
+    let bank = match &rule {
+        RecipientRule::Fixed(r) => daily::iban_bank_line(&r.iban, privacy),
+        // The IBAN field keeps its text across prefill, privacy toggle and sender switch, so
+        // the line is derived from it again instead of being cleared.
+        RecipientRule::Free => daily::iban_bank_line(win.get_transfer_pre_iban().as_str(), privacy),
+        RecipientRule::Unavailable => String::new(),
+    };
+    win.set_tr_recipient_locked(locked);
+    win.set_tr_recipient_blocked(rule == RecipientRule::Unavailable);
+    win.set_tr_locked_name(name.into());
+    win.set_tr_locked_iban(iban.into());
+    win.set_tr_bank(bank.into());
+    win.set_tr_recipient_hint(hint.into());
+}
+
+/// Bank line under the recipient IBAN of the transfer dialog (#1563). Re-registering replaces the
+/// handler, so calling this on every open is harmless. The line is derived from the current IBAN text only
+/// and masked in privacy mode; no state is kept.
+fn wire_transfer_bank(win: &MainWindow) {
+    let weak = win.as_weak();
+    win.on_transfer_iban_edited(move |iban| {
+        if let Some(win) = weak.upgrade() {
+            let line = daily::iban_bank_line(iban.as_str(), privacy_on(&win));
+            win.set_tr_bank(line.into());
+        }
+    });
 }
 
 /// Result line of an import run.
@@ -1275,7 +1862,7 @@ fn import_file(
                 .import_moneymoney_database(location, pw.to_string(), options)
                 .map_err(e)?;
             Ok(format!(
-                "MoneyMoney-Import: {} neue Umsätze, {} Duplikate, {} Konten neu, {} zusammengeführt.",
+                "Datenimport: {} neue Umsätze, {} Duplikate, {} Konten neu, {} zusammengeführt.",
                 r.bookings_new, r.bookings_duplicates, r.accounts_created, r.accounts_merged
             ))
         }
@@ -1288,7 +1875,7 @@ fn pick_import_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Umsätze importieren")
         .add_filter(
-            "MoneyMoney, CSV, CAMT",
+            "Datenbank, CSV, CAMT",
             &["moneymoney", "csv", "xml", "sta", "mt940", "txt"],
         )
         .pick_file()
@@ -1298,6 +1885,119 @@ fn pick_import_file() -> Option<PathBuf> {
 fn pick_import_file() -> Option<PathBuf> {
     std::env::var_os("GIROCRAB_IMPORT_FILE").map(PathBuf::from)
 }
+
+/// File-import connection (Finpension, #975), called from the sync worker: the user picks the
+/// export, the core imports it into connection `id`. `Ok(None)` = dialog cancelled (skipped).
+fn import_export_file(
+    vault: &Arc<Vault>,
+    id: i64,
+    bank: &str,
+) -> Result<Option<girocrab_core::connectors::SyncSummary>, String> {
+    let Some(path) = pick_export_file(bank) else {
+        return Ok(None);
+    };
+    let bytes = sync_flow::read_export(&path)?;
+    vault
+        .clone()
+        .import_finpension_export(id, bytes)
+        .map(Some)
+        .map_err(|e| sync_flow::import_error_text(&e.to_string()))
+}
+
+/// Sync-history entry of a file import; a cancelled pick (`Ok(None)`) leaves none.
+fn log_file_import(
+    vault: &Vault,
+    id: i64,
+    result: &Result<Option<girocrab_core::connectors::SyncSummary>, String>,
+) {
+    let (outcome, message, imported) = match result {
+        Ok(Some(s)) => (SyncLogOutcome::Ok, String::new(), s.transactions_imported),
+        Ok(None) => return,
+        Err(e) => (SyncLogOutcome::Error, e.clone(), 0),
+    };
+    let _ = vault.log_sync(Some(id), SyncLogSource::Manual, outcome, message, imported);
+}
+
+/// Native file dialog for a bank export (Windows). Elsewhere (development builds) there is none.
+#[cfg(windows)]
+fn pick_export_file(bank: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title(format!("Datei importieren – {bank}"))
+        .add_filter("Export (CSV, JSON)", &["csv", "json"])
+        .pick_file()
+}
+
+#[cfg(not(windows))]
+fn pick_export_file(_bank: &str) -> Option<PathBuf> {
+    std::env::var_os("GIROCRAB_IMPORT_FILE").map(PathBuf::from)
+}
+
+/// Save dialog for the GiroCode PNG (Windows). Elsewhere `GIROCRAB_EXPORT_DIR` (development builds).
+#[cfg(windows)]
+fn save_png_file(name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("GiroCode als PNG speichern")
+        .set_file_name(name)
+        .add_filter("PNG-Bild", &["png"])
+        .save_file()
+}
+
+#[cfg(not(windows))]
+fn save_png_file(name: &str) -> Option<PathBuf> {
+    std::env::var_os("GIROCRAB_EXPORT_DIR").map(|d| PathBuf::from(d).join(name))
+}
+
+/// Opens the clipboard for the UI thread's active window: `EmptyClipboard` on a clipboard
+/// opened without an owner sets the owner to NULL, and `SetClipboardData` may then fail.
+#[cfg(windows)]
+fn open_clipboard() -> Result<clipboard_win::Clipboard, String> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetActiveWindow() -> *mut std::ffi::c_void;
+    }
+    // SAFETY: takes no arguments and only returns the calling thread's active window handle
+    // (NULL if there is none); the handle is passed on, never dereferenced.
+    let owner = unsafe { GetActiveWindow() };
+    // A NULL owner behaves exactly like `Clipboard::new_attempts(10)`.
+    clipboard_win::Clipboard::new_attempts_for(owner, 10)
+        .map_err(|_| "Die Zwischenablage ist gerade belegt; bitte erneut versuchen.".to_string())
+}
+
+/// Puts the image on the clipboard as registered "PNG" and as `CF_DIB`.
+/// Opening (busy) and writing fail with different status texts.
+#[cfg(windows)]
+fn copy_image_to_clipboard(png: &[u8], dib: &[u8]) -> Result<(), String> {
+    use clipboard_win::{raw, register_format};
+    const CF_DIB: u32 = 8;
+    let _open = open_clipboard()?;
+    let write = |_| "Das Bild konnte nicht in die Zwischenablage geschrieben werden.".to_string();
+    raw::empty().map_err(write)?;
+    raw::set_without_clear(CF_DIB, dib).map_err(write)?;
+    if let Some(format) = register_format("PNG") {
+        raw::set_without_clear(format.get(), png).map_err(write)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn copy_image_to_clipboard(_png: &[u8], _dib: &[u8]) -> Result<(), String> {
+    Err("Bilder in die Zwischenablage kopieren geht nur unter Windows.".into())
+}
+
+/// Puts plain text (the sanitized bug report, #384) on the clipboard.
+#[cfg(windows)]
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let _open = open_clipboard()?;
+    clipboard_win::raw::set_string(text)
+        .map_err(|_| "Der Text konnte nicht in die Zwischenablage geschrieben werden.".to_string())
+}
+
+#[cfg(not(windows))]
+fn copy_text_to_clipboard(_text: &str) -> Result<(), String> {
+    Err("Text in die Zwischenablage kopieren geht nur unter Windows.".into())
+}
+
+mod tan_comparison_ui;
 
 /// `TransferSession` driven synchronously.
 struct CoreTransfer {
@@ -1348,6 +2048,7 @@ fn run_transfer(
     vault: Arc<Vault>,
     demo: bool,
     request: girocrab_core::SepaTransferRequest,
+    comparison: Option<tan_comparison_ui::TanComparison>,
     bank: &str,
     ui: &DialogBridge,
 ) -> Result<String, String> {
@@ -1369,6 +2070,9 @@ fn run_transfer(
     let session = vault
         .begin_transfer(request, std::mem::take(&mut *secret), demo)
         .map_err(|e| e.to_string())?;
+    // #949: disarmed by the guard on every way out of this function
+    let gate = session.clone();
+    let _armed = tan_comparison_ui::arm(comparison, move || gate.awaits_order_approval());
     transfer_flow::drive_transfer(
         &CoreTransfer {
             session,
@@ -1466,6 +2170,18 @@ fn transfer_fields(win: &MainWindow) -> girocode::Fields {
     }
 }
 
+/// Fields for a GiroCode export: the sender's recipient rule applied with the real (unmasked)
+/// values from `State`, like on submit. Refused for a savings account without reference account.
+fn girocode_fields(win: &MainWindow) -> Result<girocode::Fields, String> {
+    let mut f = transfer_fields(win);
+    transfer_flow::apply_recipient_fields(
+        &mut f.name,
+        &mut f.iban,
+        &transfer_rule_at(win.get_tr_account_index()),
+    )?;
+    Ok(f)
+}
+
 fn set_transfer_fields(win: &MainWindow, f: &girocode::Fields) {
     win.set_transfer_pre_name(f.name.clone().into());
     win.set_transfer_pre_iban(f.iban.clone().into());
@@ -1480,6 +2196,8 @@ fn apply_transfer_prefill(win: &MainWindow, p: &TransferPrefill) {
     win.set_transfer_pre_purpose(p.purpose.clone().into());
     win.set_transfer_status(SharedString::new());
     win.set_girocode_open(false);
+    let index = normalize_transfer_index(win);
+    apply_transfer_rule(win, index);
     win.set_transfer_open(true);
 }
 
@@ -1525,18 +2243,34 @@ for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnl
         .is_ok_and(|s| s.success())
 }
 
+mod cashflow_view;
+
 fn main() -> Result<(), slint::PlatformError> {
+    if let Ok(code) = std::env::var("GIROCRAB_LANGUAGE") {
+        girocrab_core::i18n::set_language(code);
+    }
     views_ui::purge_stale_documents();
     let screenshot = screenshot_path_from_args(std::env::args().skip(1));
     if screenshot.is_some() && std::env::var_os("SLINT_BACKEND").is_none() {
         // Software rendering: the isolated window texture is capturable (Metal is not).
-        std::env::set_var("SLINT_BACKEND", "winit-software");
+        // SAFETY: before the window exists, no other thread has been started yet.
+        unsafe { std::env::set_var("SLINT_BACKEND", "winit-software") };
     }
     let win = MainWindow::new()?;
+    win.set_rf_english(refunds_ui::english());
     let demo_title = std::env::var_os("GIROCRAB_DEMO_SEED").is_some() || screenshot.is_some();
     if demo_title {
         win.set_window_title("GiroCrab Windows Demo".into());
     }
+    // Menü „Ansicht“: geräte-lokale Schalter. Demo startet mit Standardwerten und lädt die
+    // gespeicherten Schalter beim Wechsel in den eigenen Tresor; Screenshot fasst nichts an.
+    view_prefs::install(
+        &win,
+        screenshot
+            .is_none()
+            .then(|| view_prefs::prefs_path(&vault_path())),
+        demo_title,
+    );
     if let Some(path) = screenshot {
         let timer = slint::Timer::default();
         timer.start(
@@ -1596,6 +2330,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 Ok(v) => {
                     *demo_active.lock().unwrap() = demo;
                     win.set_demo_active(demo);
+                    // Ansichts-Schalter erst nach erfolgreichem Öffnen umstellen: Schlägt der
+                    // Wechsel fehl, bleiben Modus, angezeigte Werte und Speichern wie vorher.
+                    view_prefs::set_demo(&win, demo);
                     if demo {
                         win.set_allowance_total("Einzelperson 1.000 € / Ehepaar 2.000 €".into());
                         win.set_allowance_allocated(800);
@@ -1612,8 +2349,12 @@ fn main() -> Result<(), slint::PlatformError> {
                     );
                     views_ui::invalidate_planned_count();
                     SESSION.store(session_id(&v), Ordering::SeqCst);
+                    refunds_ui::reset(&win);
                     show(&win, &v, None);
-                    *vault.lock().unwrap() = Some(v);
+                    *vault.lock().unwrap() = Some(v.clone());
+                    if demo {
+                        refunds_ui::demo(&win, v);
+                    }
                     win.set_message(SharedString::new());
                     if let Some(p) = pending_transfer.lock().unwrap().take() {
                         apply_transfer_prefill(&win, &p);
@@ -1631,7 +2372,7 @@ fn main() -> Result<(), slint::PlatformError> {
         // "Demo-Modus" button: same as GIROCRAB_DEMO_SEED=1, but without touching the key store.
         let open = open.clone();
         win.on_demo(move || {
-            std::env::set_var("GIROCRAB_DEMO_SEED", "1");
+            vault_key::set_demo(true);
             open(true)
         });
     }
@@ -1640,11 +2381,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let (open, demo_active) = (open.clone(), demo_active.clone());
         win.on_demo_switch(move || {
             let to_demo = !*demo_active.lock().unwrap();
-            if to_demo {
-                std::env::set_var("GIROCRAB_DEMO_SEED", "1");
-            } else {
-                std::env::remove_var("GIROCRAB_DEMO_SEED");
-            }
+            vault_key::set_demo(to_demo);
             open(to_demo)
         });
     }
@@ -1670,8 +2407,43 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = win.as_weak();
         win.on_search_changed(move || {
             if let Some(win) = weak.upgrade() {
+                refunds_ui::cancel_reveal();
+                with_state(|st| st.reveal_limit = 0);
                 apply_filter(&win);
             }
+        });
+    }
+    {
+        // Amount filter (#357): filtered by the core, so a change reloads on the worker thread.
+        let (weak, vault) = (win.as_weak(), vault.clone());
+        win.on_amount_filter_apply(move |from, to, direction| {
+            let (Some(win), Some(v)) = (weak.upgrade(), vault.lock().unwrap().clone()) else {
+                return;
+            };
+            if privacy_on(&win) {
+                return;
+            }
+            match amount_filter::AmountFilter::parse(&from, &to, direction) {
+                Ok(amount) => {
+                    win.set_amount_filter_error("".into());
+                    win.set_amount_filter_open(false);
+                    reload_with(&win, v, amount);
+                }
+                Err(e) => win.set_amount_filter_error(e.into()),
+            }
+        });
+    }
+    {
+        let (weak, vault) = (win.as_weak(), vault.clone());
+        win.on_amount_filter_reset(move || {
+            let (Some(win), Some(v)) = (weak.upgrade(), vault.lock().unwrap().clone()) else {
+                return;
+            };
+            win.set_amount_from("".into());
+            win.set_amount_to("".into());
+            win.set_amount_direction(0);
+            win.set_amount_filter_error("".into());
+            reload_with(&win, v, Default::default());
         });
     }
     let hits: Arc<Mutex<Vec<Option<BankSearchResult>>>> = Arc::new(Mutex::new(vec![]));
@@ -1722,6 +2494,24 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     {
+        let weak = win.as_weak();
+        win.on_print_request(move || {
+            let Some(win) = weak.upgrade() else { return };
+            if !win.get_unlocked() {
+                return; // gesperrt: nichts drucken
+            }
+            let (rows, account, from_date) = with_state(|st| {
+                let shown: Vec<&Row> = st.shown.iter().map(|&i| &st.rows[i]).collect();
+                (
+                    print_ui::rows_of(&shown),
+                    print_ui::account_label(&shown),
+                    st.filter.from_date.clone(),
+                )
+            });
+            print_ui::start(win.as_weak(), rows, account, from_date, privacy_on(&win));
+        });
+    }
+    {
         let (weak, vault, demo_active, bridge) = (
             win.as_weak(),
             vault.clone(),
@@ -1764,11 +2554,18 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = win.as_weak();
         win.on_select_booking(move |id| {
             let Some(win) = weak.upgrade() else { return };
-            with_state(|st| st.selected_booking = Some(id as i64));
+            refunds_ui::cancel_reveal();
+            with_state(|st| {
+                // an explicit pick ends a finished reveal: the next reload is a normal page
+                st.reveal_limit = 0;
+                st.selected_booking = Some(id as i64);
+            });
+            // one path for the card and its key, so a later filter redraw stays in step
             render_bookings(&win);
         });
     }
     wire_batch_actions(&win, vault.clone());
+    refunds_ui::wire(&win, vault.clone());
     {
         // Privacy mode: only the rendering changes; the cached rows stay as they are.
         let (weak, vault) = (win.as_weak(), vault.clone());
@@ -1776,10 +2573,16 @@ fn main() -> Result<(), slint::PlatformError> {
             let (Some(win), Some(v)) = (weak.upgrade(), vault.lock().unwrap().clone()) else {
                 return;
             };
+            refunds_ui::privacy_changed(&win, v.clone());
             let sel = Some(win.get_selected() as i64).filter(|s| *s >= 0);
             let _ = render_header(&win, &v, sel);
             render_bookings(&win);
             views_ui::rerender(&win);
+            mandates_ui::render_batch(&win);
+            // Diagramm synchron umstellen, nicht erst beim nächsten Laden des Dashboards.
+            cashflow_view::render(&win, privacy_on(&win));
+            apply_transfer_rule(&win, win.get_tr_account_index());
+            offline_ui::sync_mask(&win);
         });
     }
     {
@@ -1877,24 +2680,69 @@ fn main() -> Result<(), slint::PlatformError> {
             });
         }
     }
+    bug_report_ui::install(
+        &win,
+        std::rc::Rc::new({
+            let vault = vault.clone();
+            move || {
+                let guard = vault.lock().ok()?;
+                let v = guard.as_ref()?; // gesperrt => None => Aktionen gesperrt
+                let accounts = v
+                    .list_accounts()
+                    .ok()?
+                    .into_iter()
+                    .map(|a| [a.name, a.owner, a.iban]);
+                // Fehler => None: lieber gesperrt als ohne Begriffe bereinigt.
+                let counterparties = v
+                    .counterparty_names(bug_report_ui::MAX_COUNTERPARTY_TERMS)
+                    .ok()?;
+                Some(bug_report_ui::ReportSource {
+                    known_terms: bug_report_ui::known_terms(accounts, counterparties),
+                    log_lines: Vec::new(),
+                })
+            }
+        }),
+    );
     {
         let (weak, vault) = (win.as_weak(), vault.clone());
         win.on_lock(move || {
             let Some(win) = weak.upgrade() else { return };
             SESSION.store(0, Ordering::SeqCst);
+            win.set_busy(false);
+            refunds_ui::reset(&win);
             *vault.lock().unwrap() = None;
+            bug_report_ui::reset(&win);
             with_state(|st| *st = State::default());
+            PENDING_AMOUNT.with(|p| p.set(amount_filter::PendingAmount::NONE));
+            win.set_amount_from("".into());
+            win.set_amount_to("".into());
+            win.set_amount_direction(0);
+            win.set_amount_filter_open(false);
+            win.set_amount_filter_error("".into());
             win.set_unlocked(false);
             win.set_days(ModelRc::new(VecModel::from(Vec::<DayGroup>::new())));
+            // #949: the armed order comparison (amount, IBAN) must not outlive the vault either
+            tan_comparison_ui::disarm_all();
+            clear_tan_comparison(&win);
+            // Selection summary: no amounts may outlive the vault.
+            win.set_marked_count(0);
+            win.set_selection_summary_visible(false);
+            win.set_selection_count_text("".into());
+            win.set_selection_income("".into());
+            win.set_selection_expense("".into());
+            win.set_selection_balance("".into());
+            win.set_selection_extra("".into());
             win.set_accounts(ModelRc::new(VecModel::from(Vec::<AccountRow>::new())));
             win.set_has_inspector(false);
             views_ui::on_lock(&win);
+            offline_ui::reset(&win);
             win.set_first_run(false);
         });
     }
     {
         // Inspector edits: one-row updates, applied to the cache so the list needs no reload.
         let (weak, vault) = (win.as_weak(), vault.clone());
+        let category_slot = vault.clone();
         let edit = move |f: EditFn| {
             let (Some(win), Some(v)) = (weak.upgrade(), vault.lock().unwrap().clone()) else {
                 return;
@@ -1914,6 +2762,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let edit = Arc::new(edit);
         {
             let edit = edit.clone();
+            let (weak, slot) = (win.as_weak(), category_slot);
             win.on_set_category(move |index| {
                 edit(Box::new(move |v, id_| {
                     let cat = with_state(|st| {
@@ -1935,7 +2784,10 @@ fn main() -> Result<(), slint::PlatformError> {
                         }
                     });
                     Ok(())
-                }))
+                }));
+                if let (Some(win), Some(v)) = (weak.upgrade(), slot.lock().unwrap().clone()) {
+                    reload(&win, v);
+                }
             });
         }
         {
@@ -1982,6 +2834,9 @@ fn main() -> Result<(), slint::PlatformError> {
             std::thread::spawn(move || {
                 let result = v.apply_rules(true).map_err(|e| e.to_string());
                 let _ = weak.upgrade_in_event_loop(move |win| {
+                    if !is_current(&v) {
+                        return;
+                    }
                     win.set_busy(false);
                     match result {
                         Ok(n) => {
@@ -2028,6 +2883,16 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let weak = win.as_weak();
+        win.on_transfer_account_changed(move |index| {
+            if let Some(win) = weak.upgrade() {
+                // The sender's rule may change the recipient: a shown GiroCode would be stale.
+                win.set_girocode_open(false);
+                apply_transfer_rule(&win, index);
+            }
+        });
+    }
+    {
+        let weak = win.as_weak();
         win.on_transfer_start(move || {
             let Some(win) = weak.upgrade() else { return };
             apply_transfer_prefill(&win, &TransferPrefill::default());
@@ -2041,6 +2906,10 @@ fn main() -> Result<(), slint::PlatformError> {
             match girocode::paste_into(&current, clipboard.as_str()) {
                 Ok(f) => {
                     set_transfer_fields(&win, &f);
+                    // `transfer-iban-edited` fires for user edits only, so refresh the bank line here.
+                    if !win.get_tr_recipient_locked() {
+                        win.set_tr_bank(daily::iban_bank_line(&f.iban, privacy_on(&win)).into());
+                    }
                     win.set_transfer_status(SharedString::new());
                     win.set_girocode_open(false);
                 }
@@ -2052,7 +2921,13 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = win.as_weak();
         win.on_transfer_girocode(move || {
             let Some(win) = weak.upgrade() else { return };
-            match girocode::girocode_image(&transfer_fields(&win)) {
+            // Privacy first: the fields are not read in privacy mode or while locked.
+            if let Err(e) = girocode::girocode_allowed(privacy_on(&win)) {
+                win.set_girocode_open(false);
+                win.set_transfer_status(e.into());
+                return;
+            }
+            match girocode_fields(&win).and_then(|f| girocode::girocode_image(&f)) {
                 Ok(img) => {
                     win.set_girocode_image(img);
                     win.set_girocode_open(true);
@@ -2063,6 +2938,59 @@ fn main() -> Result<(), slint::PlatformError> {
                     win.set_transfer_status(e.into());
                 }
             }
+        });
+    }
+    {
+        let weak = win.as_weak();
+        win.on_transfer_girocode_copy(move || {
+            let Some(win) = weak.upgrade() else { return };
+            // Privacy first: the fields are not read in privacy mode or while locked.
+            if let Err(e) = girocode::girocode_allowed(privacy_on(&win)) {
+                win.set_transfer_status(e.into());
+                return;
+            }
+            // Status texts never contain the name, IBAN or amount.
+            let status = girocode_fields(&win)
+                .and_then(|f| girocode::girocode_clipboard_images(&f))
+                .and_then(|(png, dib)| copy_image_to_clipboard(&png, &dib))
+                .map(|()| "GiroCode als Bild in die Zwischenablage kopiert.".to_string())
+                .unwrap_or_else(|e| e);
+            win.set_transfer_status(status.into());
+        });
+    }
+    {
+        let weak = win.as_weak();
+        win.on_transfer_girocode_save(move || {
+            let Some(win) = weak.upgrade() else { return };
+            // Privacy first: the fields are not read in privacy mode or while locked.
+            if let Err(e) = girocode::girocode_allowed(privacy_on(&win)) {
+                win.set_transfer_status(e.into());
+                return;
+            }
+            let f = match girocode_fields(&win) {
+                Ok(f) => f,
+                Err(e) => {
+                    win.set_transfer_status(e.into());
+                    return;
+                }
+            };
+            let png = match girocode::girocode_payload_for(&f)
+                .and_then(|p| girocode::girocode_png_bytes(&p, girocode::EXPORT_MODULE_PX))
+            {
+                Ok(png) => png,
+                Err(e) => {
+                    win.set_transfer_status(e.into());
+                    return;
+                }
+            };
+            let Some(path) = save_png_file(&girocode::girocode_png_file_name(&f.name)) else {
+                return;
+            };
+            let status = match std::fs::write(&path, png) {
+                Ok(()) => "GiroCode als PNG gespeichert.".to_string(),
+                Err(e) => format!("Die Datei konnte nicht gespeichert werden: {e}"),
+            };
+            win.set_transfer_status(status.into());
         });
     }
     {
@@ -2077,7 +3005,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             };
             let source = with_state(|st| st.transfer_sources.get(index.max(0) as usize).cloned());
-            let input = daily::TransferInput {
+            let mut input = daily::TransferInput {
                 account_id: source.as_ref().map_or(0, |s| s.0),
                 name: name.to_string(),
                 iban: iban.to_string(),
@@ -2086,6 +3014,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 instant,
                 date: date.to_string(),
             };
+            // The form text never wins over a savings account's reference account.
+            if let Err(e) =
+                transfer_flow::apply_recipient_rule(&mut input, &transfer_rule_at(index))
+            {
+                win.set_transfer_status(e.into());
+                return;
+            }
             let request = match daily::validate_transfer(&input) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2093,6 +3028,11 @@ fn main() -> Result<(), slint::PlatformError> {
                     return;
                 }
             };
+            // Frozen now (#949): later form edits never change what the TAN dialog asks to compare.
+            let comparison = tan_comparison_ui::TanComparison::new(
+                &request.recipient_iban,
+                request.amount_cents,
+            );
             let bank = source.map(|s| s.2).unwrap_or_default();
             let demo = *demo_active.lock().unwrap();
             win.set_transfer_open(false);
@@ -2100,7 +3040,7 @@ fn main() -> Result<(), slint::PlatformError> {
             win.set_sync_status("Überweisung läuft …".into());
             let (weak, bridge) = (win.as_weak(), bridge.clone());
             std::thread::spawn(move || {
-                let result = run_transfer(v.clone(), demo, request, &bank, &bridge);
+                let result = run_transfer(v.clone(), demo, request, comparison, &bank, &bridge);
                 bridge.hide();
                 let _ = weak.upgrade_in_event_loop(move |win| {
                     let sel = Some(win.get_selected() as i64).filter(|s| *s >= 0);
@@ -2114,12 +3054,39 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     manage_ui::wire(&win, vault.clone());
+    offline_ui::wire(&win, &vault);
     views_ui::wire(&win, vault.clone());
 
     if demo_mode {
         open(true);
     }
     win.run()
+}
+
+/// Drops marks of bookings that are no longer visible (account, filter or search changed).
+fn prune_marked(
+    marked: &mut std::collections::HashSet<i64>,
+    visible: &std::collections::HashSet<i64>,
+) {
+    marked.retain(|id| visible.contains(id));
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod marked_tests {
+    use super::prune_marked;
+    use std::collections::HashSet;
+
+    #[test]
+    fn marks_outside_the_visible_rows_are_dropped() {
+        let mut marked: HashSet<i64> = [1, 2, 3].into_iter().collect();
+        let visible: HashSet<i64> = [2, 3, 4].into_iter().collect();
+        prune_marked(&mut marked, &visible);
+        assert_eq!(marked, [2, 3].into_iter().collect::<HashSet<i64>>());
+        // nothing visible (e.g. empty account): no stale marks stay for batch actions
+        prune_marked(&mut marked, &HashSet::new());
+        assert!(marked.is_empty());
+    }
 }
 
 type VaultEdit = Box<dyn Fn(&Vault, &[i64]) -> Result<(), String>>;
@@ -2135,7 +3102,7 @@ fn wire_batch_actions(win: &MainWindow, vault: Arc<Mutex<Option<Arc<Vault>>>>) {
                     st.marked.insert(id as i64);
                 }
             });
-            render_bookings(&win);
+            render_booking_rows(&win);
         });
     }
     {
@@ -2145,7 +3112,7 @@ fn wire_batch_actions(win: &MainWindow, vault: Arc<Mutex<Option<Arc<Vault>>>>) {
             with_state(|st| {
                 st.marked = st.shown.iter().map(|&i| st.rows[i].id).collect();
             });
-            render_bookings(&win);
+            render_booking_rows(&win);
         });
     }
     {
@@ -2153,7 +3120,7 @@ fn wire_batch_actions(win: &MainWindow, vault: Arc<Mutex<Option<Arc<Vault>>>>) {
         win.on_batch_clear(move || {
             let Some(win) = weak.upgrade() else { return };
             with_state(|st| st.marked.clear());
-            render_bookings(&win);
+            render_booking_rows(&win);
         });
     }
     // Runs one vault edit on the marked bookings (or on one id), then updates the cached rows.
@@ -2169,6 +3136,7 @@ fn wire_batch_actions(win: &MainWindow, vault: Arc<Mutex<Option<Arc<Vault>>>>) {
                 }
                 if let Err(e) = f(&v, &ids) {
                     win.set_sync_status(e.into());
+                    reload(&win, v);
                     return;
                 }
                 with_state(|st| {
@@ -2177,6 +3145,7 @@ fn wire_batch_actions(win: &MainWindow, vault: Arc<Mutex<Option<Arc<Vault>>>>) {
                     }
                 });
                 apply_filter(&win);
+                reload(&win, v);
             },
         )
     };
@@ -2297,6 +3266,11 @@ fn wire_batch_actions(win: &MainWindow, vault: Arc<Mutex<Option<Arc<Vault>>>>) {
         let weak = win.as_weak();
         win.on_batch_export(move || {
             let Some(win) = weak.upgrade() else { return };
+            // Privacy mode or a locked vault: nothing leaves the app.
+            if privacy_on(&win) {
+                win.set_sync_status("Export im Privatmodus nicht möglich".into());
+                return;
+            }
             let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
             let csv = with_state(|st| {
                 let mut out = String::from("Datum;Gegenpartei;Verwendungszweck;Kategorie;Betrag\n");
@@ -2328,8 +3302,12 @@ fn wire_batch_actions(win: &MainWindow, vault: Arc<Mutex<Option<Arc<Vault>>>>) {
             }
         });
     }
+    depot_export_ui::wire(win, vault.clone());
     wire_export_statements(win, vault);
 }
+
+/// Depot view: "Als CSV exportieren …" (handler and tests in its own module).
+mod depot_export_ui;
 
 /// "Umsätze exportieren" card: format 0 = PDF, 1 = CSV, 2 = CAMT.053; range 0 = month, 1 = year, 2 = all.
 fn wire_export_statements(win: &MainWindow, vault: Arc<Mutex<Option<Arc<Vault>>>>) {
@@ -2453,6 +3431,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn partial_reload_and_target_changes_have_recovery_paths() {
+        let source = include_str!("main.rs");
+        let reload = source
+            .split("fn reload_with(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(!reload.contains("(Ok(rows), Ok(cats)) =>"));
+        let show = source
+            .split("fn show(win:")
+            .nth(1)
+            .unwrap()
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        let after = show.split("views_ui::sync_target(sel);").nth(1).unwrap();
+        assert!(after.contains("refresh_dashboard(win, vault.clone())"));
+    }
+
+    #[test]
+    fn round8_row_only_redraw_preserves_refund_card() {
+        let source = include_str!("main.rs");
+        let redraw = source
+            .split("fn render_booking_rows(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(!redraw.contains("refunds_ui::refresh_card(win)"));
+    }
+
+    #[test]
     fn transfer_url_is_parsed() {
         let p = parse_transfer_url(
             "girocrab://transfer?recipient=Max%20Mustermann&iban=DE89%203704%200044%200532%200130%2000&amount=12,50&purpose=Rechnung+42%20%26%20Co",
@@ -2488,27 +3501,124 @@ mod tests {
         assert!(transfer_prefill_from_args(args(&["--demo"])).is_none());
     }
 
+    /// Unique temp database path per run; the file is removed on drop, also after a failed assert.
+    /// Declare it before the vault so the vault is dropped (and unlocked) first.
+    struct TempDb(std::path::PathBuf);
+
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            Self(std::env::temp_dir().join(format!(
+                "girocrab-win-{tag}-{}-{nanos}.sqlite",
+                std::process::id()
+            )))
+        }
+
+        fn path_string(&self) -> String {
+            self.0.display().to_string()
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut side = self.0.clone().into_os_string();
+                side.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(side));
+            }
+        }
+    }
+
+    #[test]
+    fn file_import_is_logged_except_cancelled() {
+        use girocrab_core::connectors::SyncSummary;
+        use girocrab_core::sync_log::SyncLogFilter;
+        let db = TempDb::new("fileimp");
+        let vault = Vault::open(db.path_string(), vec![5; 32]).unwrap();
+        let summary = SyncSummary {
+            accounts_updated: 1,
+            transactions_imported: 3,
+            transactions_categorized: 0,
+            transactions_skipped_archived: 0,
+            new_accounts: vec![],
+            revoked_accounts: vec![],
+            postbox_documents: None,
+            warnings: vec![],
+            hints: vec![],
+            documents_imported: 0,
+            security_transactions: 0,
+            holdings: 0,
+            history_incomplete: false,
+            history_remaining: 0,
+            history_total: 0,
+            documents_off: false,
+        };
+        log_file_import(&vault, 1, &Ok(None));
+        let none = SyncLogFilter::default();
+        assert!(vault.list_sync_log(none.clone()).unwrap().is_empty());
+        log_file_import(&vault, 1, &Ok(Some(summary)));
+        log_file_import(&vault, 1, &Err("kaputt".into()));
+        let log = vault.list_sync_log(none).unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(
+            log.iter()
+                .any(|e| e.outcome == SyncLogOutcome::Ok && e.imported == 3)
+        );
+        assert!(
+            log.iter()
+                .any(|e| e.outcome == SyncLogOutcome::Error && e.message == "kaputt")
+        );
+    }
+
     #[test]
     fn demo_vault_has_accounts_and_bookings() {
-        let path =
-            std::env::temp_dir().join(format!("girocrab-win-demo-{}.sqlite", std::process::id()));
-        let vault = Vault::open(path.display().to_string(), vec![7; 32]).unwrap();
+        let db = TempDb::new("demo");
+        let vault = Vault::open(db.path_string(), vec![7; 32]).unwrap();
         vault.seed_demo_data().unwrap();
         let (rows, _) = account_rows(&vault, false).unwrap();
         assert!(!rows.is_empty());
         let first = Target::Account(rows[0].id as i64);
-        assert!(!load_rows(&vault, first).unwrap().is_empty());
-        // All accounts (scope 0) holds at least as many rows as one account.
+        let none = amount_filter::AmountFilter::default();
         assert!(
-            load_rows(&vault, Target::AllAccounts).unwrap().len()
-                >= load_rows(&vault, first).unwrap().len()
+            !load_rows(&vault, first, ROW_LIMIT, none)
+                .unwrap()
+                .0
+                .is_empty()
         );
+        // All accounts (scope 0) holds at least as many rows as one account.
+        let (all, all_balances) = load_rows(&vault, Target::AllAccounts, ROW_LIMIT, none).unwrap();
+        assert!(all.len() >= load_rows(&vault, first, ROW_LIMIT, none).unwrap().0.len());
+        // Several accounts never get a balance column (#569).
+        assert_eq!(all_balances, daily::Balances::default());
         // Privacy hides balances and the IBAN tail.
         let (hidden, total) = account_rows(&vault, true).unwrap();
-        assert!(hidden
-            .iter()
-            .all(|r| r.balance == daily::MASK && r.iban != "•••• 3000"));
+        assert!(
+            hidden
+                .iter()
+                .all(|r| r.balance == daily::MASK && r.iban != "•••• 3000")
+        );
         assert_eq!(total, daily::MASK);
+    }
+
+    #[test]
+    fn commit_load_takes_filter_and_drops_marks_of_hidden_rows() {
+        let path =
+            std::env::temp_dir().join(format!("girocrab-win-commit-{}.sqlite", std::process::id()));
+        let vault = Vault::open(path.display().to_string(), vec![7; 32]).unwrap();
+        vault.seed_demo_data().unwrap();
+        let none = amount_filter::AmountFilter::default();
+        let (rows, balances) = load_rows(&vault, Target::AllAccounts, ROW_LIMIT, none).unwrap();
+        let kept = rows[0].id;
+        let mut st = State::default();
+        st.marked.extend([kept, i64::MIN]);
+        let income = amount_filter::AmountFilter::parse("", "", 1).unwrap();
+        commit_load(&mut st, rows, balances, vec![], income);
+        assert_eq!(st.amount, income);
+        assert_eq!(st.marked, std::collections::HashSet::from([kept]));
         let _ = std::fs::remove_file(&path);
     }
 

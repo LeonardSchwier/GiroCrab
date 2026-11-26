@@ -11,16 +11,28 @@ extension AppModel {
     }
 
     func fetchRah10BankKeys(blz: String) async throws -> [Rah10BankKeyCandidate] {
+        let pin = try await prepareRah10BankKeyRequest()
         await withCheckedContinuation { continuation in
             withFreshBankingPolicy { continuation.resume() }
         }
-        guard let pin = pinVault() else { throw CoreError.Database(message: "vault locked") }
+        guard isCurrent(pin) else { throw CoreError.SessionClosed }
         let keys = try await pin.runAsync { try await $0.rah10BankKeyCandidates(blz: blz) }
         guard isCurrent(pin) else { throw CoreError.SessionClosed }
         return keys
     }
 
+    /// The registration field saves off the main thread. Do not start the first
+    /// bank request until that write has finished, or move it to a different vault.
+    func prepareRah10BankKeyRequest() async throws -> VaultPin {
+        guard let pin = pinVault() else { throw CoreError.Database(message: "vault locked") }
+        await settingsWriteTask?.value
+        guard isCurrent(pin) else { throw CoreError.SessionClosed }
+        return pin
+    }
+
     func addRah10Connection(bytes: Data, password: String, name: String, bankKeys: [Rah10BankKeyCandidate], expected: [String], completion: @escaping (Bool) -> Void) {
+        // taken now: adding may wait for the policy, after the assistant closed
+        let history = newLoginHistory
         withFreshBankingPolicy { [self] in
             guard bankingAllowsAdding(bankingGate(forNew: .finTsGeneric)) else { completion(false); return }
             if demoActive, let ov = ownVault { useVault(ov, demo: false) }
@@ -28,7 +40,9 @@ extension AppModel {
             Task {
                 do {
                     let id = try await pin.run {
-                        try $0.addRah10ConnectionWithBankKeys(bytes: bytes, password: password, displayName: name, bankKeys: bankKeys, expectedFingerprints: expected)
+                        let id = try $0.addRah10ConnectionWithBankKeys(bytes: bytes, password: password, displayName: name, bankKeys: bankKeys, expectedFingerprints: expected)
+                        try Self.requestNewLoginHistory(history, for: id, in: $0)
+                        return id
                     }
                     // A committed import stays successful if the vault was swapped.
                     guard isCurrent(pin) else { completion(true); return }

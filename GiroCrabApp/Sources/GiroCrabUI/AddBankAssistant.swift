@@ -93,10 +93,13 @@ struct AddBankSheet: View {
         .padding(20)
         .macFrame(width: 860)
         .onAppear {
+            model.newLoginHistory = nil
             model.loadLivePsd2Banks()
             loadPopular()
             if let spec = model.demoAddBank { applyDemo(spec) }
         }
+        // a later login added elsewhere gets the setting again
+        .onDisappear { model.newLoginHistory = nil }
         .onChange(of: model.livePsd2Banks.count) { _, _ in loadPopular() }
     }
 
@@ -181,6 +184,7 @@ struct AddBankSheet: View {
         switch step {
         case .bank:
             guard let s = selected else { return }
+            submit.reset()
             ways = (s.id == Self.manualFinTs.id || s.id == Self.rah10Bank.id) ? [s]
                 : Self.ways(to: s, in: searchBanks(query: s.name, livePsd2: model.livePsd2Banks, perGroupLimit: 12))
             step = s.id == Self.rah10Bank.id && !missingSettings.isEmpty ? .setup : .access
@@ -381,7 +385,12 @@ struct AddBankSheet: View {
                     Section {
                         Picker("Verbindung", selection: Binding(
                             get: { s.id },
-                            set: { id in if let w = ways.first(where: { $0.id == id }) { selected = w } }
+                            set: { id in
+                                guard let w = ways.first(where: { $0.id == id }), w.id != s.id else { return }
+                                // the next form reports itself; the last one's "Hinzufügen" must not stay
+                                submit.reset()
+                                selected = w
+                            }
                         )) {
                             ForEach(ways, id: \.id) { w in
                                 VStack(alignment: .leading, spacing: 2) {
@@ -419,10 +428,34 @@ struct AddBankSheet: View {
                     }
                 }
                 .id(s.id) // a new form reports its own readiness
+                Section {
+                    Picker("Zeitraum beim ersten Abruf", selection: firstFetchPeriod) {
+                        ForEach(HistoryRange.pickerOptions, id: \.setting) { Text($0.title).tag($0.setting) }
+                        // a value set elsewhere (e.g. synced from another device) stays selectable
+                        if !HistoryRange.pickerOptions.contains(where: { $0.setting == firstFetchPeriod.wrappedValue }) {
+                            Text("\(Int(firstFetchPeriod.wrappedValue) ?? 90) Tage").tag(firstFetchPeriod.wrappedValue)
+                        }
+                    }
+                } header: {
+                    Text("Erster Abruf").appSectionHeader()
+                } footer: {
+                    Text("„Maximum“ reicht so weit zurück, wie Bank und Anbindung es zulassen. Für mehr als 90 Tage verlangen viele Banken eine TAN. Später lässt sich ein Zeitraum in den Einstellungen des Zugangs erneut abrufen.")
+                        .appFont(.caption).foregroundStyle(Theme.secondary)
+                        .leadingFooter()
+                }
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
         }
+    }
+
+    /// Period of the new login's first fetch (#1043): the setting `sync.days_back` until
+    /// chosen here, applied when the login is added.
+    private var firstFetchPeriod: Binding<String> {
+        Binding(
+            get: { model.newLoginHistory ?? model.settingEntry("sync.days_back")?.value ?? "max" },
+            set: { model.newLoginHistory = $0 }
+        )
     }
 
     // MARK: - 3. Setup

@@ -13,7 +13,10 @@ extension AppModel {
     /// PSD2 banks such as C24 and must not move the cards off the web login.
     func usesPortal(_ c: BankConnection) -> Bool {
         if Self.isMagicDemoLogin(c.loginName) { return false }
-        if !isDemo, [.advanzia, .amazonOrders, .fnz, .quirion, .schwaebischHall, .equatePlus].contains(c.connector) { return true }
+        // FNZ: direct login with the Zugangsnummer + PIN (PIN sheet, "PIN im
+        // Tresor speichern"). The browser window with the FNZsecure approval
+        // is the fallback, offered in the PIN sheet and on a missing PIN.
+        if !isDemo, [.advanzia, .airPlus, .amazonOrders, .quirion, .sharinbox, .axaShareplan, .unionInvestment, .berghausCie, .schwaebischHall, .equatePlus, .edenred].contains(c.connector) { return true }
         guard !isDemo, c.connector == .americanExpress || c.connector == .amazonVisa else { return false }
         // the card's own application (#824) or the default one
         let app = connectionEnableBankingApp(c.id)
@@ -21,6 +24,40 @@ extension AppModel {
             optIn: settingEntry(Self.enableBankingOptInKey(c.connector))?.value,
             hasApp: !(app?.applicationId.isEmpty ?? true),
             hasKey: app?.hasKey ?? false)
+    }
+
+    /// Connections fed by an export file the user picks (no login, no sync).
+    func usesFileImport(_: BankConnection) -> Bool {
+        false
+    }
+
+    func importFinpension(_ c: BankConnection, url: URL) {
+        guard let pin = pinVault() else { return }
+        let ok = url.startAccessingSecurityScopedResource()
+        defer { if ok { url.stopAccessingSecurityScopedResource() } }
+        let fileName = url.lastPathComponent
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            showError(String(localized: "Finpension-Import fehlgeschlagen"), describe(error))
+            return
+        }
+        let id = c.id
+        Task {
+            do {
+                let s = try await pin.run { try $0.importFinpensionExport(connectionId: id, bytes: data) }
+                guard isCurrent(pin) else { return }
+                toast = String(localized: "\(c.displayName): \(s.transactionsImported) neue Buchungen aus \(fileName)")
+                reloadAll()
+            } catch where !isCurrent(pin) {
+                // Locked or switched vault meanwhile: no error over another vault.
+            } catch CoreError.InvalidInput {
+                showError(String(localized: "Nichts erkannt"), String(localized: "In \(fileName) wurden keine Finpension-Positionen oder -Buchungen erkannt. Erwartet: CSV oder JSON-Export mit ISIN, Anzahl, Kurs, Marktwert bzw. Datum, Beschreibung, Betrag."))
+            } catch {
+                showError(String(localized: "Finpension-Import fehlgeschlagen"), describe(error))
+            }
+        }
     }
 
     static func enableBankingOptInKey(_ kind: ConnectorKind) -> String {
@@ -49,6 +86,32 @@ extension AppModel {
             AppModel.debugLog("portal import failed: \(describe(error))")
             return false
         }
+    }
+
+    /// Amex: statement PDFs of the card the portal shows, the ones not stored yet, downloaded
+    /// in the signed-in page: at most 24 from the last two years, or with `all` every one the
+    /// portal offers. Returns how many were added and how many could not be fetched or
+    /// stored (`failed` > 0 also when the statement list itself could not be read).
+    func importAmexStatements(_ c: BankConnection, browser: PortalBrowser, all: Bool = false)
+        async -> (added: Int, failed: Int) {
+        // one vault for the whole job: a vault switched meanwhile gets nothing
+        guard let pin = pinVault() else { return (0, 0) }
+        let id = c.id
+        let since = all ? "" : DateText.iso(Calendar.current.date(byAdding: .month, value: -24, to: Date()) ?? Date())
+        // closing dates the card has already: the portal's statement ids change with every login
+        let known: (String, String) async -> Set<String>? = { card, number in
+            (try? await pin.run { try $0.portalStatementDates(connectionId: id, cardKey: card, cardNumber: number) })
+                .map(Set.init)
+        }
+        let fetched = await browser.amexStatements(known: known, since: since, limit: all ? Int.max : 24)
+        AppModel.debugLog("portal statements: listed=\(fetched.listed) new=\(fetched.statements.count) failed=\(fetched.failed)")
+        guard !fetched.statements.isEmpty else { return (0, fetched.failed) }
+        let card = fetched.card, number = fetched.number, statements = fetched.statements
+        guard isCurrent(pin), let added = try? await pin.run({
+            try $0.importPortalStatements(connectionId: id, cardKey: card, cardNumber: number, statements: statements)
+        }), isCurrent(pin) else { return (0, fetched.failed + statements.count) }
+        if added > 0 { documentsVersion += 1 }
+        return (Int(added), fetched.failed)
     }
 
     /// Number of bookings currently recognised in the captured JSON / visible table (nothing stored).
@@ -119,8 +182,14 @@ extension ConnectorKind {
         case .amazonVisa: return URL(string: "https://kunden.openbankpay.com/amazon/login")
         case .equatePlus: return URL(string: "https://www.equateplus.com/EquatePlusParticipant2/?login")
         case .quirion: return URL(string: "https://banking.quirion.de/login/")
+        case .sharinbox: return URL(string: "https://sharinbox.sgmarkets.com/home")
+        case .axaShareplan: return URL(string: "https://espace-salarie.axa-mon-epargne-entreprises.com/")
+        case .unionInvestment: return URL(string: "https://anlegen.meindepot.union-investment.de/dashboard/super")
+        case .airPlus: return URL(string: AirPlusScripts.origin + "/")
+        case .berghausCie: return URL(string: "https://my.berghauscie.de/")
         case .schwaebischHall: return SchwaebischHallScripts.loginURL
         case .fnz: return URL(string: "https://portal.fnz.de/")
+        case .edenred: return URL(string: "https://nutzer.edenred.de/")
         case .amazonOrders: return URL(string: "https://www.amazon.de/gp/css/order-history")
         default: return nil
         }
@@ -142,8 +211,19 @@ extension ConnectorKind {
         case .amazonVisa: return ["openbankpay.com", "openbank.de", "openbank.com", "zinia.de", "zinia.com"]
         case .amazonOrders: return ["amazon.de", "amazon.com"]
         case .fnz: return ["portal.fnz.de"]
+        // the sign-in runs on Edenred's SSO host
+        case .edenred: return ["edenred.de", "edenred.io"]
         case .equatePlus: return ["www.equateplus.com", "www.emea.equateplus.com", "www.na.equateplus.com"]
         case .quirion: return ["banking.quirion.de"]
+        // sign-in runs on sso.sgmarkets.com (SG Connect); the data pages are served by sharinbox.*
+        case .sharinbox: return ["sharinbox.sgmarkets.com", "sso.sgmarkets.com"]
+        // the portal page serves its sign-in and its data interface
+        case .axaShareplan: return ["espace-salarie.axa-mon-epargne-entreprises.com"]
+        // sign-in (Keycloak) and API run on service.*; the captcha on frcapi.com is a sub-resource
+        case .unionInvestment: return ["anlegen.meindepot.union-investment.de", "service.meindepot.union-investment.de"]
+        case .airPlus: return ["businesstravelportal.airplus.com", "sso.service.airplus.com"]
+        // the portal page and its GraphQL service (sign-in and data)
+        case .berghausCie: return ["my.berghauscie.de", "bc-cms.herokuapp.com"]
         case .schwaebischHall: return ["www.schwaebisch-hall.de", "login.schwaebisch-hall.de"]
         default: return []
         }
@@ -369,7 +449,14 @@ final class PortalBrowser {
         return SHA256.hash(data: Data(token.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Amex: the latest statement list (`documents/info/statements`) and the card token of
+    /// its request; kept in memory only, for `amexStatements`.
+    @ObservationIgnored private(set) var statementList: (body: String, token: String)?
+
     func captured(_ body: String, url: String, card: String = "") {
+        if url.lowercased().contains("documents/info/statements") {
+            statementList = (body, card)
+        }
         let path = Self.maskedPath(url)
         seenPaths.append(path)
         if seenPaths.count > 200 { seenPaths.removeFirst(seenPaths.count - 200) }
@@ -441,6 +528,12 @@ final class PortalBrowser {
     func fillLogin(user: String, password: String) async -> Bool {
         guard onPortal else { return false }
         let js = """
+        var host = location.hostname.toLowerCase().replace(/\\.$/, '');
+        var allowed = domains.some(function(d) {
+          d = String(d).toLowerCase().replace(/\\.$/, '');
+          return host === d || host.endsWith('.' + d);
+        });
+        if (location.protocol !== 'https:' || !allowed) return false;
         var vis = function(e) { var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
         var pw = Array.prototype.find.call(document.querySelectorAll('input[type=password]'), vis);
         if (!pw) return false;
@@ -450,17 +543,18 @@ final class PortalBrowser {
           return /user|login|benutzer/i.test((i.id || '') + ' ' + (i.name || '') + ' ' + (i.getAttribute('autocomplete') || '')); });
         var before = texts.filter(function(i) { return pw.compareDocumentPosition(i) & Node.DOCUMENT_POSITION_PRECEDING; });
         var u = named || before[before.length - 1];
-        if (!u) return false;
         var set = function(el, v) {
           if (el.value) return;
           Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
           el.dispatchEvent(new Event('input', {bubbles: true}));
           el.dispatchEvent(new Event('change', {bubbles: true}));
         };
-        set(u, user); set(pw, password);
+        if (u) set(u, user);
+        set(pw, password);
         return true;
         """
-        return (try? await webView.callAsyncJavaScript(js, arguments: ["user": user, "password": password],
+        return (try? await webView.callAsyncJavaScript(js, arguments: ["user": user, "password": password,
+                                                                               "domains": domains.domains],
                                                         contentWorld: .defaultClient) as? Bool) ?? false
     }
 
@@ -468,6 +562,7 @@ final class PortalBrowser {
     @discardableResult
     func selectAmexCard(name: String, number: String) async -> Bool {
         expectedCard = (name, number, listCard)
+        statementList = nil
         let js = Self.amexSwitcherJS + """
         if (!sw) return false;
         sw.click(); await new Promise(function(r) { setTimeout(r, 800); });
@@ -493,6 +588,113 @@ final class PortalBrowser {
     """
 
     /// Host + path without query, digits masked – no ids or card numbers.
+    /// Amex: the statement PDFs of the card shown, newest first, whose closing date is not
+    /// among `known(card, number)` and on or after `since` (ISO date), at most `limit`. The
+    /// portal opens a statement as `<url>?account_key=…&client_id=OneAmex`, `account_key`
+    /// being a parameter of its own page; the list is loaded by its statements page.
+    /// `failed` counts statements not fetched, or 1 when the list could not be read.
+    func amexStatements(known: (String, String) async -> Set<String>?, since: String, limit: Int)
+        async -> (card: String, number: String, statements: [PortalStatement], listed: Int, failed: Int) {
+        guard onPortal, !onLoginPage else { return ("", "", [], 0, 0) }
+        // a list captured for another card than the one shown is not used (#243)
+        if let list = statementList, let shown = listCard, Self.cardKey(list.token) != shown {
+            statementList = nil
+        }
+        if statementList == nil {
+            // the statements page of the card shown loads the list
+            _ = try? await webView.callAsyncJavaScript(
+                "location.href = location.origin + '/activity/statements' + location.search; return true;",
+                contentWorld: .page)
+            for _ in 0..<40 where statementList == nil { try? await Task.sleep(nanoseconds: 500_000_000) }
+        }
+        guard onPortal, let list = statementList,
+              let items = (try? JSONSerialization.jsonObject(with: Data(list.body.utf8))) as? [[String: Any]] else {
+            return ("", "", [], 0, 1)
+        }
+        let card = Self.cardKey(list.token)
+        let number = cards.first { $0.key == card }?.number ?? ""
+        guard let knownDates = await known(card, number) else { return (card, number, [], items.count, 1) }
+        let wanted: [(date: String, path: String)] = items.compactMap { i in
+            guard (i["available"] as? Bool) != false, (i["archived"] as? Bool) != true,
+                  let date = i["end_date"] as? String, date.count == 10, date >= since, !knownDates.contains(date),
+                  let path = ((i["available_formats"] as? [[String: Any]])?
+                    .first { ($0["format"] as? String)?.uppercased() == "PDF" }?["url"] as? String) else { return nil }
+            return (date, path)
+        }
+        .sorted { $0.date > $1.date }
+        let todo = Array(wanted.prefix(limit))
+        guard !todo.isEmpty else { return (card, number, [], items.count, 0) }
+        // The key belongs to the portal page it was read from: it is only ever sent from that
+        // page (same host), never from a page the window moved to meanwhile.
+        guard onPortal, !onLoginPage, let keyHost = currentURL?.host else { return (card, number, [], items.count, todo.count) }
+        let key = (try? await webView.callAsyncJavaScript(
+            "var k = new URLSearchParams(location.search).get('account_key');"
+                + " if (!k && window.qsp) k = window.qsp.account_key; return k || '';",
+            contentWorld: .page) as? String) ?? ""
+        guard !key.isEmpty else { return (card, number, [], items.count, todo.count) }
+        // The PDF as base64; "" when the portal answers with something else or the page is
+        // no longer the one the key came from.
+        let download = """
+        try {
+          if (location.protocol !== 'https:' || location.host !== host) return '';
+          var u = new URL(path, location.origin);
+          if (u.host !== host) return '';
+          u.searchParams.set('account_key', key); u.searchParams.set('client_id', 'OneAmex');
+          var r = await fetch(u.toString(), {credentials: 'include'});
+          if (!r.ok) return '';
+          var blob = await r.blob();
+          return await new Promise(function(done) {
+            var f = new FileReader();
+            f.onload = function() { done(String(f.result).split(',')[1] || ''); };
+            f.onerror = function() { done(''); };
+            f.readAsDataURL(blob);
+          });
+        } catch (e) { return ''; }
+        """
+        var out: [PortalStatement] = []
+        var failed = 0
+        for (n, s) in todo.enumerated() {
+            guard onPortal, !onLoginPage, currentURL?.host == keyHost else {
+                failed += todo.count - n
+                break
+            }
+            let b64 = (try? await webView.callAsyncJavaScript(download, arguments: ["path": s.path, "key": key, "host": keyHost],
+                                                             contentWorld: .page) as? String) ?? ""
+            guard let data = Data(base64Encoded: b64), data.starts(with: Array("%PDF".utf8)) else {
+                failed += 1
+                continue
+            }
+            out.append(PortalStatement(date: s.date, bytes: data))
+        }
+        return (card, number, out, items.count, failed)
+    }
+
+    /// Edenred: the transaction history page of the current card, from the card list the
+    /// portal loaded; nil before it was loaded.
+    func edenredHistoryURL() -> URL? {
+        var cards: [[String: Any]] = []
+        for b in bodies.reversed() {
+            guard let v = try? JSONSerialization.jsonObject(with: Data(b.utf8)) as? [String: Any],
+                  let data = v["data"] as? [[String: Any]] else { continue }
+            let found = data.filter { $0["card_ref"] is String && $0["class"] is String }
+            if !found.isEmpty { cards = found; break }
+        }
+        // the current card: not expired or blocked, the latest expiry date (a replacement
+        // card expires after the card it replaces)
+        let ended = ["expir", "block", "cancel", "close", "lost", "stolen", "inactive", "replaced"]
+        let usable = cards.filter { c in
+            let st = (c["status"] as? String ?? "").lowercased()
+            return !ended.contains { st.contains($0) }
+        }
+        let card = (usable.isEmpty ? cards : usable)
+            .max { ($0["expiration_date"] as? String ?? "") < ($1["expiration_date"] as? String ?? "") }
+        guard let ref = card?["card_ref"] as? String, let cls = card?["class"] as? String,
+              var c = URLComponents(string: "https://nutzer.edenred.de/page/beneficiary-wallet-transaction-history")
+        else { return nil }
+        c.queryItems = [URLQueryItem(name: "cardClass", value: cls), URLQueryItem(name: "cardRef", value: ref)]
+        return c.url
+    }
+
     static func maskedPath(_ url: String) -> String {
         let u = URL(string: url)
         let s = u.map { ($0.host ?? "") + $0.path } ?? String(url.prefix(120))
@@ -626,13 +828,35 @@ struct PortalWebSheet: View {
     @State private var cardQueue: [PortalBrowser.CardList.Entry]?
     /// Amex: the card the portal is switching to right now.
     @State private var loadingCard: String?
+    /// Amex: when the card round began waiting, for its time limit (#1010).
+    @State private var cardsSince: Date?
     /// Amex: the stored login was filled in (or there is none): not tried again.
     @State private var loginFilled = false
+    /// Amex: statement PDFs are being downloaded before the sheet closes.
+    @State private var loadingStatements = false
+    /// Amex: statements were loaded with the button: the automatic import still stores
+    /// recognised bookings but leaves the sheet open, the user closes it.
+    @State private var statementsLoadedByHand = false
+    /// Edenred: sign-in started from the start page / transaction history opened (once each).
+    @State private var edenredLoginOpened = false
+    @State private var edenredHistoryOpened = false
 
     /// Amex: not every card of the switcher has been opened yet. Importing now would
     /// take only the cards loaded so far and close the sheet, so it waits (#243).
     private var cardsPending: Bool {
         connection.connector == .americanExpress && (cardQueue.map { !$0.isEmpty } ?? true || loadingCard != nil)
+    }
+    /// Amex: the card round still running after this long gives up, so the page is not
+    /// hidden for good and the cards loaded so far can be imported (#1010).
+    static let cardRoundTimeout: TimeInterval = 90
+    static func cardRoundTimedOut(since: Date?, now: Date = Date()) -> Bool {
+        since.map { now.timeIntervalSince($0) > cardRoundTimeout } ?? false
+    }
+
+    /// Amex: whether to switch to the next card now. Also while older billing periods are
+    /// browsed: switching cards neither imports nor closes the sheet (#1010).
+    static func switchesCard(isAmex: Bool, recognized: Int, away: Bool, quietFor: TimeInterval) -> Bool {
+        isAmex && recognized > 0 && !away && quietFor > 4
     }
     /// The older history (SMS code) is offered once per connection; later syncs close on their own.
     private var historyOfferedKey: String { "portal.historyOffered.\(connection.id)" }
@@ -663,6 +887,7 @@ struct PortalWebSheet: View {
         if importedCount > 0 && olderOffered {
             return String(localized: "\(importedCount) Umsätze übernommen. Für ältere Umsätze im Portal „Umsätze anzeigen“ wählen und den SMS-Code bestätigen – die Übernahme läuft danach automatisch weiter.")
         }
+        if loadingStatements { return String(localized: "Kontoauszüge werden geladen …") }
         if let card = loadingCard { return String(localized: "Umsätze der Karte „\(card)“ werden geladen …") }
         if importedCount > 0 { return String(localized: "\(importedCount) Umsätze übernommen – weitere werden geladen …") }
         if recognized == 0 { return String(localized: "Angemeldet – öffnen Sie die Umsatzübersicht, damit das Portal die Buchungen lädt.") }
@@ -713,6 +938,16 @@ struct PortalWebSheet: View {
                     .help("Lässt dieses Fenster offen, damit Sie im Portal frühere Abrechnungszeiträume öffnen können.")
                 }
                 Button { importing = true } label: { Label("CSV- oder PDF-Kontoauszug importieren …", systemImage: "doc.badge.plus") }
+                if connection.connector == .americanExpress, !browser.onLoginPage, browser.onPortal {
+                    Button {
+                        statementsLoadedByHand = true
+                        Task { await loadStatements(all: true) }
+                    } label: {
+                        Label("Alle Kontoauszüge laden", systemImage: "doc.on.doc")
+                    }
+                    .help("Lädt alle Kontoauszüge, die das Portal anbietet und die noch nicht im Tresor sind.")
+                    .disabled(busy || loadingStatements)
+                }
                 // Developer tool, hidden from everyday use (--developer). Also offered on
                 // the login page: the dump records `on_login_page` itself.
                 if model.options.developer && recognized == 0 {
@@ -735,7 +970,7 @@ struct PortalWebSheet: View {
         }
         .task {
             // Billing-period portals: the first sync of a connection offers the older periods.
-            if connection.connector.portalHasBillingPeriods && !UserDefaults.standard.bool(forKey: historyOfferedKey) {
+            if connection.connector.portalHasBillingPeriods && !AppDefaults.store.bool(forKey: historyOfferedKey) {
                 browsingHistory = true
             }
             // Count recognised bookings live; auto-import only when >= 1 booking is
@@ -743,12 +978,27 @@ struct PortalWebSheet: View {
             // Never while browsing older periods: the automatic import closes the sheet.
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
-                guard !busy else { continue }
-                if connection.connector == .americanExpress, !loginFilled, browser.onLoginPage, browser.onPortal,
+                guard !busy, !loadingStatements else { continue }
+                if AppModel.supportsStoredPortalLogin(connection.connector), !loginFilled, browser.onLoginPage, browser.onPortal,
                    !browser.loading {
                     loginFilled = await fillStoredLogin()
                 }
                 let away = browser.onLoginPage || !browser.onPortal
+                // Edenred: start the sign-in from the start page (an open SSO session signs in on
+                // its own), then open the card's transaction history, which loads the bookings.
+                if connection.connector == .edenred, !away, !browser.loading, let here = browser.currentURL {
+                    if !edenredLoginOpened, here.path == "/" || here.path == "/page/home",
+                       let login = URL(string: "https://nutzer.edenred.de/login") {
+                        edenredLoginOpened = true
+                        browser.webView.load(URLRequest(url: login))
+                        continue
+                    }
+                    if !edenredHistoryOpened, here.path.hasPrefix("/page/dashboard"), let history = browser.edenredHistoryURL() {
+                        edenredHistoryOpened = true
+                        browser.webView.load(URLRequest(url: history))
+                        continue
+                    }
+                }
                 let rows = away ? "[]" : await browser.domRowsJSON()
                 let n = away ? 0 : await model.previewPortalCapture(connection, bodies: browser.bodies, domRowsJSON: rows)
                 if n != lastSeenCount || n != recognized { lastSeenCount = n; lastChange = Date() }
@@ -771,8 +1021,17 @@ struct PortalWebSheet: View {
                     }
                 }
                 // Amex: open every card of the switcher once before importing (#243).
-                if !browsingHistory, connection.connector == .americanExpress, n > 0, !away,
-                   Date().timeIntervalSince(lastChange) > 4 {
+                if cardsPending, n > 0, !away {
+                    if cardsSince == nil { cardsSince = Date() }
+                    if Self.cardRoundTimedOut(since: cardsSince) {
+                        AppModel.debugLog("portal cards: gave up, \(cardQueue?.count ?? -1) left")
+                        cardQueue = []
+                        loadingCard = nil
+                        model.toast = String(localized: "Nicht alle Karten ließen sich öffnen – übernommen werden die bisher geladenen Karten.")
+                    }
+                }
+                if Self.switchesCard(isAmex: connection.connector == .americanExpress, recognized: n, away: away,
+                                     quietFor: Date().timeIntervalSince(lastChange)) {
                     if await openNextCard() { lastChange = Date(); continue }
                 }
                 if !browsingHistory, n > importedCount, !away, !pager.more, Date().timeIntervalSince(lastChange) > 4 {
@@ -786,8 +1045,8 @@ struct PortalWebSheet: View {
                     }
                     // First sync with older history on offer: store what is there, but keep
                     // the sheet open so the user can unlock the rest (SMS code).
-                    let firstSync = importedCount == 0 && !UserDefaults.standard.bool(forKey: historyOfferedKey)
-                    let keepOpen = pager.older && firstSync
+                    let firstSync = importedCount == 0 && !AppDefaults.store.bool(forKey: historyOfferedKey)
+                    let keepOpen = pager.older && firstSync || statementsLoadedByHand
                     if await attempt(closing: !keepOpen) {
                         if !keepOpen && openHolds.isEmpty { return }
                         importedCount = n
@@ -832,13 +1091,46 @@ struct PortalWebSheet: View {
             if fromButton { confirmDiscard = true }
             return true
         }
-        if closing { close() }
+        if closing {
+            await loadStatements()
+            close()
+        }
         return true
+    }
+
+    /// Amex: downloads the new statement PDFs while the portal session is open; `all`
+    /// without the two-year limit (button), else the recent ones before closing. A download
+    /// already running is waited for, so closing never cuts it off.
+    private func loadStatements(all: Bool = false) async {
+        guard connection.connector == .americanExpress else { return }
+        guard !loadingStatements else {
+            while loadingStatements {
+                // the sheet went away: stop waiting
+                do { try await Task.sleep(nanoseconds: 200_000_000) } catch { return }
+            }
+            return
+        }
+        loadingStatements = true
+        defer { loadingStatements = false }
+        let r = await model.importAmexStatements(connection, browser: browser, all: all)
+        var notes: [String] = []
+        if r.added > 0 { notes.append(String(localized: "\(r.added) neue Kontoauszüge")) }
+        if r.failed > 0 { notes.append(String(localized: "\(r.failed) Kontoauszüge konnten nicht geladen werden – beim nächsten Abruf erneut versuchen.")) }
+        if notes.isEmpty, all { notes.append(String(localized: "Keine neuen Kontoauszüge")) }
+        guard !notes.isEmpty else { return }
+        let note = notes.joined(separator: " · ")
+        model.toast = all ? note : (model.toast.map { $0 + " · " } ?? "") + note
     }
 
     /// Closing with unresolved pending charges asks first: they would be discarded.
     private func requestClose() {
-        if openHolds.isEmpty { close() } else { confirmDiscard = true }
+        guard openHolds.isEmpty else { confirmDiscard = true; return }
+        // a running statement download finishes first
+        if loadingStatements || (importedCount > 0 && connection.connector == .americanExpress) {
+            Task { await loadStatements(); close() }
+        } else {
+            close()
+        }
     }
 
     /// Alert text (alerts are never part of a bug report picture).
@@ -855,10 +1147,15 @@ struct PortalWebSheet: View {
     /// done, or when nothing is stored; false while the form is not there yet.
     private func fillStoredLogin() async -> Bool {
         let id = connection.id
+        guard !AppDefaults.store.bool(forKey: AppModel.portalLoginAutofillDisabledKey(id)) else { return true }
         let stored = try? await model.vaultOffMain {
             (try $0.getSetting(key: AppModel.portalLoginKey(id)) ?? "", try $0.getSetting(key: "pin.conn.\(id)") ?? "")
         }
-        guard let (user, password) = stored, !user.isEmpty, !password.isEmpty else { return true }
+        guard let (storedUser, password) = stored, !password.isEmpty else { return true }
+        // Amazon Visa already stores the email as the connection login; copy it to
+        // the encrypted portal-login secret when the user opts into saving credentials.
+        let user = storedUser.isEmpty && connection.connector == .amazonVisa ? connection.loginName : storedUser
+        guard !user.isEmpty else { return true }
         let filled = await browser.fillLogin(user: user, password: password)
         if filled { AppModel.debugLog("portal: stored login filled in") }
         return filled
@@ -906,7 +1203,7 @@ struct PortalWebSheet: View {
     }
 
     private func close() {
-        if importedCount > 0 { UserDefaults.standard.set(true, forKey: historyOfferedKey) }
+        if importedCount > 0 { AppDefaults.store.set(true, forKey: historyOfferedKey) }
         model.webLoginConnection = nil
         dismiss()
     }

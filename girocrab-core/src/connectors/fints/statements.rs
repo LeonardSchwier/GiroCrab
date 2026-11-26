@@ -3,23 +3,32 @@
 //! receipts (HKQTG).
 
 use super::syntax::{self, SegmentBuilder};
-use super::{camt, fints_date, kku, mt940, FinTsConnector, SepaAccount, UpdAccount};
-use crate::connectors::{today, ConnectContext, RemoteTransaction};
+use super::{FinTsConnector, SepaAccount, UpdAccount, camt, fints_date, kku, mt940};
+use crate::connectors::{ConnectContext, RemoteTransaction, today};
 use crate::error::{CoreError, CoreResult};
 use crate::i18n::trf;
 
-/// Start date of a card statement request: `since`, but not further back than the
+/// Closing balance of a statements answer (`:62F:` / camt `CLBD`): the booked balance.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Closing {
+    pub cents: i64,
+    pub date: Option<String>,
+}
+
+/// Start date of a statement request: `since`, but not further back than the
 /// bank's storage period (`storage_days`, 0 = unknown). Dates are `YYYY-MM-DD`.
-pub(super) fn card_since(since: &str, today: &str, storage_days: i64) -> String {
-    let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok();
+pub(super) fn stored_since(since: &str, today: &str, storage_days: i64) -> String {
+    let parse = |d: &str| jiff::civil::Date::strptime("%Y-%m-%d", d).ok();
     match (parse(since), parse(today)) {
         (Some(s), Some(t)) if storage_days > 0 => {
             // the bank's number: an absurd value must not overflow the date arithmetic
             // (a panic on a hostile reply); no bound cuts the range then
-            let oldest =
-                chrono::Duration::try_days(storage_days).and_then(|d| t.checked_sub_signed(d));
+            let oldest = jiff::Span::new()
+                .try_days(storage_days)
+                .and_then(|d| t.checked_sub(d))
+                .ok();
             match oldest {
-                Some(oldest) => s.max(oldest).format("%Y-%m-%d").to_string(),
+                Some(oldest) => crate::dates::iso(s.max(oldest)),
                 None => since.to_string(),
             }
         }
@@ -152,11 +161,33 @@ pub(super) fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// FNV-1a 64 over raw bytes (stable id for a statement PDF).
-pub(super) fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+/// Warning of a statements request that stopped at its page limit with pages
+/// left: kept as a warning, not an error, so a long first fetch still stores
+/// what it read.
+pub(super) fn truncated_warning(label: &str) -> String {
+    trf(
+        "{0}: Die Umsatzliste war länger als 50 Seiten und wurde nicht vollständig gelesen.",
+        &[&label],
+    )
+}
+
+/// Period of a statements request (HKCAZ/HKKAZ): from `since` (YYYY-MM-DD), open end.
+/// An explicit "bis" date of today cuts off entries a bank already dates on the
+/// next business day, e.g. weekend card holds and credits dated Monday (#1570);
+/// an empty "bis" means "up to the current state".
+pub(super) fn request_period(since: &str) -> (String, String) {
+    (since.replace('-', ""), String::new())
+}
+
+#[test]
+fn request_period_leaves_end_open() {
+    // Saturday fetch: entries dated on the following Monday must not be cut off.
+    let (from, to) = request_period("2026-11-01");
+    assert_eq!(from, "20261101");
+    assert!(
+        to.is_empty(),
+        "an explicit end date drops entries dated on the next business day"
+    );
 }
 
 impl FinTsConnector {
@@ -186,10 +217,11 @@ impl FinTsConnector {
         ctx: &ConnectContext,
         acc: &SepaAccount,
         label: &str,
-    ) -> CoreResult<(Vec<RemoteTransaction>, Option<i64>)> {
+    ) -> CoreResult<(Vec<RemoteTransaction>, Option<Closing>)> {
         let format = self.st.camt_formats.first().cloned().unwrap_or_default();
-        let from = ctx.since.replace('-', "");
-        let to = today().replace('-', "");
+        // never ask for more than the bank keeps: an older start ends in a partial reply (3997)
+        let since = stored_since(&ctx.since, &today(), self.st.caz_storage_days);
+        let (from, to) = request_period(&since);
         let mut touchdown: Option<String> = None;
         let mut txs = Vec::new();
         let mut closing = None;
@@ -213,8 +245,11 @@ impl FinTsConnector {
                         let (t, rep) = camt::parse(&crate::text::decode_xml_bytes(xml), label);
                         txs.extend(t);
                         add_pending(rep.pending);
-                        if rep.closing_balance_cents.is_some() {
-                            closing = rep.closing_balance_cents;
+                        if let Some(cents) = rep.closing_balance_cents {
+                            closing = Some(Closing {
+                                cents,
+                                date: rep.closing_date,
+                            });
                         }
                     }
                 }
@@ -233,6 +268,7 @@ impl FinTsConnector {
                 break;
             }
         }
+        self.truncated_statements |= touchdown.is_some();
         txs.extend(pending);
         Ok((txs, closing))
     }
@@ -293,7 +329,7 @@ impl FinTsConnector {
             (String::new(), String::new())
         } else {
             // Never ask for more than the bank keeps: an older start date is an error.
-            let since = card_since(&ctx.since, &today(), self.st.kku_storage_days);
+            let since = stored_since(&ctx.since, &today(), self.st.kku_storage_days);
             (since.replace('-', ""), today().replace('-', ""))
         };
         let mut touchdown: Option<String> = None;
@@ -346,15 +382,15 @@ impl FinTsConnector {
         acc: &SepaAccount,
         label: &str,
         currency: &str,
-    ) -> CoreResult<(Vec<RemoteTransaction>, Option<i64>)> {
+    ) -> CoreResult<(Vec<RemoteTransaction>, Option<Closing>)> {
         let v = self.version("HKKAZ");
         let acct = if v >= 7 {
             Self::kti(acc)
         } else {
             Self::ktv(acc)
         };
-        let from = ctx.since.replace('-', "");
-        let to = today().replace('-', "");
+        let since = stored_since(&ctx.since, &today(), self.st.kaz_storage_days);
+        let (from, to) = request_period(&since);
         let mut touchdown: Option<String> = None;
         let mut data = Vec::<u8>::new();
         for _page in 0..50 {
@@ -382,8 +418,13 @@ impl FinTsConnector {
                 break;
             }
         }
+        self.truncated_statements |= touchdown.is_some();
         let (txs, stmt) = mt940::parse(&crate::text::decode_bank_bytes(&data), label, currency);
-        Ok((txs, stmt.closing_balance_cents))
+        let closing = stmt.closing_balance_cents.map(|cents| Closing {
+            cents,
+            date: stmt.closing_date,
+        });
+        Ok((txs, closing))
     }
 
     /// The statement transaction the bank offers: HKEKA (statement in a chosen
@@ -445,6 +486,8 @@ impl FinTsConnector {
         let reply_id = format!("HI{}", &tx[2..]);
         let mut docs = Vec::new();
         let mut touchdown: Option<String> = None;
+        // a failing page drops the PDFs read so far: their receipt codes go with them
+        let receipts_before = self.st.pending_receipts.len();
         for _page in 0..12 {
             // HKEKA: account, format 3 (PDF), number, year, max entries.
             // HKEKP: account, number, year, max entries (always PDF).
@@ -456,7 +499,13 @@ impl FinTsConnector {
             if let Some(t) = &touchdown {
                 b = b.de(&[t]);
             }
-            let r = self.request(ctx, tx, b.build()).await?;
+            let r = match self.request(ctx, tx, b.build()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.st.pending_receipts.truncate(receipts_before);
+                    return Err(e);
+                }
+            };
             for s in r.all(&reply_id) {
                 crate::depot_debug::log(&format!(
                     "statements: {reply_id} v{} layout: {}",
@@ -465,10 +514,10 @@ impl FinTsConnector {
                 ));
                 // the bank's own file name (e.g. DKB), else one of ours
                 let bank_file_name = statement_file_name(s);
-                if let Some(code) = receipt_code(s) {
-                    if !self.st.pending_receipts.contains(&code) {
-                        self.st.pending_receipts.push(code);
-                    }
+                if let Some(code) = receipt_code(s)
+                    && !self.st.pending_receipts.contains(&code)
+                {
+                    self.st.pending_receipts.push(code);
                 }
                 let (stmt_label, period, date) = if pdf_only {
                     hiekp_details(s)
@@ -479,34 +528,34 @@ impl FinTsConnector {
                 };
                 for el in &s.elements {
                     for val in el {
-                        if let syntax::Value::Binary(pdf) = val {
-                            if pdf.starts_with(b"%PDF") {
-                                // HKEKP periods are not reliable enough for an
-                                // id; the bank re-sends unacknowledged statements,
-                                // so the content keeps them from being stored twice.
-                                let source_url = if pdf_only {
-                                    format!("fints:hkekp:{label}:{:016x}", fnv1a64_bytes(pdf))
-                                } else {
-                                    format!("fints:hkeka:{label}:{period}")
-                                };
-                                docs.push(crate::documents::RemoteDocument {
-                                    account_ref: label.to_string(),
-                                    booking_external_id: None,
-                                    // like MoneyMoney: the bank's file name, readable
-                                    title: bank_file_name
-                                        .as_deref()
-                                        .map(statement_title)
-                                        .unwrap_or_else(|| trf("Kontoauszug {0}", &[&stmt_label])),
-                                    doc_type: "kontoauszug".into(),
-                                    mime_type: "application/pdf".into(),
-                                    file_name: bank_file_name.clone().unwrap_or_else(|| {
-                                        format!("Kontoauszug_{}_{}.pdf", label, date)
-                                    }),
-                                    source_url,
-                                    bytes: pdf.clone(),
-                                    date: date.clone(),
-                                });
-                            }
+                        if let syntax::Value::Binary(pdf) = val
+                            && pdf.starts_with(b"%PDF")
+                        {
+                            // HKEKP periods are not reliable enough for an
+                            // id; the bank re-sends unacknowledged statements,
+                            // so the content keeps them from being stored twice.
+                            let source_url = if pdf_only {
+                                format!("fints:hkekp:{label}:{:016x}", crate::fnv::fnv1a64(pdf))
+                            } else {
+                                format!("fints:hkeka:{label}:{period}")
+                            };
+                            docs.push(crate::documents::RemoteDocument {
+                                account_ref: label.to_string(),
+                                booking_external_id: None,
+                                // like MoneyMoney: the bank's file name, readable
+                                title: bank_file_name
+                                    .as_deref()
+                                    .map(statement_title)
+                                    .unwrap_or_else(|| trf("Kontoauszug {0}", &[&stmt_label])),
+                                doc_type: "kontoauszug".into(),
+                                mime_type: "application/pdf".into(),
+                                file_name: bank_file_name.clone().unwrap_or_else(|| {
+                                    format!("Kontoauszug_{}_{}.pdf", label, date)
+                                }),
+                                source_url,
+                                bytes: pdf.clone(),
+                                date: date.clone(),
+                            });
                         }
                     }
                 }

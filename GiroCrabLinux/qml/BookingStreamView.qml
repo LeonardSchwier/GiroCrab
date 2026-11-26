@@ -65,8 +65,9 @@ Rectangle {
         ColumnLayout {
             Layout.fillWidth: true
             Layout.fillHeight: false // a nested layout fills by default (all children hidden: empty vault)
-            Layout.leftMargin: 20; Layout.rightMargin: 20; Layout.topMargin: 18; Layout.bottomMargin: 10
-            spacing: 14
+            // ViewLayout.cardGap (4): one gap between the stacked cards above the list (#603)
+            Layout.leftMargin: 20; Layout.rightMargin: 20; Layout.topMargin: 18; Layout.bottomMargin: 4
+            spacing: 4
             DemoBanner { visible: AppModel.demoActive && !AppModel.screenshotMode; Layout.fillWidth: true }
             StreamHeaderCard { visible: !stream.emptyVault; Layout.fillWidth: true }
             RowLayout {
@@ -108,11 +109,25 @@ Rectangle {
             HoverHandler { id: listHover }
             readonly property bool userScrolling: moving || vbar.pressed || listHover.hovered
 
+            // BookingListView.swift › StreamDayTracker (#593): the day of the element that crosses
+            // a line 24 px below the top edge; the balance chart moves its marker there. Reported
+            // only when it changes, so a selected booking's day stays until the list moves on.
+            property string topDay: ""
+            function trackTopDay() {
+                const i = indexAt(40, contentY + 24)
+                const item = i >= 0 ? AppModel.streamItems[i] : null
+                const day = !item ? "" : item.type === "header" ? item.day.date : item.type === "row" ? item.booking.booking_date : ""
+                if (day === topDay) return
+                topDay = day
+                StreamFollow.scrollFocusDay = day
+            }
+            readonly property int firstDayIndex: AppModel.streamItems.findIndex(x => x.type === "header")
+
             header: ColumnLayout {
                 width: list.width
                 onImplicitHeightChanged: if (list.pinnedTop) Qt.callLater(list.positionViewAtBeginning)
-                spacing: 14
-                Item { implicitHeight: 4 }
+                spacing: 4   // ViewLayout.cardGap (#603)
+                Item { implicitHeight: 0 }   // topGap: the spacing above the first card
                 EmptyVaultCard {
                     visible: stream.emptyVault
                     Layout.fillWidth: true; Layout.leftMargin: 20; Layout.rightMargin: 20
@@ -212,7 +227,7 @@ Rectangle {
                 AppModel.loadMoreBookings(Math.min(3000, Math.max(AppModel.defaultListLimit,
                                                                   Math.ceil(missing / perBooking) + 100)))
             }
-            onContentYChanged: { Qt.callLater(loadVisible); if (userScrolling) scrollDate.show() }
+            onContentYChanged: { Qt.callLater(loadVisible); if (userScrolling) scrollDate.show(); trackTopDay() }
             onHeightChanged: Qt.callLater(loadVisible)
             Connections {
                 target: AppModel
@@ -266,14 +281,16 @@ Rectangle {
                 opacity: AppModel.isLoadingSelection ? 0 : 1
                 enabled: !AppModel.isLoadingSelection
                 // „Kompakt“ (#542): no day headers, the date stands in each row
-                height: modelData.type === "header" ? (BookingPrefs.density === "compact" ? 0 : 14 + dayHeader.height)
+                height: modelData.type === "header" ? (BookingPrefs.density === "compact" ? 0 : dayGap + dayHeader.height)
                       : modelData.type === "account" ? 14 + accountHeader.height : row.height
+                /// The first day sits one card gap below the cards (ViewLayout.cardGap, #603).
+                readonly property int dayGap: index === list.firstDayIndex ? 4 : 14
 
                 DayHeader {
                     id: dayHeader
                     visible: item.modelData.type === "header" && BookingPrefs.density !== "compact"
                     day: item.modelData.type === "header" ? item.modelData.day : null
-                    x: 20; y: 14; width: item.width - 40
+                    x: 20; y: item.dayGap; width: item.width - 40
                 }
                 NewBookingsCardHeader {
                     id: accountHeader
@@ -340,6 +357,11 @@ Rectangle {
                 Timer { id: hideTimer; interval: 700 }
             }
 
+            /// SelectionScroller (#593): the chart marker follows the selected booking.
+            function followSelection() {
+                const b = AppModel.selectedBooking
+                if (b && StreamFollow.scrollFocusDay !== b.booking_date) StreamFollow.scrollFocusDay = b.booking_date
+            }
             function revealSelection() {
                 const i = AppModel.streamItems.findIndex(x => x.type === "row" && x.booking.id === AppModel.selectedBookingID)
                 if (i >= 0) list.positionViewAtIndex(i, ListView.Contain)
@@ -352,7 +374,10 @@ Rectangle {
                 // SelectionScroller: keep the selected booking visible.
                 function onSelectedBookingIDChanged() {
                     if (AppModel.scrollOnSelect) Qt.callLater(list.revealSelection)
+                    Qt.callLater(list.followSelection)
                 }
+                // a new list: the element at the top edge changes without a scroll
+                function onStreamItemsChanged() { Qt.callLater(list.trackTopDay) }
                 // click in the balance chart: that day's card to the top, its first booking selected
                 function onScrollToDay(day) {
                     const i = AppModel.streamItems.findIndex(x => x.type === "header" && x.day.date === day)
@@ -364,6 +389,8 @@ Rectangle {
                 }
             }
         }
+        // .safeAreaInset(edge: .bottom) { SelectionSummaryBar() }: count and sum of the selection (#878)
+        SelectionSummaryBar { Layout.fillWidth: true }
     }
 
     // The drag image of bookings dragged onto a sidebar category (#366): the merchant (or the
@@ -444,28 +471,44 @@ Rectangle {
                 Text { visible: nh.account !== null; Layout.alignment: Qt.AlignRight
                        text: nh.account ? Fmt.money(nh.account.balance_cents, nh.account.currency) : ""
                        font.pixelSize: Theme.body; font.weight: Font.DemiBold; font.features: { "tnum": 1 }
-                       color: nh.account && nh.account.balance_cents < 0 ? Theme.negative : Theme.text; Sensitive {} }
+                       color: nh.account && nh.account.balance_cents < 0 ? Theme.negative : Theme.text; Sensitive { amounts: true } }
                 Text { visible: nh.section !== null && nh.section.pendingCents !== 0; Layout.alignment: Qt.AlignRight
                        text: nh.section ? qsTr("Vorgemerkt: %1").arg(Fmt.money(nh.section.pendingCents, nh.account ? nh.account.currency : "EUR")) : ""
-                       font.pixelSize: Theme.caption; font.features: { "tnum": 1 }; color: Theme.secondary; Sensitive {} }
+                       font.pixelSize: Theme.caption; font.features: { "tnum": 1 }; color: Theme.secondary; Sensitive { amounts: true } }
             }
         }
     }
 
     component DayHeader: Rectangle {
+        id: dh
         property var day
+        /// The day the balance chart's marker points to (#593): accent dot, accent text, tinted.
+        readonly property bool marked: day !== null && day !== undefined && StreamFollow.highlightDay === day.date
+        readonly property color fill: marked ? Qt.tint(Theme.card, Theme.withAlpha(Theme.accent, 0.12)) : Theme.card
         height: 40
-        color: Theme.card
+        color: fill
         radius: 12
         border.color: Theme.border
-        Rectangle { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: parent.height / 2; color: Theme.card
+        Rectangle { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: parent.height / 2; color: dh.fill
                     Rectangle { anchors.left: parent.left; width: 1; height: parent.height; color: Theme.border }
                     Rectangle { anchors.right: parent.right; width: 1; height: parent.height; color: Theme.border } }
         Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Theme.border }
         RowLayout {
             anchors.fill: parent; anchors.leftMargin: 16; anchors.rightMargin: 16
-            Text { text: day ? Fmt.dayHeader(day.date) : ""; font.pixelSize: Theme.subheadline + 1; font.weight: Font.DemiBold; color: Theme.text; Layout.fillWidth: true }
-            Text { text: day ? Fmt.signed(day.sum) : ""; font.pixelSize: Theme.subheadline + 1; font.features: { "tnum": 1 }; color: day && day.sum > 0 ? Theme.inflow : Theme.secondary; Sensitive {} }
+            spacing: 8
+            Rectangle { visible: dh.marked; width: 7; height: 7; radius: 3.5; color: Theme.accent }
+            Text { text: day ? Fmt.dayHeader(day.date) : ""; font.pixelSize: Theme.subheadline + 1; font.weight: Font.DemiBold; color: dh.marked ? Theme.accent : Theme.text; Layout.fillWidth: true }
+            Text { text: day ? Fmt.signed(day.sum) : ""; font.pixelSize: Theme.subheadline + 1; font.features: { "tnum": 1 }; color: day && day.sum > 0 ? Theme.inflow : Theme.secondary; Sensitive { amounts: true } }
+            // end-of-day balance (#577): exact, whatever the order within the day
+            Text {
+                readonly property string balance: day ? ListBalances.days[day.date] || "" : ""
+                visible: balance !== ""
+                text: qsTr("Saldo %1").arg(balance)
+                font.pixelSize: Theme.caption; font.features: { "tnum": 1 }; color: Theme.secondary
+                HoverHandler { id: dayBalanceHover }
+                ToolTip.visible: dayBalanceHover.hovered; ToolTip.delay: 600; ToolTip.text: qsTr("Kontostand am Ende des Tages")
+                Sensitive { amounts: true }
+            }
         }
     }
 
@@ -479,6 +522,17 @@ Rectangle {
         readonly property bool compact: BookingPrefs.density === "compact"
         readonly property bool card: !compact
         height: row.implicitHeight
+        /// a plain click on the row, also BookingRow's Accessible.onPressAction
+        function primaryActivate(toggle = false, extend = false) {
+            if (!dc.booking) return
+            stream.forceActiveFocus()
+            // „Kompakt“: a click on the open row folds it, a click on another row opens that one
+            if (dc.compact && AppModel.selectedBookingID === dc.booking.id && !toggle && !extend)
+                stream.compactCollapsedID = stream.compactCollapsedID === dc.booking.id ? null : dc.booking.id
+            else
+                stream.compactCollapsedID = null
+            AppModel.selectBooking(dc.booking.id, toggle, extend, true)
+        }
 
         // background: rounded only at the bottom of the day's last row
         Rectangle {
@@ -559,13 +613,7 @@ Rectangle {
                 // the Amazon drill-down chevron sits below this area
                 const c = row.chevron
                 if (c.visible && c.contains(c.mapFromItem(dc, m.x, m.y))) { stream.toggleAmazonExpanded(dc.booking.id); return }
-                const toggle = m.modifiers & Qt.ControlModifier, extend = m.modifiers & Qt.ShiftModifier
-                // „Kompakt“: a click on the open row folds it, a click on another row opens that one
-                if (dc.compact && AppModel.selectedBookingID === dc.booking.id && !toggle && !extend)
-                    stream.compactCollapsedID = stream.compactCollapsedID === dc.booking.id ? null : dc.booking.id
-                else
-                    stream.compactCollapsedID = null
-                AppModel.selectBooking(dc.booking.id, toggle, extend)
+                dc.primaryActivate(m.modifiers & Qt.ControlModifier, m.modifiers & Qt.ShiftModifier)
             }
             onDoubleClicked: m => { if (m.button === Qt.LeftButton) AppModel.editNote(dc.booking) }
             // .draggable(BookingDrag.payload(…)): onto a sidebar category (#366)
@@ -599,7 +647,34 @@ Rectangle {
         AppMenuItem { text: qsTr("Notiz bearbeiten …"); icon.name: SF.icon("note.text"); onTriggered: AppModel.editNote(stream.menuBooking) }
         // TagsMenu (#228)
         TagsMenu { booking: stream.menuBooking }
-        AppMenuItem { text: qsTr("Umsatz aufteilen (Splitbuchung) …"); icon.name: SF.icon("arrow.triangle.branch"); onTriggered: AppModel.splitBooking = stream.menuBooking }
+        // #1663: a common share opens the sheet with that share already in the second part
+        AppMenu {
+            id: splitMenu
+            title: qsTr("Umsatz aufteilen (Splitbuchung)")
+            icon.name: SF.icon("arrow.triangle.branch")
+            Instantiator {
+                model: AppModel.splitShares
+                delegate: AppMenuItem {
+                    required property int modelData
+                    text: qsTr("%1 %").arg(modelData)
+                    onTriggered: AppModel.openSplit(stream.menuBooking, modelData)
+                }
+                onObjectAdded: (index, item) => splitMenu.insertItem(index, item)
+                onObjectRemoved: (index, item) => splitMenu.removeItem(item)
+            }
+            AppMenuSeparator {}
+            AppMenuItem { text: qsTr("Andere Aufteilung …"); onTriggered: AppModel.openSplit(stream.menuBooking) }
+        }
+        AppMenuItem {
+            readonly property var b: stream.menuBooking
+            visible: b !== null && (b.amount_cents !== 0 || b.split_count > 0)
+            height: visible ? implicitHeight : 0
+            text: b && b.amount_cents > 0
+                ? (["refund", "both"].includes(b.refund_marker) ? qsTr("Ursprüngliche Buchungen bearbeiten …") : qsTr("Ursprüngliche Buchung zuordnen …"))
+                : (b && ["original", "both"].includes(b.refund_marker) ? qsTr("Erstattungen bearbeiten …") : qsTr("Erstattung zuordnen …"))
+            icon.name: SF.icon("arrow.uturn.backward")
+            onTriggered: AppModel.refundBooking = b
+        }
         // LoanAssignMenu(hidesWhenUnavailable: true): left out for loan bookings and unlinked inflows
         Instantiator {
             model: AppModel.loanAssignable(stream.menuBooking) ? 1 : 0
@@ -607,7 +682,26 @@ Rectangle {
             onObjectAdded: (index, menu) => {
                 let at = 0
                 for (let i = 0; i < rowMenu.count; ++i)
-                    if (rowMenu.itemAt(i) && rowMenu.itemAt(i).text === qsTr("Umsatz aufteilen (Splitbuchung) …")) at = i + 1
+                    if (rowMenu.itemAt(i) && rowMenu.itemAt(i).subMenu === splitMenu) at = i + 1
+                rowMenu.insertMenu(at, menu)
+            }
+            onObjectRemoved: (index, menu) => rowMenu.removeMenu(menu)
+        }
+        // OfflineBookingMenu (OfflineAccountsUI.swift, #679): edit / delete by hand, mirror into an offline account
+        AppMenuItem { id: editManualItem; readonly property bool shown: OfflineAccounts.isManuallyEditable(stream.menuBooking)
+                   visible: shown; height: shown ? implicitHeight : 0
+                   text: qsTr("Buchung bearbeiten …"); icon.name: SF.icon("square.and.pencil")
+                   onTriggered: OfflineAccounts.editManualBooking(stream.menuBooking) }
+        AppMenuItem { readonly property bool shown: OfflineAccounts.isManuallyEditable(stream.menuBooking)
+                   visible: shown; height: shown ? implicitHeight : 0
+                   text: qsTr("Buchung löschen …"); icon.name: SF.icon("trash")
+                   onTriggered: OfflineAccounts.deleting = stream.menuBooking }
+        Instantiator {
+            model: stream.menuBooking && OfflineAccounts.offlineAccounts.some(a => a.id !== stream.menuBooking.account_id) ? 1 : 0
+            delegate: OfflineMirrorMenu { booking: stream.menuBooking }
+            onObjectAdded: (index, menu) => {
+                let at = 0
+                for (let i = 0; i < rowMenu.count; ++i) if (rowMenu.itemAt(i) === editManualItem) at = i + 2
                 rowMenu.insertMenu(at, menu)
             }
             onObjectRemoved: (index, menu) => rowMenu.removeMenu(menu)
@@ -679,12 +773,25 @@ Rectangle {
         readonly property var refundSource: amazonRef !== null && amazonRef.isRefund ? AmazonOrderRef.refundSource(booking, AppModel.bookings) : null
         readonly property bool expanded: amazonRef !== null && booking !== null && !!stream.amazonExpanded[booking.id]
         readonly property var counterAccount: BookingDetails.counterAccount(booking)
+        readonly property bool hasRefund: booking !== null && ["refund", "original", "both"].includes(booking.refund_marker)
+        readonly property real refundRoom: hasRefund ? refundBadge.implicitWidth + 8 : 0
         property alias chevron: chevron
         /// Width the name line gets in a single line: the row minus date, signet, marks and amount.
         readonly property real nameLineWidth: width - 28 - (compact ? 80 * Theme.textScale + 8 : 0) - Theme.scaled(signetSize) - 8
             - (checkIcon.visible ? checkIcon.width + 8 : 0) - (pendingIcon.visible ? pendingIcon.width + 8 : 0)
-            - (amountLabel.visible ? amountLabel.implicitWidth : orderAmount.implicitWidth + 16) - 8
+            - amountColumn.implicitWidth - 8 - refundRoom
         implicitHeight: Math.max((effectiveDensity === "compact" ? 28 : 44) * Theme.textScale, column.implicitHeight) + 2 * verticalPadding
+        // DayCard: .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton) (ff91866);
+        // name, amount and date follow the redaction like the planned rows.
+        Accessible.role: Accessible.Button
+        Accessible.name: booking ? AppModel.masking(booking.merchant.name || booking.booking_text) + ", "
+            + AppModel.masking(Fmt.money(booking.amount_cents), AppModel.redactAmounts) + ", " + Fmt.medium(booking.booking_date) : ""
+        Accessible.selected: booking !== null && (AppModel.selectedBookingID === booking.id || !!AppModel.selectedBookingIDs[booking.id])
+        Accessible.onPressAction: {
+            let p = parent
+            while (p && typeof p.primaryActivate !== "function") p = p.parent
+            if (p) p.primaryActivate()
+        }
 
         ColumnLayout {
             id: column
@@ -732,7 +839,11 @@ Rectangle {
                             Layout.minimumWidth: br.isSingleLine ? Math.min(Math.ceil(implicitWidth), Math.max(0, br.nameLineWidth - 30)) : 0
                             Sensitive {}
                         }
-                        SFIcon { id: docIcon; visible: br.booking && br.booking.document_count > 0; symbol: "doc.text.fill"; size: 11; color: Theme.withAlpha(Theme.accent, 0.8) }
+                        SFIcon { id: docIcon; visible: br.booking && br.booking.document_count > 0; symbol: "doc.text.fill"; size: 11; color: Theme.withAlpha(Theme.accent, 0.8)
+                                 // BookingListView.swift › BookingRow: .help (#675)
+                                 HoverHandler { id: docHover }
+                                 ToolTip.visible: docHover.hovered && docIcon.visible; ToolTip.delay: 500
+                                 ToolTip.text: br.booking ? qsTr("%1 Beleg(e) – Leertaste für Vorschau").arg(br.booking.document_count) : "" }
                         SFIcon { id: repeatIcon; visible: br.booking !== null && AppModel.recurringSeries(br.booking) !== null; symbol: "repeat"; size: 11 }
                         // Keep the name and amount first. Show the category only when its
                         // complete label fits (ViewThatFits); the purpose yields first.
@@ -834,6 +945,10 @@ Rectangle {
                             HoverHandler { id: chevronHover }
                             ToolTip.visible: chevronHover.hovered; ToolTip.delay: 600
                             ToolTip.text: br.expanded ? qsTr("Artikel einklappen") : qsTr("Alle Artikel anzeigen")
+                            // BookingRow: .accessibilityLabel(amazonExpanded ? … : …) (#571)
+                            Accessible.role: Accessible.Button
+                            Accessible.name: ToolTip.text
+                            Accessible.onPressAction: stream.toggleAmazonExpanded(br.booking.id)
                         }
                         Item { Layout.fillWidth: true }
                     }
@@ -843,27 +958,61 @@ Rectangle {
                          Layout.alignment: br.isSingleLine ? Qt.AlignVCenter : Qt.AlignTop; Layout.topMargin: br.isSingleLine ? 0 : 4 }
                 SFIcon { id: pendingIcon; visible: br.booking && br.booking.is_pending; symbol: "clock"; size: 11; color: Theme.tertiary
                          Layout.alignment: br.isSingleLine ? Qt.AlignVCenter : Qt.AlignTop; Layout.topMargin: br.isSingleLine ? 0 : 4 }
-                AmountLabel { id: amountLabel; visible: br.amazonRef === null; cents: br.booking ? br.booking.amount_cents : 0
-                              Layout.alignment: br.isSingleLine ? Qt.AlignVCenter : Qt.AlignTop }
-                // Order account: the direction is never colour alone — charges get a
-                // minus, refunds a plus (#571); both are badged symmetrically.
-                Rectangle {
-                    visible: br.amazonRef !== null
+                RowLayout {
+                    id: refundBadge
+                    visible: br.hasRefund
+                    spacing: 3
                     Layout.alignment: br.isSingleLine ? Qt.AlignVCenter : Qt.AlignTop
-                    implicitWidth: orderAmount.implicitWidth + 16; implicitHeight: orderAmount.implicitHeight + 6
-                    radius: height / 2
-                    color: br.amazonRef !== null && br.amazonRef.isRefund ? Theme.inflowBadge : Theme.outflowBadge
+                    SFIcon { symbol: "arrow.uturn.backward"; size: 12; color: Theme.accent }
                     Text {
-                        id: orderAmount
-                        anchors.centerIn: parent
-                        text: br.amazonRef === null ? "" : br.amazonRef.isRefund ? Fmt.signed(br.booking.amount_cents) : Fmt.money(-Math.abs(br.booking.amount_cents))
-                        font.pixelSize: Theme.body; font.weight: Font.DemiBold; font.features: { "tnum": 1 }
-                        color: br.amazonRef !== null && br.amazonRef.isRefund ? Theme.inflow : Theme.charge
-                        Sensitive {}
+                        text: br.booking ? Fmt.money(Math.max(br.booking.refund_cents, br.booking.refunded_cents), br.booking.currency) : ""
+                        font.pixelSize: Theme.caption; color: Theme.secondary; font.features: { "tnum": 1 }
+                        Sensitive { amounts: true }
                     }
-                    HoverHandler { id: orderAmountHover }
-                    ToolTip.visible: orderAmountHover.hovered; ToolTip.delay: 600
-                    ToolTip.text: br.amazonRef !== null && br.amazonRef.isRefund ? qsTr("Gutschrift (Erstattung)") : qsTr("Bestellung")
+                    HoverHandler { id: refundHover }
+                    ToolTip.visible: refundHover.hovered
+                    ToolTip.text: qsTr("Erstattung zugeordnet")
+                }
+                // compact rows stay one line: the balance goes next to the amount (#577)
+                GridLayout {
+                    id: amountColumn
+                    columns: br.isSingleLine ? 3 : 1
+                    columnSpacing: 8; rowSpacing: 1
+                    Layout.alignment: br.isSingleLine ? Qt.AlignVCenter : Qt.AlignTop
+                    AmountLabel { id: amountLabel; visible: br.amazonRef === null; cents: br.booking ? br.booking.amount_cents : 0
+                                  Layout.alignment: Qt.AlignRight | Qt.AlignVCenter }
+                    // Order account: the direction is never colour alone — charges get a
+                    // minus, refunds a plus (#571); both are badged symmetrically.
+                    Rectangle {
+                        visible: br.amazonRef !== null
+                        Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                        implicitWidth: orderAmount.implicitWidth + 16; implicitHeight: orderAmount.implicitHeight + 6
+                        radius: height / 2
+                        color: br.amazonRef !== null && br.amazonRef.isRefund ? Theme.inflowBadge : Theme.outflowBadge
+                        Text {
+                            id: orderAmount
+                            anchors.centerIn: parent
+                            text: br.amazonRef === null ? "" : br.amazonRef.isRefund ? Fmt.signed(br.booking.amount_cents) : Fmt.money(-Math.abs(br.booking.amount_cents))
+                            font.pixelSize: Theme.body; font.weight: Font.DemiBold; font.features: { "tnum": 1 }
+                            color: br.amazonRef !== null && br.amazonRef.isRefund ? Theme.inflow : Theme.charge
+                            Sensitive { amounts: true }
+                        }
+                        HoverHandler { id: orderAmountHover }
+                        ToolTip.visible: orderAmountHover.hovered; ToolTip.delay: 600
+                        ToolTip.text: br.amazonRef !== null && br.amazonRef.isRefund ? qsTr("Gutschrift (Erstattung)") : qsTr("Bestellung")
+                    }
+                    // balance after this booking (#577); pending ones have none
+                    Text {
+                        readonly property string balance: br.booking ? ListBalances.bookings[br.booking.id] || "" : ""
+                        visible: balance !== ""
+                        Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                        text: balance
+                        font.pixelSize: Theme.caption; font.features: { "tnum": 1 }; color: Theme.tertiary
+                        HoverHandler { id: balanceHover }
+                        ToolTip.visible: balanceHover.hovered; ToolTip.delay: 600; ToolTip.text: qsTr("Saldo nach dieser Buchung")
+                        Accessible.name: qsTr("Saldo") + ": " + AppModel.masking(balance, AppModel.redactAmounts)
+                        Sensitive { amounts: true }
+                    }
                 }
             }
             // „Standard“: one line of purpose below the name; opened rows: all of it
@@ -918,6 +1067,18 @@ Rectangle {
         SFIcon { symbol: none ? "questionmark.folder" : (booking.category_symbol || "tag.fill"); size: 11; color: parent.tint }
         Text { text: none ? SidebarModel.uncategorizedLabel : booking.category_name; font.pixelSize: Theme.callout + 1; font.weight: Font.Medium; color: parent.tint; elide: Text.ElideRight
                Sensitive { labels: true } }   // also a custom „Ohne Kategorie“ label (#597)
+        // BookingListView.swift › BookingSuggestionHint (#664): the history's suggestion behind
+        // „Ohne Kategorie“, in the secondary colour so it never reads as assigned
+        readonly property var suggested: none ? CategorySuggestions.category(CategorySuggestions.forBooking(booking)) : null
+        RowLayout {
+            visible: parent.suggested !== null
+            Layout.leftMargin: 4
+            spacing: 3
+            Accessible.name: parent.suggested ? qsTr("Vorschlag: %1").arg(AppModel.masking(parent.suggested.name, AppModel.redactLabels)) : ""
+            SFIcon { symbol: "clock.arrow.circlepath"; size: 11; color: Theme.secondary }
+            Text { text: parent.parent.suggested ? parent.parent.suggested.name : ""; font.pixelSize: Theme.callout + 1; color: Theme.secondary; elide: Text.ElideRight
+                   Sensitive { labels: true } }
+        }
     }
 
     // Onboarding.swift › EmptyVaultCard: the personal vault has no accounts yet.
@@ -933,7 +1094,7 @@ Rectangle {
                    font.pixelSize: Theme.callout + 1; color: Theme.secondary; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             Repeater {
                 model: [qsTr("Bank wählen und Anmeldenamen eingeben"),
-                        qsTr("Fehlende Angaben ergänzen (z. B. FinTS-Produkt-ID, API-Schlüssel) – das Formular öffnet sich automatisch"),
+                        qsTr("Fehlende Angaben ergänzen (z. B. API-Schlüssel) – das Formular öffnet sich automatisch"),
                         qsTr("PIN eingeben und in der Banking-App freigeben")]
                 RowLayout {
                     required property string modelData
@@ -985,6 +1146,11 @@ Rectangle {
                             ? qsTr("Ihr eigener Tresor ist noch leer. Hier sehen Sie erfundene Buchungen.")
                             : qsTr("Erfundene Buchungen – keine echte Bank verbunden. Sobald echte Daten da sind, schützt Face ID bzw. Ihr Gerätecode den Tresor automatisch; hier können Sie den Sperrbildschirm testen.")
                     font.pixelSize: Theme.caption; color: Theme.secondary; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                }
+                Text {
+                    // DemoBanner.resetNote (#952): the demo vault is rebuilt on every start
+                    text: qsTr("Änderungen werden beim Beenden zurückgesetzt.")
+                    font.pixelSize: Theme.caption; font.weight: Font.Medium; color: Theme.secondary; wrapMode: Text.WordWrap; Layout.fillWidth: true
                 }
             }
             Button { text: AppModel.hasOwnVault || AppModel.vaultMayHoldRealData() ? qsTr("Zurück zum eigenen Tresor") : qsTr("Eigenes Konto anlegen")

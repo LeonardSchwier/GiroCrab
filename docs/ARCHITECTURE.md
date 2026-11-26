@@ -1,5 +1,8 @@
 # Architecture notes
 
+The reasons behind lasting decisions (alternatives, accepted trade-offs) are recorded as
+[architecture decision records](adr/README.md).
+
 ## Schema & migrations
 
 The vault is a SQLCipher database. Its schema is versioned in
@@ -33,12 +36,26 @@ and `migrate` runs the missing ones in a single transaction.
 | 29 | `depot_values`: value history of securities depots |
 | 30 | `tx_date_id` also covers `deleted_ms`, `account_id` and `category_id` (counts and period sums from the index) |
 | 31 | `booking_documents.seen_at`: read status of documents; the document list index carries the column, a partial index finds the unread ones |
-| 32+ | future changes; the tables of securities depots are described in `docs/DEPOT_DATENMODELL.md` |
+| 32 | `accounts.note` / `note_ms`: the account note syncs like the name (#980); moves the setting `account.note.<id>` onto the account |
+| 33 | `hidden_recipients`: IBANs left out of the transfer suggestions (#978); index `tx_recipients` over the outgoing bookings with an IBAN |
+| 34 | `accounts.include_in_total` / `total_ms`: per-account switch for the totals (#337); existing order accounts start excluded |
+| 35 | `merchant_switches`, `custom_merchants`: merchant recognition settings and own merchants, both merged (#1373) |
+| 36 | `accounts.bank_label` / `bank_label_ms`: per-account bank label (#1467) |
+| 37 | one sidebar section per account kind (#1003): accounts of the old section "Giro & Tagesgeld" move by `accounts.kind` |
+| 38 | repair (#998): accounts an import archived because of a cancelled refresh are active again, marked in `accounts.archive_unknown` |
+| 39 | `transaction_splits.uuid` / `position`: stable split-part identities, deterministic UUIDv5 backfill (#714) |
+| 40 | `refund_links`: refund links between bookings or split parts (#714) |
+| 41 | `transactions.date_ms`: edit stamp of a manual booking's date, synced on its own (#714) |
+| 42 | `accounts.last_fetch_unix`: last single-account fetch timestamp (#1716) |
+| 43 | `planned_transfers.settled_ms`: settled scheduled orders (NULL = open), date index over `(execution_date, settled_ms)` (#1900) |
+| 44+ | future changes; the tables of securities depots are described in `docs/DEPOT_DATENMODELL.md` |
 
 **Changing the schema**
 
 1. Append a step to `STEPS` (SQL, or a hook for Rust logic such as backfills). Never edit or
-   reorder an existing step: vaults in the wild have already run it.
+   reorder an existing step: vaults in the wild have already run it. Describe the step in the
+   module comment of `schema.rs` and in the table above, and move the "future changes" row on
+   (`scripts/lint-schema-docs.sh`, CI).
 2. Run `cargo run -q -p girocrab-core --example make_fixture_vault`. It writes
    `girocrab-core/tests/fixtures/vault-v{N}.girocrab`; commit it. Never regenerate or edit an
    older fixture – each stands for vaults written by that version.
@@ -83,6 +100,7 @@ module adds its own methods to it and reaches the database through `self.db()`.
   | `vault/rules.rs` | pattern and expression rules |
   | `vault/settings.rs` | settings and `KNOWN_SETTINGS` |
   | `vault/merge.rs` | merging a peer snapshot or another vault file |
+  | `refunds.rs`, `refunds/` | UUID endpoint resolution, allocation, link API, suggestions and full-row link merge |
   | `loans.rs`, `planning.rs`, `documents.rs`, `insights.rs`, `connectors/*.rs`, `importers/*.rs`, … | their feature |
 
 - A feature module has at most one `#[uniffi::export] impl Vault` (the Swift API) and one plain
@@ -91,7 +109,42 @@ module adds its own methods to it and reaches the database through `self.db()`.
 - Free functions for Swift are exported only from `ffi.rs`, as wrappers that forward to the
   feature module (`scripts/lint-ffi-exports.sh`, CI). Elsewhere `#[uniffi::export]` marks only
   `impl` blocks of exported objects and callback traits.
+- `unsafe` code lives only in `sys.rs` (safe wrappers around the libc calls std lacks): the
+  core's `Cargo.toml` denies `unsafe_code` (every other workspace member forbids it) and
+  `scripts/lint-no-obfuscation.sh` (CI) lets only that file lift it. The script also keeps
+  processes, embedded files other than `data/` and dynamic loading out of the core and
+  Base64/hex decoding out of the payment path. Two checks back its text patterns: `clippy.toml`
+  bans process and loader calls by resolved path, and `--compiled` (CI) lists the files and
+  environment variables the compiler read for the library.
 - Modules under `vault/` are children of `vault`, so they see its private fields and helpers
   (`kept_key`, `migrate`). Other modules use `Vault::db()` only.
 - Tests sit in the module whose code they exercise.
 - A new feature gets a new module. Don't add another section to an existing file.
+
+## Refund links
+
+Refund links are stored independently of bank bookings and user splits. Split
+parts have durable UUIDs; their display position is not an endpoint identity.
+`planning/split_ids.rs` implements migration 39; step 40 in `schema.rs` creates `refund_links`. `planning.rs` preserves kept
+UUIDs, and the split and twin merge paths retain them.
+
+`refunds.rs` resolves endpoints and allocates capacity in creation order (`created_ms`, then sync identity as tie-break);
+`refunds/store.rs` merges complete link rows after exact booking-id mapping,
+including import take-overs. Local edits and deletions keep original link keys
+and stamps. Split replacement inherits a referenced UUID only for an unambiguous
+same-amount replacement in the same edit; resolution is exact-UUID only.
+Import remaps retain moved tombstones and source-key provenance so a later user
+unlink suppresses the moved row at read time. Merge remains full-row LWW.
+`refunds/api.rs` exposes link/unlink and compare-and-set restore. Allocation is
+cached by vault data revision, not persisted as additional financial truth.
+
+Links are documentation only: no report reads them; allocated cents appear
+only as row markers, in the refund card and in the assignment dialog.
+
+See [ADR 0004](adr/0004-refund-links.md) for the rules, rejected
+alternatives and test evidence, and the [refund UI guide](ERSTATTUNGEN_UI.md)
+for platform entry points and privacy behavior.
+
+Manual bookings in offline accounts merge amount and split vector atomically
+under `splits_ms`, with a deterministic value tie-break. Bank booking amounts
+keep their existing merge semantics. The manual amount unit needs no schema step.

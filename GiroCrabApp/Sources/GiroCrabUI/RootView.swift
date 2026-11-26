@@ -12,16 +12,7 @@ public struct GiroCrabScenes: Scene {
     @AppStorage(AppAppearance.defaultsKey) private var appearance: AppAppearance = .system
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
-    @AppStorage(ViewLayout.inspectorKey) private var showInspector = true
-    @AppStorage(ViewLayout.statisticsKey) private var showStatistics = true
-    @AppStorage(ViewLayout.budgetsKey) private var showBudgets = true
-    @AppStorage(ViewLayout.runningBalanceKey) private var showRunningBalance = false
-    @AppStorage(ViewLayout.lastFetchKey) private var showLastFetch = false
-    @AppStorage(ViewLayout.compactHeaderKey) private var compactHeader = false
-    @AppStorage(BalanceChartStyle.defaultsKey) private var chartStyle: BalanceChartStyle = .line
-    @AppStorage(ViewLayout.headerChartCollapsedKey) private var chartCollapsed = false
     @AppStorage(AppTextSize.defaultsKey) private var textSize: AppTextSize = .standard
-    @AppStorage(PrivacyMode.enabledKey) private var privacyMode = false
     #endif
 
     public init(options: LaunchOptions = .current) {
@@ -56,6 +47,10 @@ public struct GiroCrabScenes: Scene {
                 .modifier(AutoLockOnBackground(model: model))
                 .privacyModeEnvironment()
                 .listSettingsEnvironment()
+                // `girocrab://transfer?…` from another app or a web page (PaymentLink); the
+                // open main window takes it instead of a new one being made for it.
+                .onOpenURL { model.openLink($0) }
+                .handlesExternalEvents(preferring: [PaymentLink.scheme], allowing: ["*"])
                 #if os(macOS)
                 .appTextSize(textSize.effective)
                 .modifier(MenuBarBridge(model: model))
@@ -63,224 +58,32 @@ public struct GiroCrabScenes: Scene {
                 .frame(minHeight: 480, maxHeight: .infinity)
                 #endif
         }
+        .handlesExternalEvents(matching: [PaymentLink.scheme])
         #if os(macOS)
         // Fits a 13" MacBook Air (1470 × 956 pt) with room for the Dock.
         .defaultSize(width: 1280, height: 820)
         .windowResizability(.contentMinSize)
         .commands {
-            // Ablage › Neu: only commands that create something.
-            CommandGroup(replacing: .newItem) {
-                Button("Neue Überweisung …") { model.openTransfer() }
-                    .keyboardShortcut("n", modifiers: .command)
-                    // ⌘N in the tag sheet is „Neuer Tag …“ (TagManagerView's key monitor)
-                    .disabled(!model.canTransfer || model.showTagManager)
-                Button("Neue Kontogruppe …") { model.groupDialog = .create() }
-                    .keyboardShortcut("n", modifiers: [.command, .shift])
-                    .disabled(!model.isUnlocked)
-                Button("Bank hinzufügen …") { model.showAddBank = true }
-                    .disabled(!model.isUnlocked)
-                Button("Neues Darlehen …") { model.openLoanEditor(.create) }
-                    .disabled(!model.isUnlocked)
-                Button("Neues Sachwerte-Konto …") { model.createTangibleAccount() }
-                    .disabled(!model.isUnlocked)
-                Button("Neues Offline-Konto …") { model.runInOwnVault { model.offlineStore.showNewAccount = true } }
-                    .disabled(!model.isUnlocked)
-                Button("Neue Hauptkategorie …") { model.newCategoryRequest = NewCategoryRequest(parent: nil) }
-                    .disabled(!model.isUnlocked)
-            }
-            // Ablage › Import/Export (every toolbar command is also in the menu bar).
-            CommandGroup(replacing: .importExport) {
-                Button("Vorhandene Daten importieren …") { model.openMoneyMoneyImport() }
-                    .disabled(!model.isUnlocked)
-                Button("Umsätze exportieren …") { model.openBookingExport() }
-                    .keyboardShortcut("e", modifiers: [.command, .shift])
-                    .disabled(!model.isUnlocked)
-            }
-            CommandGroup(replacing: .printItem) {
-                Button("Papierformat …") { PageSetup.run() }
-                    .keyboardShortcut("p", modifiers: [.command, .shift])
-                Button("Drucken …") { model.showPrintSheet = true }
-                    .keyboardShortcut("p", modifiers: .command)
-                    .disabled(!model.isUnlocked)
-            }
-            // "Bank hinzufügen …" lives in Ablage with the other "create" commands
-            // (HIG: one command, one menu – Help search otherwise lists it twice).
-            CommandMenu("Konten") {
-                Button("Alle Konten abrufen") { model.requestSyncAll() }
-                    .keyboardShortcut("r", modifiers: .command)
-                    .disabled(!model.isUnlocked || model.bankingBlocksAll)
-                Divider()
-                Button("Regeln …") { model.openRuleEditor() }
-                    .keyboardShortcut("k", modifiers: [.command, .option])
-                    .disabled(!model.isUnlocked)
-                Button("Tags verwalten …") { model.showTagManager = true }
-                    .keyboardShortcut("t", modifiers: [.command, .shift])
-                    .disabled(!model.isUnlocked)
-                Button("Wiederkehrende Buchungen …") { model.showRecurringSheet = true }
-                    .disabled(!model.isUnlocked)
-            }
-            CommandMenu("Buchung") {
-                // Offline accounts (#679, #81): typed bookings
-                Button("Neue Buchung …") { model.openManualBooking() }
-                    .keyboardShortcut("n", modifiers: [.command, .option])
-                    .disabled(!model.canAddManualBooking)
-                Button("Buchung bearbeiten …") { if let b = model.selectedBooking { model.editManualBooking(b) } }
-                    .disabled(model.selectedBooking.map { !model.isManuallyEditable($0) } ?? true)
-                Button("Buchung löschen …") { if let b = model.selectedBooking { model.offlineStore.deleting = b } }
-                    .disabled(model.selectedBooking.map { !model.isManuallyEditable($0) } ?? true)
-                Divider()
-                // In the list, the single keys C and R do the same (kept for speed).
-                Button("Kategorisieren …") { if model.selectedBooking != nil { model.showCategorizer = true } }
-                    .keyboardShortcut("c", modifiers: [.command, .control])
-                    .disabled(model.selectedBooking == nil)
-                Button("Regel für diesen Händler erstellen …") { model.openRuleEditor(from: model.selectedBooking) }
-                    .keyboardShortcut("r", modifiers: [.command, .control])
-                    .disabled(model.selectedBooking == nil)
-                // A checkmark item like "Als Gehalt / Rente zählen"; ⇧⌘U as in Mail
-                Toggle("Geprüft", isOn: Binding(
-                    get: { model.selectedBooking?.checked ?? false },
-                    set: { on in if let b = model.selectedBooking { model.setChecked(on, for: b) } }
-                ))
-                .keyboardShortcut("u", modifiers: [.command, .shift])
-                .disabled(model.selectedBooking == nil)
-                // ⌥⇧⌘U as in Mail ("Alle Nachrichten als gelesen markieren"), next to ⇧⌘U
-                Button("Alle Buchungen als gelesen markieren") { model.markAllChecked() }
-                    .keyboardShortcut("u", modifiers: [.command, .shift, .option])
-                    .disabled(!model.canMarkAllChecked)
-                Button("Notiz bearbeiten") { if let b = model.selectedBooking { model.editNote(for: b) } }
-                    .disabled(model.selectedBooking == nil)
-                Button("Tags bearbeiten") { if let b = model.selectedBooking { model.editTags(for: b) } }
-                    .disabled(model.selectedBooking == nil)
-                // like the Finder (⌘Y); Space in the list does the same
-                Button("Beleg in Quick Look anzeigen") {
-                    if let b = model.selectedBooking, let d = model.documents(for: b).first { model.quickLook(d) }
-                }
-                .keyboardShortcut("y", modifiers: .command)
-                .disabled(model.selectedBooking.map { model.documents(for: $0).isEmpty } ?? true)
-                Divider()
-                RecurringMenu(model: model, booking: model.selectedBooking)
-                    .disabled(model.selectedBooking == nil)
-                Toggle("Als Gehalt / Rente zählen", isOn: Binding(
-                    get: { model.selectedBooking?.isSalary ?? false },
-                    set: { on in if let b = model.selectedBooking { model.setSalaryFlag(b, on) } }
-                ))
-                .disabled((model.selectedBooking?.amountCents ?? 0) <= 0)
-                Divider()
-                // ⌘↑/⌘↓ stay with text fields (start/end of text); ↑/↓ work in the list.
-                Button("Nächste Buchung") { model.moveSelection(1) }
-                    .keyboardShortcut(.downArrow, modifiers: [.command, .control])
-                Button("Vorherige Buchung") { model.moveSelection(-1) }
-                    .keyboardShortcut(.upArrow, modifiers: [.command, .control])
-                Divider()
-                ForEach(Array(BookingScope.ordered.enumerated()), id: \.offset) { i, s in
-                    Button(model.presentation.menuTitle(index: i, scope: s)) { model.applyScopeShortcut(index: i, scope: s) }
-                        .keyboardShortcut(KeyEquivalent(Character(String(i + 1))), modifiers: .command)
-                }
-                Divider()
-                LoanAssignMenu(model: model, booking: model.selectedBooking)
-            }
-            CommandGroup(after: .appInfo) {
-                if AppUpdates.shared.isAvailable {
-                    // Standard place: right below "About", own group (HIG).
-                    Button("Nach Updates suchen …") { AppUpdates.shared.checkForUpdates() }
-                        .disabled(!AppUpdates.shared.canCheckForUpdates)
-                    Divider()
-                }
-                Button("Tresor sperren") { model.lock() }
-                    .keyboardShortcut("l", modifiers: [.command, .control])
-                    .disabled(!model.hasOwnVault)
-            }
-            // `Group`: a CommandsBuilder takes at most 10 children (older Xcode in CI).
-            Group {
-                // Hilfe › Mitteilungen …: ellipsis because a window opens.
-                // Replaces the default Help menu ("Help isn't available for …").
-                CommandGroup(replacing: .help) {
-                    Button("GiroCrab-Hilfe") { openWindow(id: "help") }
-                        .keyboardShortcut("?", modifiers: .command)
-                    Divider()
-                    Button("Mitteilungen …") { openWindow(id: "announcements") }
-                    Divider()
-                    // #301: redacted screenshot + scrubbed diagnostics, then a prefilled issue.
-                    // While the report window is open, its "Neu aufnehmen" is
-                    // the way to refresh the picture (markings would be lost).
-                    Button("Problem melden …") { openWindow(id: "bug-report") }
-                        .keyboardShortcut("b", modifiers: [.command, .option])
-                        .disabled(model.isReportOpen)
-                    Divider()
-                    Link("Webseite & Dokumentation (girocrab.de)", destination: HelpLinks.website)
-                    Link("Fehler melden / Issue erstellen (GitHub)", destination: HelpLinks.issues)
-                    Link("Community & Diskussionen (GitHub)", destination: HelpLinks.discussions)
-                }
-                // Bearbeiten › Suchen …: focuses the toolbar search field.
-                CommandGroup(after: .pasteboard) {
-                    Divider()
-                    Button("Suchen …") { ToolbarSearch.focus() }
-                        .keyboardShortcut("f", modifiers: .command)
-                        // not behind the tag sheet: the search field is hidden there
-                        .disabled(!model.isUnlocked || model.showTagManager)
-                }
-            }
+            FileCommands(model: model)
+            BookingCommands(model: model)
+            AppCommands(model: model, openWindow: openWindow)
             SidebarCommands()
             ToolbarCommands()
-            CommandGroup(after: .sidebar) {
-                Button(showInspector ? "Informationen ausblenden" : "Informationen einblenden") { showInspector.toggle() }
-                    .keyboardShortcut("i", modifiers: [.command, .option])
-                    .disabled(!model.isUnlocked)
-                Toggle("Auswertungen anzeigen", isOn: $showStatistics)
-                    .disabled(!model.isUnlocked)
-                Toggle("Budgets anzeigen", isOn: $showBudgets)
-                    .disabled(!model.isUnlocked)
-                Toggle("Saldo anzeigen", isOn: $showRunningBalance)
-                    .disabled(!model.isUnlocked)
-                Toggle("Kopfbereich minimieren", isOn: $compactHeader)
-                    .disabled(!model.isUnlocked)
-                Toggle("Letzten Abruf anzeigen", isOn: $showLastFetch)
-                    .disabled(!model.isUnlocked)
-                // the header chart (#634): same switches as its title row
-                Toggle("Diagramm anzeigen", isOn: Binding(get: { !chartCollapsed }, set: { chartCollapsed = !$0 }))
-                    .disabled(!model.isUnlocked)
-                Picker("Diagramm", selection: $chartStyle) {
-                    ForEach(BalanceChartStyle.allCases) { Text($0.title).tag($0) }
-                }
-                .disabled(!model.isUnlocked)
-                // Hides amounts (or all personal data, Einstellungen › Allgemein).
-                Toggle("Privatmodus", isOn: $privacyMode)
-                    .keyboardShortcut("h", modifiers: [.command, .shift])
-                Divider()
-                // Like Mail/Notes: text size of the whole app (#343).
-                Button("Größer") { textSize = textSize.larger ?? textSize }
-                    .keyboardShortcut("+", modifiers: .command)
-                    .disabled(textSize.larger == nil)
-                Button("Kleiner") { textSize = textSize.smaller ?? textSize }
-                    .keyboardShortcut("-", modifiers: .command)
-                    .disabled(textSize.smaller == nil)
-                Button("Originalgröße") { textSize = .standard }
-                    .keyboardShortcut("0", modifiers: .command)
-                    .disabled(textSize == .standard)
-                Divider()
-                Button("Befehlspalette …") { model.showCommandPalette = true }
-                    .keyboardShortcut("k", modifiers: .command)
-                    .disabled(!model.isUnlocked)
-                Divider()
-                Picker("Konten anzeigen", selection: Binding(get: { model.accountView }, set: { model.accountView = $0 })) {
-                    ForEach(AccountSidebarMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .disabled(!model.isUnlocked)
-                Button("Kontogruppen bearbeiten …") { model.openGroupManager() }
-                    .disabled(!model.isUnlocked)
-                Divider()
-                Button(model.demoActive ? "Eigenen Tresor anzeigen" : "Demo-Daten anzeigen") {
-                    if model.demoActive { model.showOwnVault() } else { model.showDemo() }
-                }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-                .disabled(!model.isUnlocked)
-            }
+            ViewCommands(model: model)
         }
         #endif
 
         #if os(macOS)
+        Window("Regeln", id: RuleEditorWindow.id) {
+            RuleEditorWindow()
+                .environment(model)
+                .appTextSize(textSize.effective)
+                .preferredColorScheme(appearance.colorScheme)
+        }
+        .defaultSize(width: 920, height: 660)
+        .windowResizability(.contentMinSize)
+        .commandsRemoved()
+
         Window("Mitteilungen", id: "announcements") {
             AnnouncementsListView()
                 .appTextSize(textSize.effective)
@@ -289,6 +92,7 @@ public struct GiroCrabScenes: Scene {
         .defaultSize(width: 460, height: 360)
         Window("Abruf-Protokoll", id: "sync-log") {
             SyncLogView()
+                .toastOverlay()
                 .environment(model)
                 .privacyModeEnvironment()
                 .appTextSize(textSize.effective)
@@ -315,6 +119,8 @@ public struct GiroCrabScenes: Scene {
             // (a window of its own, like a sheet) over the main window, so its
             // views get the same redaction and mark personal data.
             SettingsView()
+                // Notices raised here appear here, not behind it in the main window (#1145).
+                .toastOverlay()
                 .environment(model)
                 .privacyModeEnvironment()
                 .appTextSize(textSize.effective)
@@ -389,6 +195,10 @@ public struct GiroCrabRootView: View {
                     .transformEnvironment(\.reportRedaction) { $0.formUnion(model.reportRedaction.union(LaunchOptions.current.redaction)) }
                     .onAppear { StartupClock.mark("MainSplitView appear") }
                     #if os(macOS)
+                    .onChange(of: model.ruleEditorRequest, initial: true) {
+                        guard model.showRuleEditor else { return }
+                        openWindow(id: RuleEditorWindow.id)
+                    }
                     // screenshots: --demo-sheet report[:<sheet>] captures the open
                     // view or demo sheet, as "Problem melden" would; once, also
                     // after a lock/unlock brings this view back
@@ -659,16 +469,22 @@ struct MainSplitView: View {
     @Environment(AppModel.self) private var model
     @AppStorage(EnableBankingKeySync.noticeSuppressedKey) private var enableBankingNoticeSuppressed = false
     @Environment(\.textScale) private var textScale
+    @AppStorage(ViewLayout.inspectorKey) private var showInspector = true
     #if os(macOS)
     @State private var columns: NavigationSplitViewVisibility = .all
-    @AppStorage(ViewLayout.inspectorKey) private var showInspector = true
     @State private var inspectorWidth: CGFloat = InspectorWidth.standard
     @State private var inspectorDragStart: CGFloat?
     @State private var splitterHovered = false
     @State private var splitterCursorPushed = false
     @Environment(\.openSettings) private var openSettings
     #else
-    @State private var columns: NavigationSplitViewVisibility = .automatic
+    /// The sidebar opens on request (toolbar button): next to the detail column
+    /// the booking column needs the width.
+    @State private var columns: NavigationSplitViewVisibility = .detailOnly
+    @Environment(\.horizontalSizeClass) private var hSize
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var span = WindowSpan()
     #endif
 
     private var sidebar: some View {
@@ -680,42 +496,28 @@ struct MainSplitView: View {
 
     private var bookingColumn: some View {
         Group {
-            if model.sidebarSelection == .documents {
-                DocumentsView()
-            } else if model.sidebarSelection == .planned {
-                PlannedPaymentsView()
-            } else if model.sidebarSelection == .directDebits {
-                DirectDebitsView()
-            } else if model.sidebarSelection == .wealth {
-                WealthView()
-            } else {
-                accountColumn
+            switch model.mainColumn {
+            // These views have no search of their own. A field is attached anyway, so the toolbar has the
+            // same items in every view: a customized layout is never applied to a different set.
+            case .documents: DocumentsView()
+            case .planned: PlannedPaymentsView().toolbarSearchPlaceholder()
+            case .directDebits: DirectDebitsView().toolbarSearchPlaceholder()
+            case .subscriptions: SubscriptionsView().toolbarSearchPlaceholder()
+            case .wealth: WealthView().toolbarSearchPlaceholder()
+            case .bookings: AccountColumn()
             }
         }
         #if os(macOS)
+        .background(ToolbarSearchVisibility(hidden: [.planned, .directDebits, .wealth].contains(model.mainColumn)))
         // The customizable toolbar belongs to the column, not to the view in
         // it: its items must stay when Belege replaces the booking list
         // (AppKit crashes on customizable items that come and go).
         .modifier(MainToolbar())
         // Window title for both views here too, so the toolbar keeps the same
         // compact style (and height) when switching to Belege.
-        .modifier(WindowTitle(title: model.title))
+        .modifier(WindowTitle())
         #endif
         .frame(minHeight: 0, maxHeight: .infinity)
-    }
-
-    /// A securities depot and a Sachwerte account each have their own view on the shared holdings frame
-    /// (`AssetAccountFrame`); everything else shows bookings. `.id` keeps no state of another account.
-    @ViewBuilder
-    private var accountColumn: some View {
-        switch model.presentation {
-        case .securities:
-            if let depot = model.selectedSecuritiesDepot { DepotDetailView(account: depot).id(depot.id) }
-        case .tangible:
-            if let account = model.selectedTangibleAccount { TangibleAccountDetailView(account: account).id(account.id) }
-        case .bookings:
-            BookingStreamView()
-        }
     }
 
     #if os(macOS)
@@ -729,9 +531,9 @@ struct MainSplitView: View {
         } detail: {
             HStack(spacing: 0) {
                 bookingColumn
-                // Belege & PostBox has its own preview; the booking inspector would show whatever
-                // booking was selected last, whichever document is open.
-                if showInspector, model.sidebarSelection != .documents {
+                // Belege & Postbox has its own preview and Vermögen no booking list (#1808): the booking
+                // inspector has nothing to show there.
+                if showInspector, model.mainColumn.hasInspector {
                     inspectorSplitter
                     InspectorView()
                         .frame(width: inspectorWidth * textScale)
@@ -742,10 +544,11 @@ struct MainSplitView: View {
             // min widths: 240 (sidebar) + 560 + 280 (inspector) keep the minimum window size.
             // Must not depend on `inspectorWidth`: the split view re-lays out whenever these
             // change, which made the column jump while the splitter was dragged (#828).
-            .macColumnWidth(min: showInspector && model.sidebarSelection != .documents ? 560 + InspectorWidth.minimum * textScale : 560,
-                            ideal: showInspector && model.sidebarSelection != .documents ? 700 + InspectorWidth.standard * textScale : 700)
+            .macColumnWidth(min: showInspector && model.mainColumn.hasInspector ? 560 + InspectorWidth.minimum * textScale : 560,
+                            ideal: showInspector && model.mainColumn.hasInspector ? 700 + InspectorWidth.standard * textScale : 700)
         }
         .navigationSplitViewStyle(.balanced)
+        .sidebarDividerToTop()
     }
 
     /// Draggable grip between the booking column and the inspector; the system
@@ -753,7 +556,7 @@ struct MainSplitView: View {
     private var inspectorSplitter: some View {
         ZStack {
             Color.clear.frame(width: 10)
-            Color(nsColor: .separatorColor).frame(width: 1).frame(maxHeight: .infinity)
+            Theme.systemSeparator.frame(width: 1).frame(maxHeight: .infinity)
         }
         .contentShape(Rectangle())
         .frame(width: 10)
@@ -797,21 +600,150 @@ struct MainSplitView: View {
         }
     }
     #else
+    /// iOS/iPadOS: the booking column is the main area at every width, the
+    /// booking detail sits next to it when the window is wide enough and opens
+    /// as a sheet otherwise. The width decides, not the size class: a
+    /// three-column split shows only its (empty) detail column in a regular
+    /// but narrow window such as an unfolded iPhone Duo held upright, and the
+    /// system `.inspector` shows neither column nor sheet there.
+    @Environment(\.reportRedaction) private var reportRedaction
+
+    /// iPhone sheet title: the merchant, else the booking text like the list row, else
+    /// "Buchung" (an empty name left the title blank).
+    private var bookingSheetTitle: String {
+        guard let b = model.selectedBooking else { return String(localized: "Buchung") }
+        let name = b.merchant.name.isEmpty ? b.bookingText : b.merchant.name
+        return name.isEmpty ? String(localized: "Buchung") : name
+    }
+
     private var splitView: some View {
-        NavigationSplitView(columnVisibility: $columns) {
-            sidebar
-        } content: {
-            bookingColumn
-        } detail: {
-            if model.sidebarSelection == .documents {
-                // the documents view has its own preview
-                Color.clear
-            } else {
+        HStack(spacing: 0) {
+            NavigationSplitView(columnVisibility: $columns) {
+                sidebar
+            } detail: {
+                bookingColumn
+                    .toolbar {
+                        // Only where the column has room: in a narrower window the
+                        // detail is a sheet anyway and the switch would do nothing.
+                        if inspectorFits {
+                            ToolbarItem(placement: .primaryAction) { inspectorToggle }
+                        }
+                    }
+            }
+            .navigationSplitViewStyle(.balanced)
+            if inspectorShown {
+                Divider().ignoresSafeArea()
                 InspectorView()
+                    .frame(width: inspectorWidth)
                     .frame(minHeight: 0, maxHeight: .infinity)
+                    .background(Theme.systemBackground.ignoresSafeArea())
             }
         }
-        .navigationSplitViewStyle(.balanced)
+        .onGeometryChange(for: WindowSpan.self) {
+            WindowSpan(width: $0.size.width, leading: $0.safeAreaInsets.leading, trailing: $0.safeAreaInsets.trailing)
+        } action: { span = $0 }
+        .capturableSheet(isPresented: Binding(
+            get: { !inspectorShown && model.showBookingSheet && hasDetailSelection },
+            // Only a dismissal by the user ends it: when the window gets wide
+            // enough the sheet gives way to the column and returns with the
+            // same booking once the window is narrow again.
+            set: { if !$0, !inspectorShown { model.showBookingSheet = false } }
+        )) {
+            // Title + "Fertig" (UI-Audit INS-3); the merchant is personal, so the
+            // title is masked in the bug report (a parameter text, no `.sensitive()`).
+            NavigationStack {
+                InspectorView()
+                    .navigationTitle(reportRedaction.masking(bookingSheetTitle))
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Fertig") { model.showBookingSheet = false }
+                        }
+                    }
+            }
+            // The presentation can retain the dark launch appearance while
+            // the booking list has already switched to its effective scheme.
+            .preferredColorScheme(colorScheme)
+            .presentationDetents(dynamicTypeSize.isAccessibilitySize ? [.large] : [.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+        // Unfolding or widening the window (compact → regular) would otherwise
+        // bring the sidebar back as an overlay on top of the booking column.
+        .onChange(of: hSize) { _, new in
+            if new == .regular { columns = .detailOnly }
+        }
+        // Turning an iPad upright keeps a sidebar that was open as a column of its own,
+        // which leaves the booking column too little room next to the detail column.
+        .onChange(of: span.full < 1000) { _, narrow in
+            if narrow { columns = .detailOnly }
+        }
+        // In such a window the open sidebar takes its width from the main column (the
+        // documents view no longer fits beside it), so choosing an entry closes it again,
+        // as the push to the detail does on an iPhone.
+        .background(SidebarSelectionWatcher {
+            if span.full < 1000 { columns = .detailOnly }
+        })
+    }
+
+    /// Room for the booking column (about a phone's width) next to the detail
+    /// column. The documents view has its own preview, and „Vermögen“ has nothing to
+    /// select: the column would show the booking picked last in another list.
+    private var inspectorFits: Bool {
+        model.mainColumn != .documents && model.mainColumn != .wealth && span.full >= 760 * textScale
+    }
+
+    /// The detail column is on screen: there is room for it and the user has not
+    /// hidden it. Hidden, the detail opens as a sheet like in a narrow window (#1746).
+    private var inspectorShown: Bool { showInspector && inspectorFits }
+
+    /// Hides or shows the detail column; the choice is kept like on the Mac
+    /// (`ViewLayout.inspectorKey`, the same switch as „Informationen ausblenden“ there).
+    private var inspectorToggle: some View {
+        Button {
+            // A booking tapped while the column was showing asked for no sheet:
+            // hiding the column must not open one for it.
+            if showInspector { model.showBookingSheet = false }
+            showInspector.toggle()
+        } label: {
+            Label(showInspector ? "Informationen ausblenden" : "Informationen einblenden", systemImage: "sidebar.trailing")
+        }
+    }
+
+    /// The list in the booking column has a selection the detail sheet can show.
+    private var hasDetailSelection: Bool {
+        switch model.mainColumn {
+        case .bookings: model.selectedBookingID != nil
+        case .planned: model.selectedPlannedID != nil
+        case .directDebits: model.selectedMandateID != nil
+        case .subscriptions: model.selectedSubscriptionID != nil
+        case .documents, .wealth: false
+        }
+    }
+
+    /// Up to about 1000 pt the two columns meet on the centre line of the window,
+    /// which is the fold of an open iPhone Duo; wider windows give the list more.
+    private var inspectorWidth: CGFloat {
+        if span.full < 1000 { return span.width - (span.full / 2 - span.leading) }
+        return min(max(span.width * 0.4, 320 * textScale), 440 * textScale)
+    }
+
+    /// Reports a new sidebar selection without making the split view read it: a body that
+    /// depends on the selection re-lays out every column on each change (`AppModel.mainColumn`).
+    private struct SidebarSelectionWatcher: View {
+        @Environment(AppModel.self) private var model
+        let changed: () -> Void
+
+        var body: some View {
+            Color.clear.onChange(of: model.sidebarSelection) { changed() }
+        }
+    }
+
+    /// Width inside the safe area plus the horizontal insets around it.
+    private struct WindowSpan: Equatable {
+        var width: CGFloat = 0
+        var leading: CGFloat = 0
+        var trailing: CGFloat = 0
+        var full: CGFloat { width + leading + trailing }
     }
     #endif
 
@@ -846,10 +778,12 @@ struct MainSplitView: View {
                 .environment(model)
         }
         #endif
+        #if os(iOS)
         .capturableSheet(isPresented: $model.showRuleEditor) {
-            RuleEditorView(initialDraft: model.ruleDraft)
+            RuleEditorView()
                 .environment(model)
         }
+        #endif
         .capturableSheet(isPresented: $model.showCommandPalette, onDismiss: {
             // Follow-up sheet/popover chosen in the palette: opened once the
             // palette is really gone, instead of after a guessed delay.
@@ -907,7 +841,12 @@ struct MainSplitView: View {
                 .interactiveDismissDisabled(model.transferBusy)
         }
         .capturableSheet(isPresented: Binding(get: { model.splitBooking != nil }, set: { if !$0 { model.splitBooking = nil } })) {
-            if let b = model.splitBooking { SplitSheet(booking: b).environment(model) }
+            if let b = model.splitBooking { SplitSheet(booking: b, presetPercent: model.splitPresetPercent).environment(model) }
+        }
+        .capturableSheet(isPresented: Binding(get: { model.refundPickerBooking != nil }, set: { if !$0 { model.refundPickerBooking = nil } })) {
+            if let booking = model.refundPickerBooking {
+                RefundPickerSheet(booking: booking).environment(model).id("\(model.vaultRevision)|\(booking.id)")
+            }
         }
         .capturableSheet(item: $model.payeeCheck) { _ in
             PayeeCheckSheet()
@@ -926,6 +865,11 @@ struct MainSplitView: View {
                 else if c.connector == .fnz { FnzWebSheet(connection: c) }
                 else if c.connector == .equatePlus { EquatePlusWebSheet(connection: c) }
                 else if c.connector == .quirion { QuirionWebSheet(connection: c) }
+                else if c.connector == .sharinbox { SharinboxWebSheet(connection: c) }
+                else if c.connector == .axaShareplan { AxaShareplanWebSheet(connection: c) }
+                else if c.connector == .unionInvestment { UnionInvestmentWebSheet(connection: c) }
+                else if c.connector == .airPlus { AirPlusWebSheet(connection: c) }
+                else if c.connector == .berghausCie { BerghausCieWebSheet(connection: c) }
                 else if c.connector == .schwaebischHall { SchwaebischHallWebSheet(connection: c) }
                 else { PortalWebSheet(connection: c) }
             }
@@ -961,12 +905,16 @@ struct MainSplitView: View {
         .alert(model.errorTitle ?? String(localized: "Etwas ist schiefgelaufen"),
                isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             if let retry = model.errorRetry {
-                Button("Erneut versuchen") { model.errorMessage = nil; retry() }
+                Button("Erneut versuchen") { model.errorOnClose = nil; model.errorMessage = nil; retry() }
             }
             ForEach(Array(model.errorAlternatives.enumerated()), id: \.offset) { _, alt in
-                Button(alt.title) { model.errorMessage = nil; alt.action() }
+                Button(alt.title) { model.errorOnClose = nil; model.errorMessage = nil; alt.action() }
             }
-            Button("OK", role: .cancel) { model.errorMessage = nil }
+            if let close = model.errorCloseTitle {
+                Button(close, role: .cancel) { model.errorMessage = nil }
+            } else {
+                Button("OK", role: .cancel) { model.errorMessage = nil }
+            }
         } message: {
             Text(model.errorMessage ?? "")
         }
@@ -992,24 +940,38 @@ struct MainSplitView: View {
                 }
                 .dialogSuppressionToggle(isSuppressed: $enableBankingNoticeSuppressed)
         }
-        .overlay(alignment: .bottom) {
-            if let toast = model.toast {
-                Label(toast, systemImage: "checkmark.circle.fill")
-                    .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(.regularMaterial, in: Capsule())
-                    .shadow(color: .black.opacity(0.08), radius: 8, y: 2)
-                    .padding(.bottom, 22)
-                    .transition(Motion.slide(.bottom))
-                    // id: a changed or extended notice gets its full time again
-                    .task(id: toast) {
-                        try? await Task.sleep(nanoseconds: 3_500_000_000)
-                        // replaced meanwhile: the new notice's own task takes over
-                        guard !Task.isCancelled else { return }
-                        withAnimation { model.toast = nil }
-                    }
-            }
+        .background {
+            Color.clear
+                .alert("Enable-Banking-Anwendung synchronisiert",
+                       // after the default application's notice, never on top of it
+                       isPresented: Binding(get: { model.enableBankingLoginNotice != nil && model.enableBankingAdoptNotice == nil },
+                                            set: { if !$0 { model.enableBankingLoginNotice = nil } }),
+                       presenting: model.enableBankingLoginNotice) { _ in
+                    Button("OK") {}
+                } message: { notice in
+                    Text(notice.message)
+                }
+                .dialogSuppressionToggle(isSuppressed: $enableBankingNoticeSuppressed)
         }
-        .animation(Motion.animation(.spring(duration: 0.3)), value: model.toast)
+        .toastOverlay()
+    }
+}
+
+/// A securities depot and a Sachwerte account each have their own view on the shared holdings frame
+/// (`AssetAccountFrame`); everything else shows bookings. `.id` keeps no state of another account.
+/// A view of its own so that only it follows the selected account, not the whole split view.
+private struct AccountColumn: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        switch model.presentation {
+        case .securities:
+            if let depot = model.selectedSecuritiesDepot { DepotDetailView(account: depot).id(depot.id) }
+        case .tangible:
+            if let account = model.selectedTangibleAccount { TangibleAccountDetailView(account: account).id(account.id) }
+        case .bookings:
+            BookingStreamView()
+        }
     }
 }
 
@@ -1058,13 +1020,80 @@ struct MacHeroIcon: View {
 #if os(macOS)
 import AppKit
 
+/// A search field for the views of the booking column that have none (Vermögen, Geplant, Lastschriften), so
+/// the toolbar has the same items in every view. Without it the search item comes and goes with the view,
+/// AppKit re-applies a customized layout to a changed set: items jump, and some layouts crash SwiftUI
+/// (`applyItemCustomizations`, #1832). The item is hidden (`ToolbarSearchVisibility`), not removed: a hidden
+/// `NSToolbarItem` stays in `toolbar.items`. macOS 14 cannot hide it and disables the field instead.
+struct ToolbarSearchPlaceholder: ViewModifier {
+    @State private var text = ""
+
+    func body(content: Content) -> some View {
+        content.searchable(text: $text, placement: .toolbar, prompt: "")
+    }
+}
+
+/// Hides (macOS 15+) or disables (macOS 14) the toolbar's search item of the window that hosts the view. The item is not
+/// re-created when the view in the column changes (`NSToolbar.willAddItemNotification` is not sent for it
+/// after launch), so applying the state when it changes and when the view gets its window is enough.
+struct ToolbarSearchVisibility: NSViewRepresentable {
+    let hidden: Bool
+
+    func makeNSView(context: Context) -> SearchVisibilityView { SearchVisibilityView() }
+
+    func updateNSView(_ view: SearchVisibilityView, context: Context) { view.hidesSearch = hidden }
+
+    final class SearchVisibilityView: NSView {
+        var hidesSearch = false { didSet { apply() } }
+        private var enabledObservation: NSKeyValueObservation?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+        }
+
+        private func apply() {
+            let items = window?.toolbar?.items.compactMap { $0 as? NSSearchToolbarItem } ?? []
+            items.forEach { ToolbarSearch.setUnavailable(hidesSearch, $0) }
+            // macOS 14: SwiftUI re-enables the field on its own (e.g. after the Privatmodus toggle): disable it again
+            enabledObservation = ToolbarSearch.canHideItems ? nil : items.first.flatMap { item in
+                item.searchField.observe(\.isEnabled) { [weak self, weak item] _, _ in
+                    MainActor.assumeIsolated { if let self, let item { ToolbarSearch.setUnavailable(self.hidesSearch, item) } }
+                }
+            }
+        }
+    }
+}
+
 /// Bearbeiten › Suchen … (⌘F): puts the cursor into the window's toolbar search
 /// field (`.searchable(placement: .toolbar)`; `searchFocused` needs macOS 15).
 enum ToolbarSearch {
+    /// macOS 15+ can hide a toolbar item; macOS 14 cannot, so its search field is disabled instead.
+    nonisolated static var canHideItems: Bool {
+        if #available(macOS 15, *) { return true }
+        return false
+    }
+
+    @MainActor
+    static func setUnavailable(_ unavailable: Bool, _ item: NSSearchToolbarItem) {
+        if canHideItems {
+            if #available(macOS 15, *), item.isHidden != unavailable { item.isHidden = unavailable }
+        } else if item.searchField.isEnabled == unavailable {
+            item.searchField.isEnabled = !unavailable // the item is reused by views with search: re-enable it too
+        }
+    }
+
+    @MainActor
+    private static func isUnavailable(_ item: NSSearchToolbarItem) -> Bool {
+        if #available(macOS 15, *), canHideItems { return item.isHidden }
+        return !item.searchField.isEnabled
+    }
+
     @MainActor
     static func focus() {
         let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first { $0.toolbar != nil }
-        guard let window, let item = window.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first else {
+        // A hidden or disabled item (a view without search, #1832) takes no focus: ⌘F does nothing there.
+        guard let window, let item = window.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first(where: { !isUnavailable($0) }) else {
             FileHandle.standardError.write("ToolbarSearch: no search field\n".data(using: .utf8)!)
             return
         }
@@ -1072,3 +1101,14 @@ enum ToolbarSearch {
     }
 }
 #endif
+
+extension View {
+    /// macOS only: see `ToolbarSearchPlaceholder`; iOS has no customizable toolbar.
+    func toolbarSearchPlaceholder() -> some View {
+        #if os(macOS)
+        modifier(ToolbarSearchPlaceholder())
+        #else
+        self
+        #endif
+    }
+}

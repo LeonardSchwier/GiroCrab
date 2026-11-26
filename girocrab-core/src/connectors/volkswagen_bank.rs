@@ -30,18 +30,20 @@
 //! a stable bank id leave `external_id` empty so `store_fetch` derives a
 //! content id.
 use async_trait::async_trait;
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Utc, Weekday};
-use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, REFERER};
-use serde_json::{json, Value};
+use jiff::civil::{Date, DateTime, Weekday};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, ORIGIN, REFERER};
+use serde_json::{Value, json};
 
 use super::{
-    http_client_same_host, BankConnector, Challenge, ChallengeKind, ChallengeResponse,
-    ConnectContext, FetchResult, Phase, RemoteAccount, RemoteTransaction,
+    BankConnector, Challenge, ChallengeKind, ChallengeResponse, ConnectContext, FetchResult, Phase,
+    RemoteAccount, RemoteTransaction, http_client_same_host,
 };
 use crate::{
     error::{CoreError, CoreResult},
     i18n::{tr, trf},
     models::AccountKind,
+    money,
+    secret::SecretJson,
 };
 
 const BASE: &str = "https://banking.volkswagenbank.de";
@@ -73,7 +75,7 @@ pub(crate) trait Portal: Send {
         &mut self,
         user: &str,
         password: &str,
-        state: &serde_json::Value,
+        state: &SecretJson,
     ) -> CoreResult<LoginStep>;
     /// Ask whether the pushTAN was approved.
     async fn poll_push(&mut self) -> CoreResult<LoginStep>;
@@ -117,6 +119,26 @@ struct HttpPortal {
 }
 
 impl HttpPortal {
+    /// The booking list of account `number` from `from` (YYYY-MM-DD) to `today`.
+    async fn cash_flow(&mut self, number: &str, from: &str, today: Date) -> CoreResult<Value> {
+        let body = json!({
+            "accountNumber": number,
+            "dateFrom": format!("{from}Z"),
+            "dateTo": format!("{today}Z"),
+        });
+        let (flow, _) = self
+            .call(true, "CashFlowService/cashflow/list/get", Some(body), None)
+            .await?;
+        // the portal's own refusal (#1043); a missing status is a broken answer
+        match text(&flow, "Status") {
+            "Success" | "" => Ok(flow),
+            status => Err(CoreError::Bank {
+                code: status.to_string(),
+                message: bad_response().to_string(),
+            }),
+        }
+    }
+
     fn client(&mut self) -> CoreResult<reqwest::Client> {
         if self.client.is_none() {
             self.client = Some(http_client_same_host()?);
@@ -212,7 +234,7 @@ impl Portal for HttpPortal {
         &mut self,
         user: &str,
         password: &str,
-        _state: &serde_json::Value,
+        _state: &SecretJson,
     ) -> CoreResult<LoginStep> {
         self.token = None;
         self.request_key = None;
@@ -303,24 +325,21 @@ impl Portal for HttpPortal {
         let mut out = FetchResult::default();
         for account in accounts {
             if account.cash_flow {
-                let from = ctx
-                    .since_by_account
-                    .get(&account.remote.external_ref)
-                    .unwrap_or(&ctx.since);
-                let (flow, _) = self
-                    .call(
-                        true,
-                        "CashFlowService/cashflow/list/get",
-                        Some(json!({
-                            "accountNumber": account.remote.account_number,
-                            "dateFrom": format!("{from}Z"),
-                            "dateTo": format!("{today}Z"),
-                        })),
-                        None,
-                    )
-                    .await?;
-                out.transactions
-                    .extend(parse_cashflow(&flow, &account.remote.external_ref)?);
+                let account_ref = &account.remote.external_ref;
+                let number = &account.remote.account_number;
+                let from = ctx.since_for(account_ref);
+                let flow = match self.cash_flow(number, from, today).await {
+                    Ok(flow) => flow,
+                    // the bank refused the start date (#1043): once more with 90 days
+                    Err(e) => {
+                        let from = super::history::retry_since(from, ctx.full_fetch, e)?;
+                        let flow = self.cash_flow(number, &from, today).await?;
+                        out.warnings
+                            .push(super::history::refused_warning(account_ref, &from));
+                        flow
+                    }
+                };
+                out.transactions.extend(parse_cashflow(&flow, account_ref)?);
             }
             out.accounts.push(account.remote);
         }
@@ -350,7 +369,7 @@ fn account_kind(category: &str) -> AccountKind {
 
 /// `AccountListService/accountlist` → accounts. Any missing field fails the
 /// whole call so a changed portal never imports half a picture.
-fn parse_accounts(v: &Value, today: NaiveDate) -> CoreResult<Vec<PortalAccount>> {
+fn parse_accounts(v: &Value, today: Date) -> CoreResult<Vec<PortalAccount>> {
     let list = v
         .get("Accounts")
         .and_then(Value::as_array)
@@ -362,7 +381,9 @@ fn parse_accounts(v: &Value, today: NaiveDate) -> CoreResult<Vec<PortalAccount>>
         if number.is_empty() {
             return Err(bad_response());
         }
-        let balance_cents = parse_cents(text(a, "Balance")).ok_or_else(bad_response)?;
+        let balance_cents = money::decimal(text(a, "Balance"), '.')
+            .and_then(money::cents)
+            .ok_or_else(bad_response)?;
         let owner = a
             .get("Owners")
             .and_then(Value::as_array)
@@ -456,53 +477,26 @@ fn parse_cashflow(v: &Value, account_ref: &str) -> CoreResult<Vec<RemoteTransact
     Ok(out)
 }
 
-/// `"71.01"` → 7101. Plain decimal with a dot, optional minus sign.
-fn parse_cents(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (negative, rest) = match s.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, s),
-    };
-    let (int, frac) = rest.split_once('.').unwrap_or((rest, ""));
-    if int.is_empty()
-        || frac.len() > 2
-        || !int.bytes().all(|b| b.is_ascii_digit())
-        || !frac.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let int: i64 = int.parse().ok()?;
-    let frac_cents: i64 = match frac.len() {
-        0 => 0,
-        1 => frac.parse::<i64>().ok()? * 10,
-        _ => frac.parse::<i64>().ok()?,
-    };
-    let cents = int.checked_mul(100)?.checked_add(frac_cents)?;
-    Some(if negative { -cents } else { cents })
-}
-
 /// The booking list leaves the unused side of credit/debit empty.
 fn amount_or_zero(s: &str) -> Option<i64> {
     if s.trim().is_empty() {
         Some(0)
     } else {
-        parse_cents(s)
+        money::decimal(s, '.').and_then(money::cents)
     }
 }
 
-fn last_sunday(year: i32, month: u32) -> Option<NaiveDate> {
-    let mut d = NaiveDate::from_ymd_opt(year, month + 1, 1)?.pred_opt()?;
-    while d.weekday() != Weekday::Sun {
-        d = d.pred_opt()?;
-    }
-    Some(d)
+fn last_sunday(year: i32, month: u32) -> Option<Date> {
+    crate::dates::ymd(year, month, 1)?
+        .nth_weekday_of_month(-1, Weekday::Sunday)
+        .ok()
 }
 
 /// Hours Berlin is ahead of UTC: +2 from the last Sunday of March 01:00 UTC to
 /// the last Sunday of October 01:00 UTC, otherwise +1.
-fn berlin_offset_hours(utc: NaiveDateTime) -> i64 {
-    let start = last_sunday(utc.year(), 3).and_then(|d| d.and_hms_opt(1, 0, 0));
-    let end = last_sunday(utc.year(), 10).and_then(|d| d.and_hms_opt(1, 0, 0));
+fn berlin_offset_hours(utc: DateTime) -> i64 {
+    let start = last_sunday(utc.year().into(), 3).map(|d| d.at(1, 0, 0, 0));
+    let end = last_sunday(utc.year().into(), 10).map(|d| d.at(1, 0, 0, 0));
     match (start, end) {
         (Some(s), Some(e)) if utc >= s && utc < e => 2,
         _ => 1,
@@ -512,14 +506,16 @@ fn berlin_offset_hours(utc: NaiveDateTime) -> i64 {
 /// Portal timestamps are UTC (`2026-10-22T22:00:00.0000000Z`) but mark a
 /// Berlin calendar day (that one is 23 October), so convert before cutting
 /// off the time.
-fn portal_date(s: &str) -> Option<NaiveDate> {
-    let utc = NaiveDateTime::parse_from_str(s.get(..19)?, "%Y-%m-%dT%H:%M:%S").ok()?;
-    Some((utc + Duration::hours(berlin_offset_hours(utc))).date())
+fn portal_date(s: &str) -> Option<Date> {
+    let utc = jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", s.get(..19)?).ok()?;
+    // Portals write 9999-12-31T23:00:00Z for "no date": checked, it is past jiff's range.
+    let berlin = utc.checked_add(jiff::Span::new().hours(berlin_offset_hours(utc)));
+    Some(berlin.ok()?.date())
 }
 
-fn berlin_today() -> NaiveDate {
-    let now = Utc::now().naive_utc();
-    (now + Duration::hours(berlin_offset_hours(now))).date()
+fn berlin_today() -> Date {
+    let now = crate::dates::now_utc();
+    (now + jiff::Span::new().hours(berlin_offset_hours(now))).date()
 }
 
 fn photo_tan_challenge(image: Vec<u8>) -> Challenge {
@@ -640,7 +636,7 @@ impl BankConnector for VolkswagenBankConnector {
             _ => {
                 return Err(CoreError::InvalidInput {
                     message: tr("Volkswagen Bank: Unerwartete Antwort auf die TAN-Abfrage.").into(),
-                })
+                });
             }
         };
         Ok(self.advance(step))
@@ -692,7 +688,7 @@ mod tests {
             &mut self,
             _user: &str,
             _password: &str,
-            _state: &serde_json::Value,
+            _state: &SecretJson,
         ) -> CoreResult<LoginStep> {
             self.next()
         }
@@ -721,10 +717,8 @@ mod tests {
             connection_id: 1,
             login_name: user.into(),
             secret: SecretString::new(password.into()),
-            settings: Default::default(),
-            state: serde_json::Value::Null,
             since: "2026-01-01".into(),
-            since_by_account: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -842,18 +836,13 @@ mod tests {
 
     #[test]
     fn decimal_strings_become_cents() {
-        assert_eq!(parse_cents("71.01"), Some(7101));
-        assert_eq!(parse_cents("80000.00"), Some(8_000_000));
-        assert_eq!(parse_cents("5.6"), Some(560));
-        assert_eq!(parse_cents("-0.31"), Some(-31));
-        assert_eq!(parse_cents("7"), Some(700));
-        for bad in ["", "-", "1,00", "1.005", "abc", ".5", "1.0.0"] {
-            assert_eq!(parse_cents(bad), None, "{bad:?}");
-        }
+        assert_eq!(amount_or_zero("71.01"), Some(7101));
+        assert_eq!(amount_or_zero("-0.31"), Some(-31));
         assert_eq!(amount_or_zero(""), Some(0));
         assert_eq!(amount_or_zero(" "), Some(0));
-        assert_eq!(amount_or_zero("5.66"), Some(566));
-        assert_eq!(amount_or_zero("x"), None);
+        for bad in ["x", "1,00", "1.005"] {
+            assert_eq!(amount_or_zero(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -908,7 +897,7 @@ mod tests {
 
     #[test]
     fn account_list_is_parsed_strictly() {
-        let today = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let today = jiff::civil::date(2026, 11, 16);
         let v = json!({"Accounts": [
             {"AccountNumber": "123", "Iban": "DE00123", "Balance": "71.01",
              "ProductName": "Plus Konto online", "Currency": "EUR",

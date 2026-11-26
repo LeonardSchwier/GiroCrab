@@ -13,7 +13,7 @@ enum SidebarItem: Hashable {
     case account(Int64)
     case category(Int64)
     case uncategorized
-    /// "Belege & PostBox"
+    /// "Belege & Postbox"
     case documents
     /// „Neue Umsätze“ (GitHub #352): unreviewed bookings of all accounts.
     case newBookings
@@ -21,8 +21,56 @@ enum SidebarItem: Hashable {
     case planned
     /// „Lastschriften“ (GitHub #143): mandates and collections.
     case directDebits
+    /// „Abos“ (GitHub #1787): marked recurring expenses with a monthly total.
+    case subscriptions
     /// "Vermögen": cash and assets (depots) minus liabilities
     case wealth
+
+    /// Whether this selection is an overall money context (#337): its KPI sums
+    /// follow the effective total set (account switch, group, archiving). The
+    /// booking list never narrows — a total context is not a proof context. A
+    /// single account, a category and every proof view keep their sums.
+    var usesTotalsContext: Bool {
+        switch self {
+        case .allAccounts, .group, .bank, .userGroup: true
+        case .account, .category, .uncategorized, .documents, .newBookings, .planned, .directDebits, .subscriptions, .wealth:
+            false
+        }
+    }
+}
+
+/// What the main window's booking column shows for a sidebar selection
+/// (`AppModel.mainColumn`). Accounts, groups and categories all show bookings
+/// (or a depot / Sachwerte view, decided by `AccountColumn`).
+enum MainColumn: Equatable {
+    case bookings, documents, planned, directDebits, subscriptions, wealth
+
+    /// The right column: Belege & Postbox has its own preview, Vermögen no booking list.
+    var hasInspector: Bool { self != .documents && self != .wealth }
+
+    init(_ item: SidebarItem?) {
+        switch item {
+        case .documents?: self = .documents
+        case .planned?: self = .planned
+        case .directDebits?: self = .directDebits
+        case .subscriptions?: self = .subscriptions
+        case .wealth?: self = .wealth
+        default: self = .bookings
+        }
+    }
+}
+
+/// Whether one sidebar row is the selected one (`AppModel.sidebarRowSelection(for:)`). A row
+/// that compared `sidebarSelection` itself re-ran on every click, and every sidebar row has a
+/// hosting view of its own; with one flag per row only the old and the new selection re-run.
+@MainActor
+@Observable
+final class SidebarRowSelection {
+    var isSelected: Bool
+
+    init(isSelected: Bool) {
+        self.isSelected = isSelected
+    }
 }
 
 /// Document origin is independent of its booking link. Bank connectors and
@@ -34,12 +82,12 @@ enum DocumentsScope: String, CaseIterable, Identifiable {
         switch self {
         case .all: return String(localized: "Alle Dokumente")
         case .receipts: return String(localized: "Belege")
-        case .postbox: return String(localized: "PostBox")
+        case .postbox: return String(localized: "Postbox")
         }
     }
 
     var heading: String {
-        self == .all ? String(localized: "Belege & PostBox") : title
+        self == .all ? String(localized: "Belege & Postbox") : title
     }
 
     var description: String {
@@ -68,7 +116,7 @@ extension DocumentInfo {
         !sourceUrl.isEmpty && !sourceUrl.hasPrefix("demo-doc-")
     }
     var originTitle: String {
-        isBankDocument ? String(localized: "PostBox") : String(localized: "Beleg")
+        isBankDocument ? String(localized: "Postbox") : String(localized: "Beleg")
     }
 }
 
@@ -146,19 +194,56 @@ enum Period: Hashable, Identifiable {
             return (DateText.iso(start), DateText.iso(end))
         }
         switch self {
-        // `.custom` dates live in `AppModel.periodRange`.
+        // `.custom` dates live in `PeriodSetting.range`.
         case .all, .custom: return (nil, nil)
         case .days(let n): return (DateText.iso(cal.date(byAdding: .day, value: -(n - 1), to: today)!), nil)
         case .months12:
             let start = cal.date(byAdding: DateComponents(year: -1, day: 1), to: today)!
             return (DateText.iso(start), nil)
-        // The salary start date lives in `AppModel.periodRange`; calendar month as fallback.
+        // The salary start date lives in `PeriodSetting.range`; calendar month as fallback.
         case .sinceSalary:
             return (DateText.iso(cal.date(from: cal.dateComponents([.year, .month], from: now))!), nil)
         case .month(let y, let m): return span(y, m, 1)
         case .quarter(let y, let q): return span(y, (q - 1) * 3 + 1, 3)
         case .year(let y): return span(y, 1, 12)
         }
+    }
+}
+
+/// What the sidebar category sums were loaded for (#1413): period range and `categorySumFilter`.
+struct CategorySumsRequest: Equatable {
+    let from: String?
+    let to: String?
+    let accounts: [Int64]
+    let checked: Bool?
+    let direction: BookingDirection
+    let amount: AmountFilter
+}
+
+/// A period with the dates of `.custom` (#1413): what `AppModel.shownPeriod` holds.
+struct PeriodSetting: Equatable {
+    let period: Period
+    /// Start/end of `.custom` (ISO, inclusive); `nil` for every other period.
+    let customFrom: String?
+    let customTo: String?
+
+    init(_ period: Period, customFrom: String? = nil, customTo: String? = nil) {
+        self.period = period
+        self.customFrom = period == .custom ? customFrom : nil
+        self.customTo = period == .custom ? customTo : nil
+    }
+
+    /// ISO start/end (inclusive, `nil` = open); `.sinceSalary` starts at the cycle's salary.
+    func range(salaryCycle: SalaryCycle?) -> (String?, String?) {
+        if period == .sinceSalary, let c = salaryCycle { return (c.lastDate, nil) }
+        if period == .custom { return (customFrom, customTo) }
+        return period.range
+    }
+
+    /// The preset name or "15.03.2025 – 30.06.2025".
+    var title: String {
+        guard let customFrom, let customTo else { return period.title }
+        return "\(DateText.medium(customFrom)) – \(DateText.medium(customTo))"
     }
 }
 
@@ -267,6 +352,9 @@ struct MerchantFocusReturn {
     let direction: BookingDirection
     let search: String
     let tags: BookingTagFilter
+    /// Set when the list was switched to all periods for the merchant list (a subscription's bookings).
+    var period: Period?
+    var amount: AmountFilter?
 }
 
 /// Tag filter of the booking list (#228): bookings carrying every tag in `tagIDs`,
@@ -318,33 +406,56 @@ struct DayGroup: Identifiable {
 /// booking row. The list is flat, so its estimated height is based on rows of
 /// nearly equal height instead of day cards of 1 to 30 bookings – the scroll
 /// bar no longer jumps whenever a long or short day is built.
+///
+/// Its identity is its position, the nth header or the nth row, not the day or the booking:
+/// a new list (another category, period or filter) then updates the elements on screen in
+/// place instead of tearing them down and building new ones, which made up most of a
+/// selection change's main-thread time. Scroll targets go through `StreamSlots`.
+/// Consequence for every view inside a stream element: `@State` that belongs to one booking or
+/// day must be reset when that changes (`onChange(of: booking.id)`), or it shows on the next one
+/// (see `DayCardRow`, `BookingRow`, `MerchantSignet`, `StreamDayTracker`).
 enum StreamItem: Identifiable {
-    case header(DayGroup)
-    case row(Booking, isLast: Bool)
+    case header(DayGroup, ordinal: Int)
+    case row(Booking, isLast: Bool, ordinal: Int)
 
-    enum Key: Hashable {
-        case day(String)
-        case booking(Booking.ID)
-    }
-
-    var id: Key {
+    var id: StreamSlot {
         switch self {
-        case .header(let day): .day(day.id)
-        case .row(let b, _): .booking(b.id)
+        case .header(_, let n): .header(n)
+        case .row(_, _, let n): .row(n)
         }
     }
 
-    static func flatten(_ days: [DayGroup]) -> [StreamItem] {
+    static func flatten(_ days: [DayGroup]) -> (items: [StreamItem], slots: StreamSlots) {
         var out: [StreamItem] = []
+        var slots = StreamSlots()
         out.reserveCapacity(days.reduce(days.count) { $0 + $1.bookings.count })
-        for day in days {
-            out.append(.header(day))
+        var row = 0
+        for (h, day) in days.enumerated() {
+            out.append(.header(day, ordinal: h))
+            slots.day[day.date] = .header(h)
             for (i, b) in day.bookings.enumerated() {
-                out.append(.row(b, isLast: i == day.bookings.count - 1))
+                out.append(.row(b, isLast: i == day.bookings.count - 1, ordinal: row))
+                slots.booking[b.id] = .row(row)
+                row += 1
             }
         }
-        return out
+        return (out, slots)
     }
+}
+
+/// Identity of a booking stream element: the nth day header or the nth booking row.
+enum StreamSlot: Hashable {
+    case header(Int)
+    case row(Int)
+    /// A row of „Neue Umsätze“. A type of its own: a bare booking id could be the id of an
+    /// account's card there.
+    case newBooking(Booking.ID)
+}
+
+/// Where a day's header and each booking sit in the stream: `ScrollViewProxy` targets.
+struct StreamSlots {
+    var day: [String: StreamSlot] = [:]
+    var booking: [Booking.ID: StreamSlot] = [:]
 }
 
 struct ActiveChallenge: Identifiable {
@@ -354,6 +465,15 @@ struct ActiveChallenge: Identifiable {
     var waiting: Bool
     var busy: Bool = false
     var error: String?
+    /// The TAN is for one order of the fetch (balance, bookings …), not the login:
+    /// "TAN auslassen" leaves that order out and the rest is stored (#1730).
+    var canSkipOrder = false
+    /// A poll of this question is in flight (fetch only): core may move on to the next order,
+    /// so "TAN auslassen" would hit that one and not the one on screen (#1826 review).
+    var polling = false
+    /// The TAN of a transfer order that was sent (not its login SCA, not a sync's challenge):
+    /// only then does the sheet show the order comparison (#949).
+    var orderApproval = false
 }
 
 /// Missing FinTS product ID / API keys for a bank: shown as a setup form.
@@ -363,7 +483,18 @@ struct SetupRequest: Identifiable {
     let keys: [String]
 }
 
-/// Form state of "Neue Überweisung" (kept while the TAN sheet is shown).
+/// How far a sync that reads a long history got (the rest comes with the next syncs).
+struct HistoryProgress: Equatable {
+    var remaining: Int
+    var total: Int
+    /// 0…1 of the timeline already read; 0 when the total is unknown.
+    var fraction: Double { total > 0 ? min(1, max(0, Double(total - remaining) / Double(total))) : 0 }
+    /// "noch ca. 600 von 2.900 Trades" – empty when the total is unknown.
+    var text: String {
+        total > 0 ? String(localized: "noch ca. \(remaining.formatted()) von \(total.formatted()) Trades") : ""
+    }
+}
+
 /// CSV handed to `.fileExporter`.
 struct CSVFileDocument: FileDocument {
     static var readableContentTypes: [UTType] { [.commaSeparatedText] }
@@ -394,6 +525,9 @@ struct TransferDraft {
     /// Terminüberweisung: when on, `executionDate` is sent (FinTS only).
     var scheduled = false
     var executionDate = Calendar.current.date(byAdding: .day, value: 1, to: Date()) ?? Date()
+    /// Filled from a `girocrab://transfer` link (`PaymentLink`): the form warns that another
+    /// app or a web page chose the recipient. A new draft starts without it.
+    var fromLink = false
 
     /// The fields a payment fills (paste, invoice, clipboard check #663).
     static let paymentFields: [WritableKeyPath<TransferDraft, String>] = [\.name, \.iban, \.bic, \.amountText, \.purpose]
@@ -475,6 +609,16 @@ struct PendingLogin: Identifiable {
     let connection: BankConnection
 }
 
+/// Where a dragged category lands relative to the row it is dropped on (#977).
+enum CategoryDropPlace {
+    /// Right above the row, as its sibling.
+    case before
+    /// Right below the row, as its sibling.
+    case after
+    /// Into the row's category, as its last sub-category.
+    case into
+}
+
 struct CategoryNode: Identifiable, Hashable {
     let category: GiroCrabCore.Category
     var children: [CategoryNode]?
@@ -523,6 +667,10 @@ let settingLabels: [String: String] = [
     "comdirect.client_secret": String(localized: "comdirect Client-Secret"),
     "paypal.client_id": String(localized: "PayPal Client-ID"),
     "paypal.client_secret": String(localized: "PayPal Secret"),
+    "kontist.client_id": String(localized: "Kontist Client-ID"),
+    "bitcoin_core.datadir": String(localized: "Bitcoin-Core-Datenverzeichnis"),
+    "bitcoin_core.rpc_url": String(localized: "Bitcoin-Core-RPC-Adresse"),
+    "kontist.client_secret": String(localized: "Kontist Client-Secret"),
     "enablebanking.application_id": String(localized: "Enable Banking Application-ID"),
     "enablebanking.private_key_pem": String(localized: "Enable Banking Private Key"),
     "enablebanking.redirect_url": String(localized: "Enable Banking Redirect-URL"),
@@ -564,7 +712,10 @@ enum StartupClock {
 
 extension BookingFilter {
     /// The list query sums exactly the selection's bookings (all of them, not a
-    /// narrowed subset), so its `flow` can stand in for `selectionFlow`.
+    /// narrowed subset) with the same calculation context, so its `flow` can
+    /// stand in for `selectionFlow` / `selectionFlowForTotals` (#337: reuse
+    /// only when the page was loaded with this very filter — `respectInTotal`
+    /// included — and nothing narrows it).
     var listHasFlow: Bool {
         scope == .all && direction == .all && checked == nil && search == nil && categoryId == nil && !uncategorizedOnly
             && tagIds.isEmpty && !untaggedOnly
@@ -606,14 +757,16 @@ extension Result where Failure == Error {
     }
 }
 
-/// Account kinds the user can pick (import, „Kontoart ändern …“), on Mac and iPhone.
+/// Account kinds the user can pick (import, Konto-Einstellungen), on Mac and iPhone.
 extension AccountKind {
-    static let importChoices: [AccountKind] = [.checking, .savings, .creditCard, .paymentService, .brokerage, .cash, .loan]
+    static let importChoices: [AccountKind] = [.checking, .savings, .timeDeposit, .buildingSavings, .creditCard, .paymentService, .brokerage, .cash, .loan]
 
     var label: String {
         switch self {
         case .checking: return String(localized: "Girokonto")
         case .savings: return String(localized: "Tagesgeld / Sparen")
+        case .timeDeposit: return String(localized: "Festgeld")
+        case .buildingSavings: return String(localized: "Bausparen")
         case .creditCard: return String(localized: "Kreditkarte")
         case .paymentService: return String(localized: "Zahlungsdienst")
         case .brokerage: return String(localized: "Depot")
@@ -639,10 +792,42 @@ enum LocalApiCheck: Equatable {
     case failed(String)
 }
 
+/// A block of the account filter menu (#357): one group of the sidebar's
+/// current view ("Nach Gruppe", "Nach Bank" or "Nach Kontoart") with the
+/// accounts of the filter it holds, subgroups included.
+struct AccountFilterGroup: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let symbol: String
+    let accounts: [Account]
+    var accountIDs: [Int64] { accounts.map(\.id) }
+
+    static func == (a: Self, b: Self) -> Bool { a.id == b.id && a.accountIDs == b.accountIDs }
+}
+
 /// The running socket and the vault it serves (`reconcileLocalApiServer`).
 struct RunningLocalApi {
     let server: LocalApiServer
     weak var servedVault: Vault?
+}
+
+/// Told by the socket server (on its thread) that a client changed categories or
+/// tags; the model reloads on the main actor if it still shows that vault.
+final class LocalApiChangeListener: LocalApiListener, @unchecked Sendable {
+    private weak var model: AppModel?
+    private weak var servedVault: Vault?
+
+    init(model: AppModel, servedVault: Vault) {
+        self.model = model
+        self.servedVault = servedVault
+    }
+
+    func bookingsChanged() {
+        Task { @MainActor [weak model, weak servedVault] in
+            guard let model, let servedVault else { return }
+            model.localApiChangedBookings(in: servedVault)
+        }
+    }
 }
 
 /// What Return in a tag field does with the typed text (#228).
@@ -665,6 +850,40 @@ enum TagEntryIntent: Equatable {
 enum KeyAdoptionState: Equatable {
     case idle, working, done
     case failed(String)
+    /// No vault where this device looked (#1503): the sheet names the place and
+    /// offers „Ordner wählen …“, since a Mac without the app's iCloud container
+    /// syncs via the folder „GiroCrab“ in iCloud Drive.
+    /// `searched`: the place looked in, shown redacted under the message.
+    case notFound(String, searched: String?)
+
+    /// „Ordner wählen …“ stays offered after a failure too: the picked folder
+    /// may hold a vault the pasted key cannot open (#1503).
+    var offersFolderPick: Bool {
+        switch self {
+        case .notFound, .failed: return true
+        case .idle, .working, .done: return false
+        }
+    }
+
+    /// Why nothing was found where the device looked; the sheet shows the place
+    /// itself (`CloudSyncManager.folderName`, redacted like in Settings).
+    static func notFoundMessage(location: CloudSyncManager.Location) -> String {
+        if location == .container {
+            return String(localized: "Im iCloud-Speicher der App liegt noch kein Tresor. Synchronisiert Ihr anderes Gerät (etwa die Mac-App) über den Ordner „GiroCrab“ in iCloud Drive, wählen Sie diesen Ordner aus. Sonst aktivieren Sie iCloud Sync auf dem anderen Gerät, warten auf den ersten Upload und versuchen es erneut.")
+        }
+        return String(localized: "Im gewählten Ordner liegt noch kein Tresor. Wählen Sie den Ordner, den Ihr anderes Gerät nutzt, oder aktivieren Sie dort iCloud Sync, warten auf den ersten Upload und versuchen es erneut.")
+    }
+
+    /// The picked folder holds no vault (#1503); nothing is created there.
+    static func pickedFolderMessage(_ picked: ICloudFolderMigration.PickedFolder) -> String? {
+        switch picked {
+        case .found: return nil
+        case .subfolder(let name):
+            return String(localized: "Der gewählte Ordner enthält einen Unterordner „\(name)“ mit Ihrem Tresor. Wählen Sie bitte genau diesen Unterordner aus.")
+        case .empty:
+            return String(localized: "Der gewählte Ordner enthält keinen GiroCrab-Tresor. Wählen Sie den Ordner, den Ihr anderes Gerät nutzt (meist „GiroCrab“ in iCloud Drive).")
+        }
+    }
 }
 
 /// What the tag sheet changed but has not stored yet (#228): names, colours,
@@ -695,4 +914,23 @@ enum TagRenameIntent: Equatable {
 struct SelectionTotal: Equatable {
     let currency: String
     let cents: Int64
+}
+
+/// Period of a full fetch (#1043) as the setting `sync.days_back` stores it: `max` or days.
+extension HistoryRange {
+    init(setting: String) {
+        self = setting == "max" ? .maximum : .days(days: UInt32(setting) ?? 90)
+    }
+
+    var setting: String {
+        switch self {
+        case .maximum: return "max"
+        case .days(let days): return String(days)
+        }
+    }
+
+    /// The periods the pickers offer, shortest first.
+    static var pickerOptions: [(setting: String, title: LocalizedStringKey)] {
+        [("90", "90 Tage"), ("365", "1 Jahr"), ("730", "2 Jahre"), ("max", "Maximum")]
+    }
 }

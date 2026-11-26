@@ -2,11 +2,11 @@
 //! credentials/cookies never cross this bridge. Snapshot checked live 2026-11-14.
 use std::{collections::HashSet, sync::Arc};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rusqlite::{params, OptionalExtension};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
-use super::{store_fetch, FetchResult, RemoteAccount, SyncSummary};
+use super::{FetchResult, RemoteAccount, SyncSummary, store_fetch};
 use crate::{
     error::{CoreError, CoreResult},
     i18n::tr,
@@ -14,12 +14,11 @@ use crate::{
     vault::Vault,
 };
 
+pub(crate) mod portal;
 mod snapshot;
 
 fn invalid(message: &'static str) -> CoreError {
-    CoreError::InvalidInput {
-        message: tr(message).into(),
-    }
+    CoreError::invalid(tr(message))
 }
 
 fn field<'a>(v: &'a Value, pointer: &str) -> CoreResult<&'a str> {
@@ -86,7 +85,9 @@ fn overview(v: &Value) -> CoreResult<FetchResult> {
         .iter()
         .any(|k| row[*k].as_bool() == Some(true))
         {
-            return Err(invalid("FNZ: Bestände sind ausgeblendet oder veraltet. Es wurden keine Salden aktualisiert."));
+            return Err(invalid(
+                "FNZ: Bestände sind ausgeblendet oder veraltet. Es wurden keine Salden aktualisiert.",
+            ));
         }
         let number = field(account, "/externalDepotNumber/externalDepotNumber")?;
         let amount = field(row, "/depotInventorySumAccountCurrency/value")?;
@@ -94,8 +95,9 @@ fn overview(v: &Value) -> CoreResult<FetchResult> {
         if !is_currency_code(currency) {
             return Err(invalid("FNZ: Unbekannte Kontowährung."));
         }
-        let cents = crate::money::parse_cents(amount)
-            .map_err(|_| invalid("FNZ: Ungültiger Saldo in der Kontoübersicht."))?;
+        let cents = crate::money::decimal(amount, '.')
+            .and_then(crate::money::cents)
+            .ok_or_else(|| invalid("FNZ: Ungültiger Saldo in der Kontoübersicht."))?;
         if !seen.insert(number.to_string()) {
             continue;
         }
@@ -118,7 +120,7 @@ fn overview(v: &Value) -> CoreResult<FetchResult> {
             },
             balance_cents: cents,
             // The overview has no valuation timestamp: this is the retrieval date.
-            balance_date: chrono::Utc::now().date_naive().to_string(),
+            balance_date: crate::dates::utc_date(jiff::Timestamp::now()).to_string(),
         });
     }
     if accounts.is_empty() {
@@ -139,6 +141,27 @@ fn document_source(connection_id: i64, id: &str) -> String {
 
 fn document_account(v: &Value) -> CoreResult<&str> {
     field(v, "/depot/externalDepotNumber/externalDepotNumber")
+}
+
+/// Postbox title: subject, else the document kind, else a generic name.
+fn document_title(v: &Value) -> String {
+    v["subject"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| v["documentKindText"].as_str())
+        .unwrap_or("FNZ Dokument")
+        .to_string()
+}
+
+/// `YYYY-MM-DD` of the mailbox date, or "" when the portal sends none.
+fn document_date(v: &Value) -> String {
+    v["receivedDate"]
+        .as_str()
+        .unwrap_or_default()
+        .get(..10)
+        .filter(|d| jiff::civil::Date::strptime("%Y-%m-%d", d).is_ok())
+        .unwrap_or_default()
+        .to_string()
 }
 
 impl Vault {
@@ -233,17 +256,8 @@ impl Vault {
             .map_err(|_| invalid("FNZ: Ungültige Dokumentdaten."))?;
         let id = field(&doc, "/id")?;
         let account_ref = document_account(&doc)?;
-        let title = doc["subject"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| doc["documentKindText"].as_str())
-            .unwrap_or("FNZ Dokument");
-        let date = doc["receivedDate"]
-            .as_str()
-            .unwrap_or_default()
-            .get(..10)
-            .filter(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
-            .unwrap_or_default();
+        let title = document_title(&doc);
+        let date = document_date(&doc);
         let db = self.db()?;
         let (account_id, excluded) = db.query_row(
             "SELECT id, archived_unix IS NOT NULL OR deleted_ms IS NOT NULL FROM accounts WHERE connection_id = ?1 AND external_ref = ?2",
@@ -259,38 +273,15 @@ impl Vault {
             &db,
             None,
             Some(account_id),
-            title,
-            "postbox",
+            &title,
+            crate::documents::account_document_type(&title),
             "application/pdf",
             &name,
             &bytes,
             &source,
-            date,
+            &date,
         )?
         .is_some())
-    }
-}
-
-pub struct WebOnlyConnector;
-
-#[async_trait::async_trait]
-impl super::BankConnector for WebOnlyConnector {
-    async fn begin(&mut self, _ctx: &super::ConnectContext) -> CoreResult<super::Phase> {
-        Err(CoreError::BrowserLoginRequired {
-            message: tr("Bitte bei FNZ anmelden und in FNZsecure freigeben.").into(),
-        })
-    }
-    async fn respond(
-        &mut self,
-        ctx: &super::ConnectContext,
-        _response: super::ChallengeResponse,
-    ) -> CoreResult<super::Phase> {
-        self.begin(ctx).await
-    }
-    async fn fetch(&mut self, _ctx: &super::ConnectContext) -> CoreResult<FetchResult> {
-        Err(CoreError::BrowserLoginRequired {
-            message: tr("Bitte im FNZ-Browserfenster abrufen.").into(),
-        })
     }
 }
 
@@ -408,29 +399,33 @@ mod tests {
                 .len(),
             1
         );
-        assert!(v
-            .clone()
-            .import_fnz_document(conn, doc.clone(), b"%PDF-1.7\nsynthetic".to_vec())
-            .unwrap());
-        assert!(!v
-            .clone()
-            .import_fnz_document(conn, doc.clone(), b"%PDF-1.7\nsynthetic".to_vec())
-            .unwrap());
-        assert!(v
-            .clone()
-            .import_fnz_document(conn, metadata("bad", "D1"), b"<html>login</html>".to_vec())
-            .is_err());
-        assert!(v
-            .clone()
-            .import_fnz_document(
-                conn,
-                metadata("unknown", "missing"),
-                b"%PDF-1.7\nsynthetic".to_vec()
-            )
-            .is_err());
+        assert!(
+            v.clone()
+                .import_fnz_document(conn, doc.clone(), b"%PDF-1.7\nsynthetic".to_vec())
+                .unwrap()
+        );
+        assert!(
+            !v.clone()
+                .import_fnz_document(conn, doc.clone(), b"%PDF-1.7\nsynthetic".to_vec())
+                .unwrap()
+        );
+        assert!(
+            v.clone()
+                .import_fnz_document(conn, metadata("bad", "D1"), b"<html>login</html>".to_vec())
+                .is_err()
+        );
+        assert!(
+            v.clone()
+                .import_fnz_document(
+                    conn,
+                    metadata("unknown", "missing"),
+                    b"%PDF-1.7\nsynthetic".to_vec()
+                )
+                .is_err()
+        );
         let mut changed = fixture();
-        changed["ownerGroups"][0]["investmentDepots"][0]["depotInventorySumAccountCurrency"]
-            ["value"] = json!("2000.00");
+        changed["ownerGroups"][0]["investmentDepots"][0]["depotInventorySumAccountCurrency"]["value"] =
+            json!("2000.00");
         v.clone()
             .import_fnz_overview(conn, changed.to_string())
             .unwrap();
@@ -445,11 +440,12 @@ mod tests {
             200000
         );
         assert_eq!(v.list_holdings(depot.id).unwrap().len(), 1);
-        assert!(v
-            .clone()
-            .pending_fnz_documents(conn, list)
-            .unwrap()
-            .is_empty());
+        assert!(
+            v.clone()
+                .pending_fnz_documents(conn, list)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             v.db()
                 .unwrap()
@@ -462,11 +458,12 @@ mod tests {
             .add_bank_connection(ConnectorKind::Fnz, "Other FNZ".into(), "other".into())
             .unwrap();
         // Not yet known in this connection: nothing to download.
-        assert!(v
-            .clone()
-            .pending_fnz_documents(other, format!("[{doc}]"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            v.clone()
+                .pending_fnz_documents(other, format!("[{doc}]"))
+                .unwrap()
+                .is_empty()
+        );
         v.clone()
             .import_fnz_overview(other, fixture().to_string())
             .unwrap();
@@ -492,14 +489,16 @@ mod tests {
         let wrong = v
             .add_bank_connection(ConnectorKind::PayPal, "Other Bank".into(), "test".into())
             .unwrap();
-        assert!(v
-            .clone()
-            .import_fnz_overview(wrong, fixture().to_string())
-            .is_err());
-        assert!(v
-            .clone()
-            .pending_fnz_documents(conn, "[{}]".into())
-            .is_err());
+        assert!(
+            v.clone()
+                .import_fnz_overview(wrong, fixture().to_string())
+                .is_err()
+        );
+        assert!(
+            v.clone()
+                .pending_fnz_documents(conn, "[{}]".into())
+                .is_err()
+        );
         drop(v);
         let _ = std::fs::remove_file(path);
     }

@@ -11,6 +11,7 @@ struct TwoFactorSheet: View {
     /// The bank's consent page inside GiroCrab (PSD2 redirect).
     @State private var consent: ConsentBrowser?
     @State private var showManualRedirect = false
+    @FocusState private var codeFocused: Bool
 
     /// The sheet shows the bank's consent page (needs a browser-sized window).
     private var showsConsentPage: Bool {
@@ -19,6 +20,24 @@ struct TwoFactorSheet: View {
 
     var body: some View {
         if let active = model.activeChallenge {
+            #if os(iOS)
+            if showsConsentPage {
+                // the bank's page sizes itself; inside a scroll view it would collapse
+                challengeContent(active)
+            } else {
+                // small iPhones: with the keyboard up, the comparison card (#949) pushes the
+                // TAN field and the buttons below the fold; scrolling keeps them reachable
+                ScrollView { challengeContent(active) }
+                    .scrollDismissesKeyboard(.interactively)
+            }
+            #else
+            challengeContent(active)
+            #endif
+        }
+    }
+
+    @ViewBuilder
+    private func challengeContent(_ active: ActiveChallenge) -> some View {
             let c = active.challenge
             VStack(spacing: 18) {
                 HStack(spacing: 10) {
@@ -47,6 +66,7 @@ struct TwoFactorSheet: View {
                     Text(c.title).appFont(.title3, weight: .bold)
                     Text(c.message).multilineTextAlignment(.center).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         .sensitive() // a transfer TAN names payee and amount
+                    if let comparison = model.tanComparison { TanComparisonHint(comparison: comparison) }
                     if let s = c.redirectUrl, let url = URL(string: s) {
                         Button { openURL(url) } label: { Label("Im Browser anmelden", systemImage: "safari") }
                             .buttonStyle(.borderedProminent)
@@ -56,8 +76,19 @@ struct TwoFactorSheet: View {
                         Text(active.waiting ? "Warte auf Freigabe …" : "Push-Nachricht gesendet")
                             .appFont(.callout).foregroundStyle(.secondary)
                     }
+                    if c.methodName == "Online-Archiv · Consorsbank App" {
+                        // as on the bank's page: the SecurePlus generator instead of the app (#1024)
+                        Button("Manuell mit TAN bestätigen") { model.switchApproval("TAN") }
+                            #if os(macOS)
+                            .buttonStyle(.link)
+                            #else
+                            .buttonStyle(.plain)
+                            #endif
+                            .appFont(.callout)
+                            .disabled(active.busy)
+                    }
                 case .progress:
-                    // approval given, a longer download runs (comdirect PostBox, #838)
+                    // approval given, a longer download runs (comdirect Postbox, #838)
                     Image(systemName: "tray.and.arrow.down")
                         .font(.system(size: 56, weight: .light))
                         .foregroundStyle(.tint)
@@ -78,16 +109,33 @@ struct TwoFactorSheet: View {
                     }
                     Text(c.message).multilineTextAlignment(.center).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         .sensitive() // a transfer TAN names payee and amount
+                    if let comparison = model.tanComparison { TanComparisonHint(comparison: comparison) }
                     TextField("TAN / Code", text: $code)
                         .appFont(.title2, design: .monospaced)
                         .multilineTextAlignment(.center)
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 220)
+                        // no input while an answer or a skip is on its way: it would be sent for the next order
+                        .disabled(active.busy)
+                        .focused($codeFocused)
+                        .onAppear { codeFocused = true }
+                        // a disabled field loses the focus: back in it when the answer is in (wrong TAN, retry)
+                        .onChange(of: active.busy) { _, busy in if !busy { codeFocused = true } }
                         #if os(iOS)
                         .keyboardType(.numberPad)
                         .textContentType(.oneTimeCode)
                         #endif
                         .onSubmit(submit)
+                    if c.methodName == "Online-Archiv · TAN" {
+                        Button("Mit Consorsbank App bestätigen") { model.switchApproval("APP") }
+                            #if os(macOS)
+                            .buttonStyle(.link)
+                            #else
+                            .buttonStyle(.plain)
+                            #endif
+                            .appFont(.callout)
+                            .disabled(active.busy)
+                    }
                     if active.connection.connector == .tradeRepublic && c.kind == .code {
                         // HIG: belongs to the code field, not to the dialog's
                         // button row (which keeps at most three buttons)
@@ -158,7 +206,11 @@ struct TwoFactorSheet: View {
                     Text("Gültig noch etwa \(s / 60) Min.").appFont(.caption).foregroundStyle(.tertiary)
                 }
 
-                SyncPromptButtons(cancel: model.skipCurrentSync) {
+                SyncPromptButtons(cancel: model.skipCurrentSync, leading: active.canSkipOrder ? AnyView(
+                    Button("TAN auslassen") { consent = nil; code = ""; model.skipOrder() }
+                        .disabled(active.busy || active.polling)
+                        .help("Nur diese Abfrage auslassen. Der Rest des Abrufs wird gespeichert.")
+                ) : nil) {
                     if c.kind == .code || c.kind == .imageCode || (c.kind == .redirect && showManualRedirect) {
                         Button(action: submit) {
                             Text("Weiter").frame(maxWidth: .infinity)
@@ -177,7 +229,6 @@ struct TwoFactorSheet: View {
             .fixedSize(horizontal: false, vertical: !showsConsentPage)
             // the bank's own page needs the room of a browser window
             .macFrame(minWidth: showsConsentPage ? 868 : 400, idealWidth: showsConsentPage ? 928 : 420)
-        }
     }
 
     /// Sends the code / pasted address – once: Return reaches both the field

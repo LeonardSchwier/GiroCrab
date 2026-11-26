@@ -5,7 +5,7 @@ import AppKit
 #endif
 
 /// Einstellungen: Bankzugänge, eigene FinTS-Produkt-ID und API-Schlüssel
-/// (im verschlüsselten SQLCipher-Tresor), Händler-Logos, Sicherheit.
+/// (im verschlüsselten SQLCipher-Tresor), Händlererkennung und -Logos, Sicherheit.
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var showKeySheet = false
@@ -14,7 +14,7 @@ struct SettingsView: View {
         @Bindable var model = model
         TabView(selection: $model.settingsTab) {
             GeneralSettings()
-                .settingsPane(height: 600)   // "Sprache" … "Händler-Logos" + "Demo": scrolls
+                .settingsPane(height: 600)   // "Sprache" … "Dock und Menüleiste" + "Demo": scrolls
                 .tabItem { Label("Allgemein", systemImage: "gearshape") }
                 .tag(SettingsTab.general)
             BankConnectionsSettings()
@@ -22,6 +22,11 @@ struct SettingsView: View {
                 .disabled(!model.isUnlocked)
                 .tabItem { Label("Banken", systemImage: "building.columns") }
                 .tag(SettingsTab.banks)
+            MerchantRecognitionSettings()
+                .settingsPane(height: 640)   // the bundled list scrolls
+                .disabled(!model.isUnlocked)
+                .tabItem { Label("Händler", systemImage: "storefront") }
+                .tag(SettingsTab.merchants)
             #if os(macOS)
             DocumentFolderSettings()
                 .settingsPane(height: 420)
@@ -68,15 +73,18 @@ struct GeneralSettings: View {
     @AppStorage(NegativeAmountStyle.defaultsKey) private var negativeAmountStyle: NegativeAmountStyle = .neutral
     @AppStorage(AppTextSize.defaultsKey) private var textSize: AppTextSize = .standard
     @AppStorage(PrivacyMode.enabledKey) private var privacyMode = false
-    @AppStorage(PrivacyMode.scopeKey) private var privacyScope = PrivacyMode.Scope.amounts
+    @AppStorage(NaturalSearch.defaultsKey) private var naturalSearch = false
+    @AppStorage(PrivacyMode.scopeKey) private var privacyScope = PrivacyMode.defaultScope
     @AppStorage(AppAppearance.defaultsKey) private var appearance: AppAppearance = .system
     @AppStorage(BookingDensity.defaultsKey) private var bookingDensity: BookingDensity = .standard
+    @AppStorage(SidebarDensity.defaultsKey) private var sidebarDensity: SidebarDensity = .defaultValue
 
-    /// Core setting `sync.days_back`: how far the first fetch of a new account reaches back.
-    private var firstFetchDays: Binding<Int> {
+    /// Core setting `sync.days_back`: how far the first fetch of a new login reaches back,
+    /// `max` (as far as the bank delivers, #1043) or days.
+    private var firstFetchPeriod: Binding<String> {
         Binding(
-            get: { Int(model.settingEntry("sync.days_back")?.value ?? "") ?? 90 },
-            set: { model.saveSetting("sync.days_back", String($0)) }
+            get: { model.settingEntry("sync.days_back")?.value ?? "max" },
+            set: { model.saveSetting("sync.days_back", $0) }
         )
     }
 
@@ -105,6 +113,11 @@ struct GeneralSettings: View {
                 }
                 Text("Kompakt öffnet die aktive Buchung mit allen Details. Standard zeigt einen kurzen Verwendungszweck. Großzügig zeigt alle Buchungen ausführlich.")
                     .appFont(.caption).foregroundStyle(.secondary)
+                Picker("Seitenleiste", selection: $sidebarDensity) {
+                    ForEach(SidebarDensity.allCases) { Text($0.title).appFont(.body).tag($0) }
+                }
+                Text("Der Saldo steht in beiden Ansichten neben dem Kontonamen. Großzügig zeigt zusätzlich die Initialen des Kontoinhabers. Kompakt verwendet kleinere Kontosymbole.")
+                    .appFont(.caption).foregroundStyle(.secondary)
                 #if os(macOS)
                 // iOS: the system's Dynamic Type setting (Einstellungen › Anzeige & Helligkeit).
                 Picker("Schriftgröße", selection: $textSize) {
@@ -117,10 +130,14 @@ struct GeneralSettings: View {
                 Picker("Im Privatmodus ausblenden", selection: $privacyScope) {
                     ForEach(PrivacyMode.Scope.allCases) { Text($0.title).tag($0) }
                 }
-                Text("Blendet Beträge aus, wenn du die App jemandem zeigst. Auf Wunsch auch Namen, Kontonummern und Verwendungszwecke.")
+                Text("Blendet Beträge, Namen, Kontonummern und Verwendungszwecke aus, wenn du die App jemandem zeigst. Auf Wunsch nur die Beträge.")
                     .appFont(.caption).foregroundStyle(.secondary)
+                if NaturalSearch.isAvailable {
+                    Toggle("Suche in natürlicher Sprache", isOn: $naturalSearch)
+                        .help("Versteht Angaben wie „Lebensmittel letzten Monat über 50 €“. Läuft vollständig auf diesem Gerät; an das Modell gehen nur Suchtext, heutiges Datum und Kategorienamen.")
+                }
                 Toggle("Auswertungen in der Übersicht anzeigen", isOn: $showStatistics)
-                Text("Blendet Saldoverlauf, Cashflow und Budgets über der Buchungsliste aus. Auch im Menü Ansicht umschaltbar.")
+                Text("Blendet die Kennzahlen (Konsumausgaben, Investiert, Einnahmen, Fixkosten offen) und die Cashflow-Karte über der Buchungsliste aus. Das Diagramm hat mit „Diagramm anzeigen“ einen eigenen Schalter. Budgets bleiben unabhängig und haben ebenfalls einen eigenen Schalter. Auch im Menü Ansicht umschaltbar.")
                     .appFont(.caption).foregroundStyle(.secondary)
                 Toggle("Budgets anzeigen", isOn: $showBudgets)
                 Text("Wer keine Monatsbudgets nutzt, blendet die Budget-Karte und „Monatsbudget festlegen …“ ganz aus. Auch im Menü Ansicht umschaltbar.")
@@ -141,26 +158,25 @@ struct GeneralSettings: View {
                 Picker("Als geprüft markieren", selection: $model.autoReviewDelay) {
                     ForEach(AutoReviewDelay.allCases) { Text($0.title).tag($0) }
                 }
-                Text("Eine ausgewählte Buchung gilt nach dieser Zeit als geprüft – wie eine gelesene E-Mail. Bei Mehrfachauswahl nie.")
+                Text(model.autoReviewDelay.helpText)
                     .appFont(.caption).foregroundStyle(.secondary)
-                Picker("Zeitraum beim ersten Abruf", selection: firstFetchDays) {
-                    Text("90 Tage").tag(90)
-                    Text("1 Jahr").tag(365)
-                    Text("2 Jahre").tag(730)
+                Picker("Zeitraum beim ersten Abruf", selection: firstFetchPeriod) {
+                    Text("90 Tage").tag("90")
+                    Text("1 Jahr").tag("365")
+                    Text("2 Jahre").tag("730")
+                    Text("Maximum").tag("max")
                     // a value set elsewhere (e.g. synced from another device) stays selectable
-                    if ![90, 365, 730].contains(firstFetchDays.wrappedValue) {
-                        Text("\(firstFetchDays.wrappedValue) Tage").tag(firstFetchDays.wrappedValue)
+                    if !["90", "365", "730", "max"].contains(firstFetchPeriod.wrappedValue) {
+                        Text("\(Int(firstFetchPeriod.wrappedValue) ?? 90) Tage").tag(firstFetchPeriod.wrappedValue)
                     }
                 }
-                Text("Wie weit GiroCrab beim ersten Abruf eines neuen Kontos zurückgeht. Viele Banken liefern nur 90 Tage oder verlangen für mehr eine TAN. Bereits abgerufene Konten betrifft das nicht.")
+                Text("Wie weit GiroCrab beim ersten Abruf eines neuen Zugangs zurückgeht. „Maximum“ reicht so weit zurück, wie Bank und Anbindung es zulassen. Für mehr als 90 Tage verlangen viele Banken eine TAN. Bestehende Zugänge rufen weiter ab ihrem neuesten Umsatz ab.")
                     .appFont(.caption).foregroundStyle(.secondary)
             } header: { Text("Buchungen").appSectionHeader() }
             TransferSettingsSection()
             BalanceChartSettingsSection()
-            MerchantLogoSettingsSection()
             #if os(macOS)
-            AutoSyncSettingsSection()
-            MenuBarSettingsSection()
+            DockAndMenuBarSettingsSection()
             #endif
             #if os(iOS)
             Section {
@@ -213,7 +229,7 @@ struct BalanceChartSettingsSection: View {
 
 /// Tabs of the settings window (macOS) / sheet (iOS).
 enum SettingsTab: Hashable {
-    case general, banks, documents, security, externalAccess, updates
+    case general, banks, merchants, documents, security, externalAccess, updates
 
     /// `--demo-settings <name>` (screenshots).
     init?(demoName: String) {
@@ -221,7 +237,8 @@ enum SettingsTab: Hashable {
         case "general": self = .general
         case "banks": self = .banks
         case "credentials": self = .banks   // FinTS registration now lives under "Banken"
-        case "logos": self = .general   // merchant logos are a section of "Allgemein"
+        case "merchants": self = .merchants
+        case "logos": self = .merchants   // merchant logos are a section of "Händler" (#1373)
         case "documents": self = .documents
         case "security": self = .security
         case "external": self = .externalAccess
@@ -277,7 +294,7 @@ struct BankConnectionsSettings: View {
                             .buttonStyle(.borderless)
                             .help("Bearbeiten / Details")
                             .accessibilityLabel("Bearbeiten / Details")
-                        Button { model.requestSync(c) } label: { Image(systemName: "arrow.triangle.2.circlepath") }
+                        Button { model.requestFullSync(c) } label: { Image(systemName: "arrow.triangle.2.circlepath") }
                             .buttonStyle(.borderless)
                             .help(model.bankingGate(for: c)?.message ?? String(localized: "Jetzt abrufen"))
                             .accessibilityLabel("Jetzt abrufen")
@@ -330,23 +347,16 @@ struct BankConnectionsSettings: View {
     @ViewBuilder private var fintsRegistrationSection: some View {
         Section {
             if model.fintsBuiltinAvailable {
-                Picker("Verwenden", selection: Binding(
-                    get: { model.fintsProductIDMode == "own" ? "own" : "builtin" },
-                    set: { model.setFintsProductIDMode($0) }
-                )) {
-                    Text("GiroCrab-Registrierung (empfohlen)").tag("builtin")
-                    Text("Eigene Registrierung").tag("own")
-                }
-                #if os(macOS)
-                .pickerStyle(.radioGroup)
-                #endif
-            } else if AppUpdateChannel.current != .stable {
-                Label("Dieser Beta-Build enthält die FinTS-Registrierung von GiroCrab nicht. Bitte melden Sie das den Entwicklern.", systemImage: "exclamationmark.triangle")
+                Label("Offizielle FinTS-Produktregistrierung von GiroCrab aktiv", systemImage: "checkmark.seal.fill")
                     .appFont(.callout)
-                    .foregroundStyle(Theme.warning)
-            }
-            // The own ID is entered right here, only when it is the one in use.
-            if !model.fintsBuiltinAvailable || model.fintsProductIDMode == "own" {
+                    .foregroundStyle(.secondary)
+            } else {
+                if AppUpdateChannel.current != .stable {
+                    Label("Dieser Beta-Build enthält die FinTS-Registrierung von GiroCrab nicht. Bitte melden Sie das den Entwicklern.", systemImage: "exclamationmark.triangle")
+                        .appFont(.callout)
+                        .foregroundStyle(Theme.warning)
+                }
+                // Own product ID is only needed in self-built / developer binaries without embedded ID (#1092).
                 OwnProductIDField()
             }
         } header: {
@@ -366,7 +376,8 @@ struct BankConnectionsSettings: View {
     }
 }
 
-/// Merchant logos from the internet (GitHub #33); needs an open vault.
+/// Merchant logos from the internet (GitHub #33), a section of Einstellungen › Händler
+/// (#1373); needs an open vault.
 struct MerchantLogoSettingsSection: View {
     @Environment(AppModel.self) private var model
 
@@ -396,7 +407,7 @@ struct MerchantLogoSettingsSection: View {
 }
 
 #if os(macOS)
-/// Automatic copy of all documents (statements, receipts, PostBox) into a
+/// Automatic copy of all documents (statements, receipts, Postbox) into a
 /// folder, e.g. in iCloud Drive (GitHub #57).
 struct DocumentFolderSettings: View {
     @Environment(AppModel.self) private var model
@@ -416,7 +427,7 @@ struct DocumentFolderSettings: View {
                 if let path = model.documentMirrorPath {
                     LabeledContent("Ordner") {
                         HStack {
-                            Text(displayPath(path))
+                            Text(ICloudFolderMigration.readablePath(path))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                                 .sensitive() // the path names the user
@@ -434,7 +445,7 @@ struct DocumentFolderSettings: View {
                         }
                     }
                 }
-                Text("Kontoauszüge, Belege und PostBox-Dokumente werden nach jedem Sync als Kopie abgelegt: <Ordner>/<Konto>/<Jahr>/. Vorhandene Dateien werden nie überschrieben. Achtung: Im Ordner liegen die PDFs unverschlüsselt – in iCloud Drive also auch in Ihrer iCloud.")
+                Text("Kontoauszüge, Belege und Postbox-Dokumente werden nach jedem Sync als Kopie abgelegt: <Ordner>/<Konto>/<Jahr>/. Vorhandene Dateien werden nie überschrieben. Achtung: Im Ordner liegen die PDFs unverschlüsselt – in iCloud Drive also auch in Ihrer iCloud.")
                     .appFont(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } header: { Text("Dokumentenordner").appSectionHeader() }
@@ -448,15 +459,6 @@ struct DocumentFolderSettings: View {
         .fileImporter(isPresented: $choosing, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { model.setDocumentMirror(url) }
         }
-    }
-
-    /// "~/Library/Mobile Documents/com~apple~CloudDocs/GiroCrab" -> "iCloud Drive/GiroCrab".
-    private func displayPath(_ path: String) -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let cloud = home + "/Library/Mobile Documents/com~apple~CloudDocs"
-        if path.hasPrefix(cloud) { return "iCloud Drive" + path.dropFirst(cloud.count) }
-        if path.hasPrefix(home) { return "~" + path.dropFirst(home.count) }
-        return path
     }
 }
 #endif
@@ -644,6 +646,16 @@ struct ICloudSyncSection: View {
     /// When the copied key leaves the clipboard; the button counts down to it (#909).
     @State private var keyCopiedUntil: Date?
     @State private var confirmKeyCopy = false
+    /// Shown in the section: a toast would land in the main window, behind Settings on macOS.
+    @State private var keyCopyError: String?
+
+    @ViewBuilder private var keychainTradeOff: some View {
+        if let text = KeychainSyncNote.tradeOff(available: VaultKeyManager.canShareViaICloudKeychain,
+                                                shared: keychainSync, syncEnabled: sync.isEnabled) {
+            Text(text).appFont(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
 
     var body: some View {
         Section {
@@ -658,6 +670,8 @@ struct ICloudSyncSection: View {
                         model.syncNow()
                     }
                 }
+            // before the switch is turned: it shares the key as well (#1798)
+            if !sync.isEnabled { keychainTradeOff }
             if sync.isEnabled {
                 LabeledContent("Ordner") { Text(sync.folderName ?? "iCloud Drive / GiroCrab").sensitive() }
                 if sync.folderNotice {
@@ -724,6 +738,7 @@ struct ICloudSyncSection: View {
                 if let note = KeychainSyncNote.text(available: VaultKeyManager.canShareViaICloudKeychain) {
                     Text(note).appFont(.caption).foregroundStyle(.secondary)
                 }
+                keychainTradeOff
                 HStack {
                     Button {
                         confirmKeyCopy = true
@@ -738,15 +753,20 @@ struct ICloudSyncSection: View {
                     .confirmationDialog("Tresor-Schlüssel kopieren?", isPresented: $confirmKeyCopy, titleVisibility: .visible) {
                         Button("Schlüssel kopieren") {
                             Task {
-                                if let k = try? await VaultKeyManager.shared.exportKeyBase64() {
-                                    VaultKeyManager.copyKeyToPasteboard(k)
+                                // keychain failures show in the section; a cancelled unlock stays silent
+                                keyCopyError = nil
+                                do {
+                                    VaultKeyManager.copyKeyToPasteboard(try await VaultKeyManager.shared.exportKeyBase64())
                                     keyCopiedUntil = Date().addingTimeInterval(VaultKeyManager.keyClipboardLifetime)
+                                } catch VaultKeyManager.KeyError.cancelled {
+                                } catch {
+                                    keyCopyError = describe(error)
                                 }
                             }
                         }
                         Button("Abbrechen", role: .cancel) {}
                     } message: {
-                        Text("Der Schlüssel entschlüsselt Ihren gesamten Tresor. Er liegt 60 Sekunden in der Zwischenablage, nicht als Text, und lässt sich nur mit „Aus Zwischenablage einfügen“ in GiroCrab verwenden.")
+                        Text("Der Schlüssel entschlüsselt Ihren gesamten Tresor. Er liegt 60 Sekunden in der Zwischenablage, nicht als Text. Über die geteilte Zwischenablage (Handoff, gleicher Apple Account) übernehmen Sie ihn auf dem anderen Gerät mit „Schlüssel einfügen …“ › „Aus Zwischenablage einfügen“; danach wird er dort aus der Zwischenablage gelöscht.")
                     }
                     Button("Schlüssel einfügen …", systemImage: "square.and.pencil") { showKeySheet = true }
                 }
@@ -755,6 +775,10 @@ struct ICloudSyncSection: View {
                 // "Tresor-Schlüssel kopieren" opened the paste sheet too (#909).
                 .buttonStyle(.borderless)
                 #endif
+                if let keyCopyError {
+                    Label(keyCopyError, systemImage: "exclamationmark.triangle.fill")
+                        .appFont(.caption).foregroundStyle(Theme.negative)
+                }
                 if sync.keyMismatch {
                     Label("Der iCloud-Tresor nutzt einen anderen Schlüssel. Fügen Sie den Schlüssel von Ihrem anderen Gerät ein.", systemImage: "exclamationmark.triangle.fill")
                         .appFont(.caption).foregroundStyle(Theme.warning)
@@ -769,17 +793,10 @@ struct ICloudSyncSection: View {
         .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { r in
             if case .success(let url) = r {
                 Task {
-                    let scoped = url.startAccessingSecurityScopedResource()
-                    // iCloud may still be listing the folder: wait briefly before calling it empty.
-                    let hasVault = await ICloudFolderMigration.waitForVault(in: url, wait: 6)
-                    let sub = hasVault ? nil : ICloudFolderMigration.vaultSubfolder(in: url)
-                    if scoped { url.stopAccessingSecurityScopedResource() }
-                    if let sub {
-                        wrongFolderHint = sub
-                    } else if !hasVault {
-                        pendingFolder = url
-                    } else {
-                        do { try sync.setFolder(url, chosen: true); model.syncNow() } catch { }
+                    switch await ICloudFolderMigration.inspectPicked(url) {
+                    case .subfolder(let sub): wrongFolderHint = sub
+                    case .empty: pendingFolder = url
+                    case .found: do { try sync.setFolder(url, chosen: true); model.syncNow() } catch { }
                     }
                 }
             }
@@ -789,14 +806,16 @@ struct ICloudSyncSection: View {
         } message: {
             Text("Der gewählte Ordner enthält einen Unterordner „\(wrongFolderHint ?? "GiroCrab")“ mit Ihrem Tresor. Wählen Sie bitte genau diesen Unterordner aus, damit kein neuer Tresor angelegt wird.")
         }
-        .alert("Neuen Tresor in diesem Ordner anlegen?", isPresented: Binding(get: { pendingFolder != nil }, set: { if !$0 { pendingFolder = nil } })) {
+        // the alert holds the folder itself, so the text never shows empty quotes while it closes
+        .alert("Neuen Tresor in diesem Ordner anlegen?", isPresented: Binding(get: { pendingFolder != nil }, set: { if !$0 { pendingFolder = nil } }), presenting: pendingFolder) { url in
             Button("Neuen Tresor anlegen") {
-                if let url = pendingFolder { do { try sync.setFolder(url, chosen: true); model.syncNow() } catch { } }
+                do { try sync.setFolder(url, chosen: true); model.syncNow() } catch { }
                 pendingFolder = nil
             }
             Button("Abbrechen", role: .cancel) { pendingFolder = nil }
-        } message: {
-            Text("Der gewählte Ordner enthält noch keinen GiroCrab-Tresor. Dort wird ein neuer Tresor angelegt. Erwarten Sie Ihre Daten in einem anderen Ordner, brechen Sie ab und wählen Sie diesen.")
+        } message: { url in
+            // say where (#909): when the picker jumps back, the user can't tell where the vault would land
+            Text("Der gewählte Ordner „\(ICloudFolderMigration.readablePath(url.path))“ enthält noch keinen GiroCrab-Tresor. Dort wird ein neuer Tresor angelegt. Erwarten Sie Ihre Daten in einem anderen Ordner, brechen Sie ab und wählen Sie diesen.")
         }
         #if os(macOS)
         .fileDialogDefaultDirectory(Self.syncFolderOrCloudDocs)
@@ -841,6 +860,7 @@ struct KeyPasteSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
+    @State private var picking = false
 
     private var valid: Bool { (try? VaultKeyManager.parseKey(text)) != nil }
     private var working: Bool { model.keyAdoption == .working }
@@ -865,8 +885,22 @@ struct KeyPasteSheet: View {
                     .appFont(.caption).foregroundStyle(Theme.negative)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if case .notFound(let message, let searched) = model.keyAdoption {
+                // The other device may sync via a folder in iCloud Drive (#1503).
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .appFont(.caption).foregroundStyle(Theme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let searched {
+                    LabeledContent("Gesucht in") { Text(searched).sensitive() }
+                        .appFont(.caption)
+                }
+            }
+            if model.keyAdoption.offersFolderPick {
+                Button("Ordner wählen …", systemImage: "folder.badge.gearshape") { picking = true }
+                    .disabled(!valid)
+            }
             HStack {
-                Button("Abbrechen", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Abbrechen", role: .cancel) { model.cancelKeyAdoption(); dismiss() }.keyboardShortcut(.cancelAction)
                 Spacer()
                 if working { ProgressView().controlSize(.small) }
                 Button("Übernehmen") { model.adoptSyncKey(text) }
@@ -879,6 +913,9 @@ struct KeyPasteSheet: View {
         .macFrame(minWidth: 420)
         .interactiveDismissDisabled(working)
         .onAppear { model.keyAdoption = .idle }
+        .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { r in
+            if case .success(let url) = r { model.adoptSyncKey(text, folder: url) }
+        }
         .onChange(of: model.keyAdoption) { _, state in
             if state == .done { text = ""; dismiss() }
         }
@@ -981,8 +1018,21 @@ struct OwnProductIDField: View {
     }
 }
 
-/// Why the iCloud Keychain switch is off in this build (#909), or nil when it works.
+/// The notes on sharing the vault key via iCloud Keychain.
 enum KeychainSyncNote {
+    /// What sharing costs: a synchronizable keychain item cannot carry `userPresence` (#1798).
+    /// Nil when it can neither be on nor be turned on in this build.
+    static func tradeOff(available: Bool, shared: Bool, syncEnabled: Bool) -> String? {
+        guard available || shared else { return nil }
+        let cost = String(localized: "Geteilt ist der Schlüssel nicht an Touch ID, Face ID oder den Gerätecode gebunden: Eine Abfrage beim Entsperren kommt dann nur noch von GiroCrab, nicht mehr vom Schlüsselbund. Umso wichtiger ist ein gut geschützter Apple Account.")
+        if syncEnabled { return cost } // below the key's own switch
+        let state = shared // turning the sync off does not unshare the key
+            ? String(localized: "Der Tresor-Schlüssel wird weiterhin über den iCloud-Schlüsselbund geteilt.")
+            : String(localized: "Beim Einschalten wird auch der Tresor-Schlüssel über den iCloud-Schlüsselbund geteilt.")
+        return state + " " + cost
+    }
+
+    /// Why the switch is off in this build (#909), or nil when it works.
     static func text(available: Bool) -> String? {
         available ? nil : String(localized: "In dieser Version nicht verfügbar. Übertragen Sie den Schlüssel mit „Tresor-Schlüssel kopieren“ und fügen Sie ihn auf dem anderen Gerät mit „Schlüssel einfügen …“ ein.")
     }

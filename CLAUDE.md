@@ -1,6 +1,6 @@
 # GiroCrab – agent efficiency rules
 
-Rust core (`girocrab-core`, UniFFI) + SwiftUI app (`GiroCrabApp`). Root = this dir (`app/`).
+Rust core (`girocrab-core`, UniFFI + serde) + native apps: `GiroCrabApp/` (macOS & iOS, SwiftUI), `GiroCrabLinux/` (Linux, Rust + Qt 6.6/QML), `GiroCrabWindows/` (Windows, Rust + Slint), `GiroCrabAndroid/` (Android, Kotlin + Jetpack Compose). Project skills live in `.claude/skills/`.
 
 ## File map (go here first; don't `find`/`grep` to locate code)
 - `girocrab-core/src/lib.rs` – crate root, UniFFI exports
@@ -9,19 +9,26 @@ Rust core (`girocrab-core`, UniFFI) + SwiftUI app (`GiroCrabApp`). Root = this d
 - `girocrab-core/src/vault/` – `impl Vault` per feature: `accounts.rs`, `bookings.rs` (list_transactions/paging), `categories.rs`, `connections.rs` (bank logins, stored PIN), `rules.rs`, `settings.rs`, `merge.rs`
 - `girocrab-core/src/schema.rs` – versioned schema migrations (see `docs/ARCHITECTURE.md`)
 - `girocrab-core/src/connectors/` – `mod.rs` (submodule decls + shared HTTP helpers), `types.rs` (`BankConnector`
-  trait + DTOs), `catalog.rs` (`descriptor`, `make_connector*`), `sync_session.rs` / `transfer_session.rs` (FFI state
-  machines), `persist.rs` (`impl Vault`: `store_fetch`, `begin_sync`/`begin_transfer`), tests in `connectors/tests/`;
-  connector impls alongside: `fints/`, `comdirect.rs`, `trade_republic.rs`, `enable_banking.rs`, `paypal.rs`
+  trait + DTOs), `catalog.rs` (`descriptor`, `make_connector*`), `bank_directory.rs` (search routing + curated PSD2 catalog),
+  `sync_session.rs` / `transfer_session.rs` (FFI state machines), `persist.rs` (`impl Vault`: `store_fetch`,
+  `begin_sync`/`begin_transfer`), `history.rs` (how far back a sync reaches: `sync.days_back`, full fetch of a login, #1043),
+  `html.rs` (helpers for connectors that read web pages), tests in `connectors/tests/`; connector impls alongside: `fints/`, `comdirect.rs`,
+  `trade_republic.rs`, `enable_banking.rs` (`needs_lean_request` 90d cap for Revolut/Spuerkeess/N26), `paypal.rs`
 - `girocrab-core/src/importers/` – one-off file/web-capture importers: `moneymoney_db.rs` (encrypted SQLCipher database import),
   `moneymoney_import.rs` (CSV/XML/CAMT/MT940 exports), `portal_import.rs` (Amex/Amazon Visa web + CSV/PDF import),
   `amazon_orders.rs`
 - `girocrab-core/src/tags.rs` – booking tags (#228): schema step, `impl Vault` API, booking tag loading; `tags/merge.rs` (iCloud merge of tags and tag sets), `tags/tests.rs`
-- `girocrab-core/src/merchants.rs` – merchant matching
+- `girocrab-core/src/merchants.rs` – merchant matching (`MerchantRules`: the bundled table with the user's changes, per vault);
+  `merchants/custom.rs` – the user's merchant settings (#1373): master switch, switched-off bundled merchants, own merchants, iCloud merge
+- `girocrab-core/src/recipients.rs` – known recipients of the transfer form (one per IBAN, cached), hidden IBANs + merge (#978)
 - `girocrab-core/src/documents.rs` – booking documents / PDF text extraction
 - `girocrab-core/src/text.rs` – text helpers (mojibake repair etc.)
 - `girocrab-core/src/local_api.rs` + `local_api/server.rs` – read-only local interface for external analysis (#136): queries, scope/token, Unix socket server (`docs/local-api.md`)
 - `girocrab-mcp/` – MCP stdio adapter for that socket (own crate, no core dependency outside tests; architecture, bundling, local testing: `docs/local-api-entwicklung.md`)
+- [`docs/adr/`](docs/adr/README.md) – architecture decisions. Read the relevant ADR before changing architecture.
+  Follow accepted decisions and their successors. Revisit rejected or superseded options only with new evidence or arguments.
 - `girocrab-core/src/report_sanitizer.rs` – scrubs log/diagnostics text for public bug reports (`sanitize_report_text`)
+- `girocrab-core/src/sys.rs` – the only `unsafe` code (libc wrappers); exceptions to `scripts/lint-no-obfuscation.sh` (CI, #948) go in that script.
 - `GiroCrabApp/Sources/GiroCrabUI/PrivacyRedaction.swift` – `.sensitive()` modifier; `BugReport.swift` / `BugReportUI.swift` – Hilfe › Problem melden
 - `GiroCrabApp/Sources/GiroCrabUI/AppModel.swift` – app state (all stored instance properties; static members stay in their feature file), init, vault lifecycle,
   `vaultOffMain`/`pinVault`; features live in `AppModel+<Feature>.swift` extensions: `Loading` (reloads, booking
@@ -33,13 +40,25 @@ Rust core (`girocrab-core`, UniFFI) + SwiftUI app (`GiroCrabApp`). Root = this d
 - `GiroCrabApp/Sources/GiroCrabUI/RootView.swift` – top-level UI
 - `GiroCrabApp/Sources/GiroCrabUI/BookingListView.swift` – booking list
 - `GiroCrabApp/Sources/GiroCrabUI/ConnectionsUI.swift` – bank connections UI
+- `GiroCrabLinux/` – Linux desktop app (Rust + `cxx-qt` + QML); UI strings require English entries in `en-linux.json` (`python3 -I GiroCrabLinux/scripts/i18n-report.py`)
+- `GiroCrabWindows/` – Windows desktop app (Rust + Slint in `src/` and `ui/`); must compile on macOS/Linux/Windows (`cargo clippy --manifest-path GiroCrabWindows/Cargo.toml --all-targets -- -D warnings`)
+- `GiroCrabAndroid/` – Android app (`app/src/main/java/de/girocrab/app/`, Jetpack Compose + JNI bridge)
 
-Other UI files live in the same `GiroCrabUI/` dir. A view with its own design page (`docs/*_UI.md`) names it in a comment on its type; a new view gets one. Ignore `cashcrab-core/` and `CashCrabApp/` (legacy).
+Other UI files live in the same `GiroCrabUI/` dir. A view with its own design page (`docs/*_UI.md`) names it in a comment on its type; a new view gets one.
+Design context for reviews: `PRODUCT.md` (product, users, platforms), `DESIGN.md` (tokens and rules as they are today); UI audits follow `docs/ui-audit.md`, reports in `docs/ui-audits/`. Ignore `cashcrab-core/` and `CashCrabApp/` (legacy).
+
+## Surgical diffs & minimalism (Karpathy / Ponytail rules)
+- **Smallest viable diff:** Target **< 300 changed lines** and one single concern per PR so automated review does not hit `size L` / `hold`. Split multi-part work into stacked or sequential PRs.
+- **Reuse `girocrab-core` & stdlib first:** Before writing a helper, check existing `girocrab-core` modules. Never add a crate or Swift package unless strictly necessary (every dependency change requires `THIRD_PARTY_NOTICES.md`, lockfile sync, and `cargo audit`).
+- **No speculative scaffolding:** Touch only lines required by the issue. Do not add unrequested config flags, traits for single implementations, or dead fallback branches.
+- **Test behavior, not implementation:** Every behavioral fix or feature ships with focused unit tests covering the user-observable behavior and privacy/redaction edge cases.
+- **Repo skills (`.claude/skills/`):** Use `girocrab-preflight` before every commit/push, `girocrab-ui-parity` when porting features across macOS/Linux/Windows/Android, and `girocrab-connector` when adding or changing bank connectors.
 
 ## Builds
 - **Swift-only change** (only `GiroCrabApp/**/*.swift`): NEVER rebuild `girocrab-core` or run `./build-xcframework.sh`. Run only `swift build -q` (in `GiroCrabApp/`) or `xcodebuild -quiet`.
 - Rust change: `cargo check -q -p girocrab-core`; rebuild the xcframework only if the UniFFI API changed.
-- Before every push run `cargo fmt --all`: CI fails on `cargo fmt --check` and then skips the Swift job. Enable the hook once: `git config core.hooksPath .githooks`.
+- Before every push run `cargo fmt --all`: CI fails on `cargo fmt --check` and then skips the Swift job. Enable the hook once: `git config core.hooksPath .githooks`
+  (pre-push runs every cheap CI lint via `scripts/verify-fast.sh --lint-only`, ~10 s; without the flag it adds clippy and the serde check for the changed files, `--tests` the unit tests).
 - Always pass `-q`/`--quiet` to `cargo check`, `cargo test`, `xcodebuild`. If output is still long, pipe through `tail -n 40`.
 - Before pushing a PR (also Swift-only ones; CI runs these on every PR): `cargo fmt --all -- --check` and `cargo clippy -q --workspace --all-targets -- -D warnings`. After pushing, check `gh pr checks`.
   Under clippy the root `build.rs` skips the xcframework + Swift app build (~8 s instead of ~90 s after a core
@@ -72,6 +91,10 @@ Internal code identifiers (module, function, test and file names) are exempt; `s
   run against a demo vault: `AppModel(options: LaunchOptions(arguments: ["--demo-seed"], environment: [:]))`,
   pattern in `Tests/GiroCrabUITests/SelectionLoadTests.swift`. Run them before pushing.
 - Tests, die `UserDefaults.standard` nutzen, tragen `// test: serial-defaults` (läuft seriell nach der parallelen Phase, `scripts/swift-test-split.sh`). Eigene Suites immer mit `\(UUID().uuidString)` (`scripts/lint-test-defaults.sh`).
+- **Fix-Proof** (CI job `fix-proof`, `tools/fix_proof.py`, `docs/fix-proof.md`): a `fix:` PR needs a Rust test that FAILS
+  on the base without the fix and passes with it. Before pushing: `python3 -I tools/fix_proof.py check --base upstream/main`.
+  A test that is also green without the fix proves nothing; rewrite it. Test through an interface that already existed:
+  a test that only compiles with the fix is weak proof. Untestable fix: `Fix-Proof: skip – <reason>` in the PR body.
 - Rust: `cargo test -q -p girocrab-core --lib <module>` for one module; whole `--lib` run ~10 s. It stays
   that fast only because unit tests skip `cipher_memory_security` (`cfg!(test)` in `Vault::apply_key`) and
   `.cargo/config.toml` builds SQLite with `SQLITE_DEFAULT_MEMSTATUS=0`: both make parallel test threads
@@ -89,6 +112,11 @@ Internal code identifiers (module, function, test and file names) are exempt; `s
   `scripts/lint-vault-access.sh` enforces this in CI.
 - `vault.list_transactions` enriches every row in the filter (merchant, flow, sums); `limit`/`offset`
   only trim the result. Never call it for a count or a sum – add a SQL aggregate.
+- **Multi-currency invariant (#569):** Never sum amounts across different currencies into one total. `EUR` is the primary
+  aggregate currency; non-EUR currencies are grouped and displayed separately per currency (*„Zusätzlich: …“*).
+- **PR size & schema splitting:** Keep each PR to one focused concern (~15–20 files max). Oversized multi-feature PRs are
+  automatically put on `hold` by the review gate. If a feature needs a schema migration, land the schema step + core model
+  in a small standalone PR first so parallel PRs do not collide on `STEPS` numbers.
 - An edit must either reload synchronously or declare what it invalidates (`rulesStale`,
   `dashboardStale`, `categoryRefreshTask`). A cancelled background load must never be the only
   thing that would have refreshed a view.
@@ -134,7 +162,8 @@ Other windows (Hilfe, Abruf-Protokoll), alerts and print output are never captur
   `.sensitive(.amounts)` on money and quantities: amounts, balances, sums, shares, chart axis values and readouts, loan
   figures; text mixing both gets `.sensitive([.personal, .amounts])` (a requested `.personal` redaction hides amounts too,
   `ReportRedaction.effective`). `.sensitive(.labels)` for category, group, budget and security names
-  (hidden only on request). Dates, bank/connector names, logos of known brands and error texts stay visible.
+  (hidden only on request). Dates, bank/connector names, logos of known brands and error texts stay visible;
+  a recipient's bank looked up from the IBAN is personal (it narrows down the IBAN).
 - The modifier does not draw the content (opacity 0) and puts a soft, fixed smudge in its place (gradients, no `.blur`),
   so it also covers AppKit/UIKit-backed views (TextEditor, PDFView). Never use `.redacted(reason:)`, `.blur` or a plain
   overlay for this. In a parameter string use `redaction.masking(text, .amounts)` for an amount.
@@ -236,5 +265,16 @@ whenever `README.md`, `docs/screenshots/**`, `docs/assets/**` or a release chang
 - Check the TestFlight version/build before running; a build number must be higher than any already uploaded for that version.
 
 ## Data tables
-`girocrab-core/data/*.tsv` are embedded at compile time and parsed by `src/data_tables.rs`: `bic_directory.tsv` (BIC),
+`girocrab-core/data/*.tsv` are embedded at compile time and parsed by `src/data_tables.rs`: `bic_directory.tsv` (BIC, bank name),
 `fints_directory.tsv` (FinTS endpoints), `merchants.tsv` (merchant dictionary). Never read them whole; `grep -n` a key instead.
+
+## Bank-Konnektoren: End-to-End-Pflicht (kein reiner Core-Merge)
+- Bei neuen Konnektoren oder Änderungen an ihrem Aufbau den [Entwurf für ADR 0001](docs/adr/0001-connector-architecture.md) lesen.
+  Die Konnektor-Vorlage dient als Ausgangspunkt. Bestehende Konnektoren bilden auch Besonderheiten ihrer Bank ab.
+- Ein neuer Bank- oder Depot-Konnektor gilt **nicht** als fertig und darf sein Feature-Issue nicht schließen, solange er nur als Parser in `girocrab-core/src/connectors/` existiert.
+- Jeder Konnektor-PR muss zwingend alle vier Ebenen verdrahten:
+  1. Core-Konnektor (`girocrab-core/src/connectors/`)
+  2. Bankenkatalog / Preset-Registrierung
+  3. FFI-Anbindung (`girocrab-core` / UniFFI)
+  4. UI-Einrichtung & Tests in `GiroCrabApp`
+- Vor jedem PR `bash scripts/lint-connectors.sh` ausführen (und bei Nacharbeit an `finpension` / `paypal_nvp` deren Eintrag aus der Allowlist entfernen).

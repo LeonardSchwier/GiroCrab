@@ -10,14 +10,20 @@ extension AppModel {
         return isTangible(accountId) ? .tangible : .securities
     }
 
-    /// How the sidebar selection is presented: bookings, a securities depot or a Sachwerte account.
+    /// How the shown selection is presented: bookings, a securities depot or a Sachwerte account.
     var presentation: AccountPresentation {
-        guard case .account(let id)? = sidebarSelection else { return .bookings }
+        guard case .account(let id)? = shownSelection else { return .bookings }
         switch depotKind(of: id) {
         case .securities: return .securities(id)
         case .tangible: return .tangible(id)
         case nil: return .bookings
         }
+    }
+
+    /// iOS: the detail sheet stays only while the column shows the same list it was opened from,
+    /// never over a depot or Sachwerte view (both keep `mainColumn` at `.bookings`).
+    static func keepsDetailSheet(from old: MainColumn, to new: MainColumn, presentation: AccountPresentation) -> Bool {
+        old == new && presentation == .bookings
     }
 
     /// The selected securities depot (never a Sachwerte account).

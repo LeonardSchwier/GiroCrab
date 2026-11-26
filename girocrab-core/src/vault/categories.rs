@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::Vault;
 use crate::error::{CoreError, CoreResult};
@@ -100,6 +100,31 @@ impl Vault {
     }
 }
 
+/// Refuses putting category `id` below itself (or below one of its sub-categories).
+fn ensure_not_below(db: &Connection, id: i64, parent_id: Option<i64>) -> CoreResult<()> {
+    let Some(mut p) = parent_id else {
+        return Ok(());
+    };
+    let mut guard = 0;
+    loop {
+        if p == id {
+            return Err(CoreError::invalid(tr(
+                "Eine Kategorie kann nicht in sich selbst verschoben werden.",
+            )));
+        }
+        guard += 1;
+        match db
+            .query_row("SELECT parent_id FROM categories WHERE id = ?1", [p], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .optional()?
+        {
+            Some(Some(next)) if guard < 32 => p = next,
+            _ => return Ok(()),
+        }
+    }
+}
+
 #[uniffi::export]
 impl Vault {
     /// All categories in tree order (depth-first, siblings by sort order) with
@@ -132,11 +157,15 @@ impl Vault {
             direction,
             None,
             None,
+            Vec::new(),
+            false,
         )
     }
 
     /// `list_categories_filtered` plus the list's amount range (GitHub #357): only bookings whose
-    /// absolute amount lies between `amount_min_cents` and `amount_max_cents` (`None` = open).
+    /// absolute amount lies between `amount_min_cents` and `amount_max_cents` (`None` = open),
+    /// and its tag filter (#1469): with `untagged_only` only bookings without a tag, otherwise
+    /// only bookings carrying every tag of `tag_ids` (AND, empty = any), like `BookingFilter`.
     #[allow(clippy::too_many_arguments)]
     pub fn list_categories_filtered_amount(
         &self,
@@ -147,6 +176,8 @@ impl Vault {
         direction: BookingDirection,
         amount_min_cents: Option<i64>,
         amount_max_cents: Option<i64>,
+        tag_ids: Vec<i64>,
+        untagged_only: bool,
     ) -> Result<Vec<Category>, CoreError> {
         self.categories_with_filters(
             date_from,
@@ -156,6 +187,8 @@ impl Vault {
             direction,
             amount_min_cents,
             amount_max_cents,
+            tag_ids,
+            untagged_only,
         )
     }
 
@@ -189,17 +222,7 @@ impl Vault {
         };
         let db = self.db()?;
         let rows = Self::category_rows(&db)?;
-        let mut ids = vec![category_id];
-        let mut i = 0;
-        while i < ids.len() && ids.len() < 4096 {
-            let cur = ids[i];
-            for r in rows.iter().filter(|r| r.1 == Some(cur)) {
-                if !ids.contains(&r.0) {
-                    ids.push(r.0);
-                }
-            }
-            i += 1;
-        }
+        let ids = Self::category_subtree(&rows, category_id);
         let in_list = |v: &[i64]| v.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         let account_clause = if account_ids.is_empty() {
             String::new()
@@ -211,7 +234,10 @@ impl Vault {
              WHERE category_id IN ({}){account_clause}
                AND (?1 IS NULL OR booking_date >= ?1) AND (?2 IS NULL OR booking_date <= ?2)
              GROUP BY m ORDER BY m",
-            crate::planning::effective_sql(", t.account_id AS account_id", ""),
+            crate::planning::effective_sql(
+                ", t.account_id AS account_id",
+                crate::planning::sums_condition(account_ids.len())
+            ),
             in_list(&ids)
         );
         let mut stmt = db.prepare(&sql)?;
@@ -226,6 +252,133 @@ impl Vault {
         Ok(out)
     }
 
+    /// What a category (with subcategories) holds in currencies other than EUR, one sum per currency
+    /// (alphabetical), for the "Zusätzlich" line next to its total (#1049). Empty for a single
+    /// account: its total is already in its own currency. Splits count with their split amounts.
+    pub fn category_other_currencies(
+        &self,
+        category_id: i64,
+        account_ids: Vec<i64>,
+        date_from: Option<String>,
+        date_to: Option<String>,
+    ) -> Result<Vec<CurrencyAmount>, CoreError> {
+        if account_ids.len() == 1 {
+            return Ok(Vec::new());
+        }
+        let db = self.db()?;
+        // No booking in another currency (the usual vault): nothing to add, no category tree read.
+        if !crate::planning::has_other_currencies(&db)? {
+            return Ok(Vec::new());
+        }
+        let rows = Self::category_rows(&db)?;
+        let ids = Self::category_subtree(&rows, category_id);
+        let in_list = |v: &[i64]| v.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let account_clause = if account_ids.is_empty() {
+            String::new()
+        } else {
+            format!(" AND account_id IN ({})", in_list(&account_ids))
+        };
+        let sql = format!(
+            "SELECT upper(currency), SUM(amount_cents) FROM {}
+             WHERE category_id IN ({}){account_clause}
+               AND (?1 IS NULL OR booking_date >= ?1) AND (?2 IS NULL OR booking_date <= ?2)
+             GROUP BY upper(currency) ORDER BY upper(currency)",
+            crate::planning::effective_sql(
+                ", t.account_id AS account_id, t.currency AS currency",
+                " AND upper(t.currency) NOT IN ('', 'EUR')"
+            ),
+            in_list(&ids)
+        );
+        let mut stmt = db.prepare(&sql)?;
+        let out = stmt
+            .query_map(params![date_from, date_to], |r| {
+                Ok(CurrencyAmount {
+                    currency: r.get(0)?,
+                    cents: r.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// "Zusätzlich" next to the sidebar totals (#1049): per category (with its subcategories) and
+    /// currency other than EUR, what `list_categories_filtered_amount` leaves out. Takes the same
+    /// filters; empty for a single account, and without a query when no booking has another currency.
+    #[allow(clippy::too_many_arguments)]
+    pub fn category_other_currency_totals(
+        &self,
+        date_from: Option<String>,
+        date_to: Option<String>,
+        account_ids: Vec<i64>,
+        checked: Option<bool>,
+        direction: BookingDirection,
+        amount_min_cents: Option<i64>,
+        amount_max_cents: Option<i64>,
+        tag_ids: Vec<i64>,
+        untagged_only: bool,
+    ) -> Result<Vec<CategoryCurrencyAmount>, CoreError> {
+        if account_ids.len() == 1 {
+            return Ok(Vec::new());
+        }
+        let db = self.db()?;
+        if !crate::planning::has_other_currencies(&db)? {
+            return Ok(Vec::new());
+        }
+        let rows = Self::category_rows(&db)?;
+        let filters = Self::category_condition(
+            &account_ids,
+            direction,
+            amount_min_cents,
+            amount_max_cents,
+            &tag_ids,
+            untagged_only,
+        );
+        let condition = format!(
+            "{filters} AND upper(t.currency) NOT IN ('', 'EUR') AND (?3 IS NULL OR (t.checked != 0) = ?3)"
+        );
+        let mut stmt = db.prepare(&format!(
+            "SELECT category_id, upper(currency), SUM(amount_cents) FROM {}
+             WHERE category_id IS NOT NULL
+               AND (?1 IS NULL OR booking_date >= ?1) AND (?2 IS NULL OR booking_date <= ?2)
+             GROUP BY category_id, upper(currency)",
+            crate::planning::effective_sql(", t.currency AS currency", &condition)
+        ))?;
+        let checked = checked.map(i64::from);
+        let own = stmt
+            .query_map(params![date_from, date_to, checked], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        // roll every sum up to its ancestors, like the totals of the tree
+        let parent: HashMap<i64, Option<i64>> = rows.iter().map(|r| (r.0, r.1)).collect();
+        let mut sums: std::collections::BTreeMap<(i64, String), i64> = Default::default();
+        for (cat, currency, cents) in own {
+            let mut at = Some(cat);
+            let mut depth = 0;
+            while let Some(id) = at {
+                *sums.entry((id, currency.clone())).or_insert(0) += cents;
+                at = parent.get(&id).copied().flatten();
+                depth += 1;
+                if depth > 32 {
+                    break;
+                }
+            }
+        }
+        Ok(sums
+            .into_iter()
+            .filter(|(_, cents)| *cents != 0)
+            .map(|((category_id, currency), cents)| CategoryCurrencyAmount {
+                category_id,
+                currency,
+                cents,
+            })
+            .collect())
+    }
+
     pub fn create_category(
         &self,
         name: String,
@@ -235,9 +388,7 @@ impl Vault {
     ) -> Result<i64, CoreError> {
         let name = name.trim().to_string();
         if name.is_empty() {
-            return Err(CoreError::InvalidInput {
-                message: tr("Der Kategoriename ist leer.").into(),
-            });
+            return Err(CoreError::invalid(tr("Der Kategoriename ist leer.")));
         }
         let db = self.db()?;
         let order: i32 = db.query_row(
@@ -276,28 +427,7 @@ impl Vault {
         color_hex: String,
     ) -> Result<(), CoreError> {
         let db = self.db()?;
-        // Refuse moving a category below itself.
-        if let Some(mut p) = parent_id {
-            let mut guard = 0;
-            loop {
-                if p == id {
-                    return Err(CoreError::InvalidInput {
-                        message: tr("Eine Kategorie kann nicht in sich selbst verschoben werden.")
-                            .into(),
-                    });
-                }
-                guard += 1;
-                match db
-                    .query_row("SELECT parent_id FROM categories WHERE id = ?1", [p], |r| {
-                        r.get::<_, Option<i64>>(0)
-                    })
-                    .optional()?
-                {
-                    Some(Some(next)) if guard < 32 => p = next,
-                    _ => break,
-                }
-            }
-        }
+        ensure_not_below(&db, id, parent_id)?;
         // The UI shows built-in names translated; saving that unchanged
         // display name keeps the stored German default (and its logic).
         let stored: Option<(String, Option<i64>, String, String, Option<String>)> = db
@@ -341,6 +471,71 @@ impl Vault {
         Ok(())
     }
 
+    /// Puts `ids` as the children of `parent_id` (`None` = top level), in this order
+    /// (sidebar drag and drop, GitHub #977). A category of another parent is moved
+    /// here; one below itself is refused. Only changed fields get a sync stamp.
+    /// Ids that no longer exist are skipped.
+    pub fn reorder_categories(
+        &self,
+        parent_id: Option<i64>,
+        ids: Vec<i64>,
+    ) -> Result<(), CoreError> {
+        let db = self.db()?;
+        let tx = db.unchecked_transaction()?;
+        if let Some(p) = parent_id {
+            let live: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM categories WHERE id = ?1 AND deleted_ms IS NULL",
+                    [p],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if live.is_none() {
+                return Err(CoreError::invalid(tr(
+                    "Die Zielkategorie existiert nicht mehr.",
+                )));
+            }
+        }
+        let now = crate::dates::now_ms();
+        let mut seen = std::collections::HashSet::new();
+        let mut order = 0;
+        for id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            let stored: Option<(Option<i64>, i32)> = tx
+                .query_row(
+                    "SELECT parent_id, sort_order FROM categories WHERE id = ?1 AND deleted_ms IS NULL",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((old_parent, old_order)) = stored else {
+                continue;
+            };
+            if old_parent != parent_id {
+                ensure_not_below(&tx, id, parent_id)?;
+            }
+            tx.execute(
+                "UPDATE categories SET parent_id = ?2, sort_order = ?3,
+                        parent_ms = CASE WHEN ?4 THEN ?6 ELSE parent_ms END,
+                        order_ms = CASE WHEN ?5 THEN ?6 ELSE order_ms END
+                 WHERE id = ?1",
+                params![
+                    id,
+                    parent_id,
+                    order,
+                    old_parent != parent_id,
+                    old_order != order,
+                    now
+                ],
+            )?;
+            order += 1;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Deletes a category and its sub-categories (soft: the rows stay with a
     /// deletion stamp, so a sync does not bring them back); their rules go
     /// too and their transactions and splits become uncategorised. The
@@ -355,9 +550,81 @@ impl Vault {
 }
 
 #[cfg(test)]
+mod reorder_tests;
+#[cfg(test)]
 mod role_tests;
 
 impl Vault {
+    /// Conditions on `t` shared by the category totals and their "other currencies": accounts,
+    /// direction, amount range (#357) and tags (#1469). Ids and amounts are integers, so inlining them cannot inject anything.
+    fn category_condition(
+        account_ids: &[i64],
+        direction: BookingDirection,
+        amount_min_cents: Option<i64>,
+        amount_max_cents: Option<i64>,
+        tag_ids: &[i64],
+        untagged_only: bool,
+    ) -> String {
+        let accounts = if account_ids.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<String> = account_ids.iter().map(i64::to_string).collect();
+            format!(" AND t.account_id IN ({})", list.join(","))
+        };
+        // `+`: no `tx_amount_date` range scan here (a row lookup per match, 10x slower
+        // than the plain pass that sums every booking anyway).
+        let side = match direction {
+            BookingDirection::All => "",
+            BookingDirection::Income => " AND +t.amount_cents > 0",
+            BookingDirection::Expense => " AND +t.amount_cents < 0",
+        };
+        // absolute amount of the booking, like the list's amount range (#357)
+        let mut amount = String::new();
+        if let Some(min) = amount_min_cents {
+            amount.push_str(&format!(" AND ABS(t.amount_cents) >= {min}"));
+        }
+        if let Some(max) = amount_max_cents {
+            amount.push_str(&format!(" AND ABS(t.amount_cents) <= {max}"));
+        }
+        // tags like the list (`BookingFilter`): none at all, or every listed tag (AND)
+        let mut tags = String::new();
+        if untagged_only {
+            tags.push_str(
+                " AND NOT EXISTS (SELECT 1 FROM transaction_tags x JOIN tags g ON g.id = x.tag_id \
+                 WHERE x.transaction_id = t.id AND g.deleted_ms IS NULL)",
+            );
+        } else {
+            let mut ids = tag_ids.to_vec();
+            ids.sort_unstable();
+            ids.dedup();
+            for tag in ids {
+                tags.push_str(&format!(
+                    " AND EXISTS (SELECT 1 FROM transaction_tags x WHERE x.transaction_id = t.id AND x.tag_id = {tag})"
+                ));
+            }
+        }
+        format!("{accounts}{side}{amount}{tags}")
+    }
+
+    /// `category_id` and all its descendants (capped like the history queries).
+    fn category_subtree(
+        rows: &[(i64, Option<i64>, String, String, String, i32, Option<i64>)],
+        category_id: i64,
+    ) -> Vec<i64> {
+        let mut ids = vec![category_id];
+        let mut i = 0;
+        while i < ids.len() && ids.len() < 4096 {
+            let cur = ids[i];
+            for r in rows.iter().filter(|r| r.1 == Some(cur)) {
+                if !ids.contains(&r.0) {
+                    ids.push(r.0);
+                }
+            }
+            i += 1;
+        }
+        ids
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn categories_with_filters(
         &self,
@@ -368,35 +635,24 @@ impl Vault {
         direction: BookingDirection,
         amount_min_cents: Option<i64>,
         amount_max_cents: Option<i64>,
+        tag_ids: Vec<i64>,
+        untagged_only: bool,
     ) -> Result<Vec<Category>, CoreError> {
         let db = self.db()?;
         let rows = Self::category_rows(&db)?;
         let mut totals: HashMap<Option<i64>, (i64, u32)> = HashMap::new();
         {
-            // ids are integers, so inlining them cannot inject anything
-            let accounts = if account_ids.is_empty() {
-                String::new()
-            } else {
-                let list: Vec<String> = account_ids.iter().map(i64::to_string).collect();
-                format!(" AND t.account_id IN ({})", list.join(","))
-            };
-            // `+`: no `tx_amount_date` range scan here (a row lookup per match, 10x slower
-            // than the plain pass that sums every booking anyway).
-            let side = match direction {
-                BookingDirection::All => "",
-                BookingDirection::Income => " AND +t.amount_cents > 0",
-                BookingDirection::Expense => " AND +t.amount_cents < 0",
-            };
-            // absolute amount of the booking, like the list's amount range (#357); ints are inlined
-            let mut amount = String::new();
-            if let Some(min) = amount_min_cents {
-                amount.push_str(&format!(" AND ABS(t.amount_cents) >= {min}"));
-            }
-            if let Some(max) = amount_max_cents {
-                amount.push_str(&format!(" AND ABS(t.amount_cents) <= {max}"));
-            }
+            let filters = Self::category_condition(
+                &account_ids,
+                direction,
+                amount_min_cents,
+                amount_max_cents,
+                &tag_ids,
+                untagged_only,
+            );
+            let currency = crate::planning::sums_condition(account_ids.len());
             let condition =
-                format!("{accounts}{side}{amount} AND (?3 IS NULL OR (t.checked != 0) = ?3)");
+                format!("{filters}{currency} AND (?3 IS NULL OR (t.checked != 0) = ?3)");
             let mut stmt = db.prepare(&format!(
                 "SELECT category_id, SUM(amount_cents), COUNT(*) FROM {}
                  WHERE (?1 IS NULL OR booking_date >= ?1) AND (?2 IS NULL OR booking_date <= ?2)

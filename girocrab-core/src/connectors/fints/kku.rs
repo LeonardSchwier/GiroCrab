@@ -25,7 +25,7 @@
 
 use super::syntax::{Segment, Value};
 use crate::connectors::RemoteTransaction;
-use crate::money::parse_cents;
+use crate::money::{cents, decimal};
 
 /// Booked balance of the card account.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,8 +69,14 @@ fn components(el: &[Value]) -> Vec<String> {
 }
 
 fn signed(amount: &str, mark: &str) -> Option<i64> {
-    let cents = parse_cents(amount).ok()?;
+    let cents = amount_cents(amount)?;
     Some(if mark == "D" { -cents } else { cents })
+}
+
+/// KKU amounts are German display numbers: `.` groups, `,` is always the
+/// decimal separator ("1.234,00", "1,500").
+fn amount_cents(amount: &str) -> Option<i64> {
+    decimal(&amount.replace('.', ""), ',').and_then(cents)
 }
 
 /// Where the fields of one booking group are. HIKKU v1 has 25 components (see the
@@ -181,14 +187,14 @@ pub fn parse<'a>(
     let mut txs = Vec::new();
     let mut balance = None;
     for s in segments {
-        if balance.is_none() {
-            if let Some(cents) = signed(s.get(3, 1), s.get(3, 0)) {
-                balance = Some(CardBalance {
-                    cents,
-                    currency: s.get(3, 2).to_string(),
-                    date: iso_date(s.get(3, 3)).unwrap_or_default(),
-                });
-            }
+        if balance.is_none()
+            && let Some(cents) = signed(s.get(3, 1), s.get(3, 0))
+        {
+            balance = Some(CardBalance {
+                cents,
+                currency: s.get(3, 2).to_string(),
+                date: iso_date(s.get(3, 3)).unwrap_or_default(),
+            });
         }
         let l = layout(s);
         for el in s.elements.iter().skip(6) {
@@ -212,7 +218,7 @@ fn kind(s: &str) -> char {
         'd'
     } else if digits(s) {
         '#'
-    } else if s.contains(',') && parse_cents(s).is_ok() {
+    } else if s.contains(',') && amount_cents(s).is_some() {
         'n'
     } else if s == "C" || s == "D" {
         'm'

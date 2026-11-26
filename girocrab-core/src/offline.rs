@@ -14,11 +14,10 @@
 //! offline accounts in this sense; accounts of a bank connection are synced and
 //! stay read-only.
 
-use chrono::NaiveDate;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::connectors::group_for;
-use crate::dates::now_ms;
+use crate::dates::{now_ms, today_iso as today};
 use crate::error::{CoreError, CoreResult};
 use crate::i18n::{tr, trf};
 use crate::models::AccountKind;
@@ -40,7 +39,8 @@ pub(crate) const OFFLINE_SQL: &str =
 pub struct ManualBookingSetup {
     /// `YYYY-MM-DD`.
     pub booking_date: String,
-    /// Negative = money out. Never 0.
+    /// Negative = money out. A new booking is never 0. An existing 0-€ split booking may keep 0
+    /// as long as it keeps nonempty parts (they carry its amounts).
     pub amount_cents: i64,
     pub counterparty: String,
     pub purpose: String,
@@ -49,25 +49,14 @@ pub struct ManualBookingSetup {
     pub note: String,
 }
 
-fn invalid(message: String) -> CoreError {
-    CoreError::InvalidInput { message }
-}
-
 fn not_found(what: String) -> CoreError {
     CoreError::NotFound { what }
-}
-
-fn today() -> String {
-    chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string()
 }
 
 fn clean(text: &str, max: usize) -> CoreResult<String> {
     let t = text.trim();
     if t.chars().count() > max {
-        return Err(invalid(trf(
+        return Err(CoreError::invalid(trf(
             "Der Text ist zu lang (höchstens {0} Zeichen).",
             &[&max],
         )));
@@ -76,9 +65,9 @@ fn clean(text: &str, max: usize) -> CoreResult<String> {
 }
 
 fn parse_date(date: &str) -> CoreResult<String> {
-    NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .map_err(|_| invalid(trf("Ungültiges Datum: {0}", &[&date.trim()])))
+    jiff::civil::Date::strptime("%Y-%m-%d", date.trim())
+        .map(crate::dates::iso)
+        .map_err(|_| CoreError::invalid(trf("Ungültiges Datum: {0}", &[&date.trim()])))
 }
 
 fn require_offline(conn: &Connection, account_id: i64) -> CoreResult<()> {
@@ -91,9 +80,9 @@ fn require_offline(conn: &Connection, account_id: i64) -> CoreResult<()> {
         .optional()?;
     match ok {
         Some(true) => Ok(()),
-        Some(false) => Err(invalid(
-            tr("Manuelle Buchungen sind nur in Offline-Konten möglich.").to_string(),
-        )),
+        Some(false) => Err(CoreError::invalid(tr(
+            "Manuelle Buchungen sind nur in Offline-Konten möglich.",
+        ))),
         None => Err(not_found(trf("Konto {0}", &[&account_id]))),
     }
 }
@@ -192,13 +181,39 @@ pub(crate) fn insert_booking(
     Ok(conn.last_insert_rowid())
 }
 
+/// Normalises an account currency: three ASCII letters (ISO 4217), upper-cased; empty means EUR.
+fn clean_currency(code: &str) -> CoreResult<String> {
+    let code = code.trim();
+    if code.is_empty() {
+        return Ok("EUR".to_string());
+    }
+    if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(CoreError::invalid(tr(
+            "Die Währung muss ein dreistelliger ISO-Code sein (z. B. EUR).",
+        )));
+    }
+    Ok(code.to_ascii_uppercase())
+}
+
+/// Sidebar symbol of a new offline account: one per kind, so a savings account is told from cash at a glance (#1049).
+fn offline_symbol(kind: AccountKind) -> &'static str {
+    match kind {
+        AccountKind::Cash => "banknote",
+        AccountKind::Savings => "percent",
+        AccountKind::TimeDeposit => "lock.circle",
+        _ => "pencil.and.list.clipboard",
+    }
+}
+
 /// Creates the account row, places it in its sidebar group and stores the opening balance.
 pub(crate) fn create_in(
     conn: &Connection,
     name: &str,
     kind: AccountKind,
+    currency: &str,
     opening_cents: i64,
 ) -> CoreResult<i64> {
+    let currency = clean_currency(currency)?;
     let name = clean(name, MAX_NAME_CHARS)?;
     let name = if name.is_empty() {
         tr("Bargeld").to_string()
@@ -209,20 +224,17 @@ pub(crate) fn create_in(
     let gid = Vault::ensure_group(conn, group, symbol, order)?;
     conn.execute(
         "INSERT INTO accounts(connection_id, group_id, external_ref, name, kind, sf_symbol, balance_cents,
-                              balance_date, sort_order)
-         VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, (SELECT IFNULL(MAX(sort_order), 0) + 1 FROM accounts))",
+                              balance_date, currency, sort_order)
+         VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, (SELECT IFNULL(MAX(sort_order), 0) + 1 FROM accounts))",
         params![
             gid,
             format!("{EXTERNAL_REF_PREFIX}{}", uuid::Uuid::new_v4()),
             name,
             kind.as_str(),
-            if kind == AccountKind::Cash {
-                "banknote"
-            } else {
-                "pencil.and.list.clipboard"
-            },
+            offline_symbol(kind),
             opening_cents,
-            today()
+            today(),
+            currency
         ],
     )?;
     let id = conn.last_insert_rowid();
@@ -237,9 +249,12 @@ fn finish(conn: &Connection, account_id: i64) -> CoreResult<()> {
     crate::opening_balance::refresh(conn, account_id)
 }
 
-fn validate(s: &ManualBookingSetup) -> CoreResult<(String, String, String, String)> {
-    if s.amount_cents == 0 {
-        return Err(invalid(tr("Der Betrag darf nicht 0 sein.").to_string()));
+fn validate(
+    s: &ManualBookingSetup,
+    unchanged_zero_split: bool,
+) -> CoreResult<(String, String, String, String)> {
+    if s.amount_cents == 0 && !unchanged_zero_split {
+        return Err(CoreError::invalid(tr("Der Betrag darf nicht 0 sein.")));
     }
     Ok((
         parse_date(&s.booking_date)?,
@@ -253,21 +268,23 @@ fn validate(s: &ManualBookingSetup) -> CoreResult<(String, String, String, Strin
 impl Vault {
     /// Creates an offline account (no bank connection) with a starting balance
     /// and returns its id. An empty name becomes "Bargeld". `kind` must not be a
-    /// depot or loan: they have their own flows.
+    /// depot or loan: they have their own flows. `currency` is an ISO 4217 code
+    /// (empty = EUR); bookings and balance use it, nothing is converted.
     pub fn create_offline_account(
         &self,
         name: String,
         kind: AccountKind,
+        currency: String,
         opening_cents: i64,
     ) -> Result<i64, CoreError> {
         if matches!(kind, AccountKind::Brokerage | AccountKind::Loan) {
-            return Err(invalid(
-                tr("Depots und Darlehen werden nicht als Offline-Konto angelegt.").to_string(),
-            ));
+            return Err(CoreError::invalid(tr(
+                "Depots und Darlehen werden nicht als Offline-Konto angelegt.",
+            )));
         }
         let db = self.db()?;
         let tx = db.unchecked_transaction()?;
-        let id = create_in(&tx, &name, kind, opening_cents)?;
+        let id = create_in(&tx, &name, kind, &currency, opening_cents)?;
         tx.commit()?;
         Ok(id)
     }
@@ -293,12 +310,40 @@ impl Vault {
         booking_id: Option<i64>,
         setup: ManualBookingSetup,
     ) -> Result<i64, CoreError> {
-        let (date, counterparty, purpose, note) = validate(&setup)?;
+        self.save_manual_booking_with_splits(account_id, booking_id, setup, None)
+    }
+
+    /// Saves the booking and optional replacement splits atomically. `None` keeps its splits.
+    /// Changing a split booking's amount requires nonempty parts summing to the new amount.
+    /// A new booking of 0 is rejected; an existing 0-€ split booking saves with 0 only while it
+    /// keeps its parts (`None`) or gets nonempty replacement parts summing to 0.
+    pub fn save_manual_booking_with_splits(
+        &self,
+        account_id: i64,
+        booking_id: Option<i64>,
+        setup: ManualBookingSetup,
+        splits: Option<Vec<crate::models::TransactionSplitInput>>,
+    ) -> Result<i64, CoreError> {
+        if let Some(parts) = &splits {
+            crate::planning::validate_splits(setup.amount_cents, parts)?;
+        }
         let db = self.db()?;
         let tx = db.unchecked_transaction()?;
+        let unchanged_zero_split = if let Some(id) = booking_id {
+            tx.query_row("SELECT amount_cents=0 AND EXISTS(SELECT 1 FROM transaction_splits WHERE transaction_id=?1) FROM transactions WHERE id=?1", [id], |r| r.get::<_,bool>(0)).optional()?.unwrap_or(false)
+                && setup.amount_cents == 0
+                // the exception holds only while the booking keeps its parts: an empty
+                // replacement would leave a zero booking without splits (CodeRabbit #1851)
+                && splits.as_ref().is_none_or(|parts| !parts.is_empty())
+        } else {
+            false
+        };
+        let (date, counterparty, purpose, note) = validate(&setup, unchanged_zero_split)?;
         require_offline(&tx, account_id)?;
         require_category(&tx, setup.category_id)?;
         ensure_opening(&tx, account_id)?;
+        let mut amount_changed = false;
+        let mut date_changed = false;
         let id = match booking_id {
             None => insert_booking(
                 &tx,
@@ -313,6 +358,18 @@ impl Vault {
                 if booking_account(&tx, id)? != account_id {
                     return Err(not_found(trf("Buchung {0}", &[&id])));
                 }
+                let (changed, has_splits): (bool, bool) = tx.query_row(
+                    "SELECT amount_cents != ?2, EXISTS(SELECT 1 FROM transaction_splits WHERE transaction_id=?1)
+                     FROM transactions WHERE id=?1",
+                    params![id, setup.amount_cents], |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                amount_changed = changed;
+                date_changed = tx.query_row("SELECT booking_date != ?2 OR COALESCE(value_date,'') != ?2 FROM transactions WHERE id=?1", params![id,date], |r| r.get(0))?;
+                if amount_changed && has_splits && splits.as_ref().is_none_or(Vec::is_empty) {
+                    return Err(CoreError::invalid(tr(
+                        "Bitte passen Sie die Aufteilung zusammen mit dem Buchungsbetrag an.",
+                    )));
+                }
                 let ms = now_ms();
                 let old: (Option<i64>, String, String) = tx.query_row(
                     "SELECT category_id, note, counterparty || char(31) || purpose FROM transactions WHERE id = ?1",
@@ -325,7 +382,8 @@ impl Vault {
                 )?;
                 if old.2 != format!("{counterparty}\u{1f}{purpose}") {
                     tx.execute(
-                        "UPDATE transactions SET counterparty = ?1, purpose = ?2, text_ms = ?4 WHERE id = ?3",
+                        // never below the stored stamp, also with a clock behind a peer's
+                        "UPDATE transactions SET counterparty = ?1, purpose = ?2, text_ms = MAX(text_ms + 1, ?4) WHERE id = ?3",
                         params![counterparty, purpose, id, ms],
                     )?;
                 }
@@ -346,6 +404,30 @@ impl Vault {
                 id
             }
         };
+        if let Some(parts) = &splits {
+            crate::planning::store_splits(&tx, id, parts)?;
+        }
+        // amount and parts sync as one unit (`splits_ms`), the date on its own (`date_ms`)
+        if amount_changed {
+            tx.execute(
+                "UPDATE transactions SET splits_ms=MAX(splits_ms+1,?2) WHERE id=?1",
+                params![id, now_ms()],
+            )?;
+            // rules can match amounts: a rule-assigned category is evaluated again by `finish`,
+            // as on a receiving device (sync merge); manual categories and splits stay
+            tx.execute(
+                "UPDATE transactions SET category_id = NULL, rule_id = NULL, category_source = 'none'
+                  WHERE id = ?1 AND category_source = 'rule'
+                    AND NOT EXISTS (SELECT 1 FROM transaction_splits WHERE transaction_id = ?1)",
+                [id],
+            )?;
+        }
+        if date_changed {
+            tx.execute(
+                "UPDATE transactions SET date_ms=MAX(date_ms+1,?2) WHERE id=?1",
+                params![id, now_ms()],
+            )?;
+        }
         finish(&tx, account_id)?;
         tx.commit()?;
         Ok(id)
@@ -394,12 +476,12 @@ impl Vault {
             .optional()?
             .ok_or_else(|| not_found(trf("Buchung {0}", &[&booking_id])))?;
         if source_account == account_id {
-            return Err(invalid(
-                tr("Eine Buchung lässt sich nicht in ihr eigenes Konto spiegeln.").to_string(),
-            ));
+            return Err(CoreError::invalid(tr(
+                "Eine Buchung lässt sich nicht in ihr eigenes Konto spiegeln.",
+            )));
         }
         if cents == 0 {
-            return Err(invalid(tr("Der Betrag darf nicht 0 sein.").to_string()));
+            return Err(CoreError::invalid(tr("Der Betrag darf nicht 0 sein.")));
         }
         ensure_opening(&tx, account_id)?;
         let setup = ManualBookingSetup {

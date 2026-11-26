@@ -18,12 +18,18 @@ ApplicationWindow {
     // The booking list gives up width first (560 → 360) so the inspector never leaves the
     // window on small screens (e.g. 1920 px at 200 % scaling).
     minimumWidth: 240 * Theme.textScale + 360 + 280; minimumHeight: 480
-    title: AppModel.isUnlocked ? AppModel.title + " – GiroCrab" : "GiroCrab"
+    // BookingListView.swift › WindowTitle: an account or category name stays out of the title
+    // while privacy mode (or the report) hides personal data or labels
+    title: AppModel.isUnlocked && (AppModel.effectiveRedaction & (AppModel.redactPersonal | AppModel.redactLabels)) === 0
+           ? AppModel.title + " – GiroCrab" : "GiroCrab"
     color: Theme.canvas
 
     // LanguagePreference.startupQuestion (RootView on the Mac): decided once at start-up.
     readonly property string languageQuestion: (AppModel.run(() => AppModel.core("language_state")) || { question: "none" }).question
     property bool languagePromptDone: false
+    // Externe Analyse (#136): the singleton starts and stops the local socket with the vault
+    // (AppModel+LocalApi.swift › reconcileLocalApiServer), also while Settings never opened.
+    readonly property QtObject externalAccess: ExternalAccess
     readonly property bool showLanguagePrompt: languageQuestion === "choose" && !languagePromptDone
     Component.onCompleted: {
         if (showLanguagePrompt) return   // the vault opens after the language screen
@@ -58,11 +64,12 @@ ApplicationWindow {
             Action { text: qsTr("Bank hinzufügen …"); enabled: AppModel.isUnlocked; onTriggered: AppModel.showAddBank = true }
             Action { text: qsTr("Neues Darlehen …"); enabled: AppModel.isUnlocked; onTriggered: AppModel.openLoanEditor("create") }
             Action { text: qsTr("Neues Sachwerte-Konto …"); enabled: AppModel.isUnlocked; onTriggered: AppModel.createTangibleAccount() }
+            Action { text: qsTr("Neues Offline-Konto …"); enabled: AppModel.isUnlocked; onTriggered: OfflineAccounts.openNewAccount() }
             Action { text: qsTr("Neue Hauptkategorie …"); enabled: AppModel.isUnlocked; onTriggered: AppModel.newCategoryRequest = { parent: null } }
             AppMenuSeparator {}
             Action { text: qsTr("Vorhandene Daten importieren …"); enabled: AppModel.isUnlocked; onTriggered: AppModel.openMoneyMoneyImport() }
-            Action { text: qsTr("Umsätze exportieren …"); enabled: AppModel.isUnlocked; onTriggered: AppModel.openBookingExport(false) }
-            Action { text: qsTr("Umsätze als CSV exportieren …"); enabled: AppModel.isUnlocked; onTriggered: AppModel.exportFilteredBookingsCSV() }
+            // RootView.swift: one export command (#831), ⇧⌘E
+            Action { text: qsTr("Umsätze exportieren …"); shortcut: "Ctrl+Shift+E"; enabled: AppModel.isUnlocked; onTriggered: AppModel.openBookingExport(false) }
             AppMenuSeparator {}
             Action { text: qsTr("Drucken …"); shortcut: "Ctrl+P"; enabled: AppModel.isUnlocked; onTriggered: AppModel.showPrintSheet = true }
             AppMenuSeparator {}
@@ -90,8 +97,29 @@ ApplicationWindow {
                      shortcut: "Ctrl+Alt+I"; enabled: AppModel.isUnlocked; onTriggered: AppModel.showInspector = !AppModel.showInspector }
             Action { text: qsTr("Auswertungen anzeigen"); checkable: true; checked: AppModel.showStatistics; onToggled: AppModel.showStatistics = checked }
             Action { text: qsTr("Budgets anzeigen"); checkable: true; checked: AppModel.showBudgets; enabled: AppModel.isUnlocked; onToggled: AppModel.showBudgets = checked }
+            // RootView.swift › Toggle("Saldo anzeigen") (#577)
+            Action { text: qsTr("Saldo anzeigen"); checkable: true; checked: ListBalances.shown; enabled: AppModel.isUnlocked
+                     onToggled: { ListBalances.setShown(checked); checked = Qt.binding(() => ListBalances.shown) } }
             // RootView.swift › Toggle("Kopfbereich minimieren") (#358)
             Action { text: qsTr("Kopfbereich minimieren"); checkable: true; checked: AppModel.compactHeader; enabled: AppModel.isUnlocked; onToggled: AppModel.compactHeader = checked }
+            // RootView.swift › Toggle("Letzten Abruf anzeigen") (#815)
+            Action { text: qsTr("Letzten Abruf anzeigen"); checkable: true; checked: LastFetch.shown; enabled: AppModel.isUnlocked
+                     onToggled: { LastFetch.setShown(checked); checked = Qt.binding(() => LastFetch.shown) } }
+            // the header chart (#634, #1760): its own switch, independent of „Auswertungen anzeigen“
+            Action { text: qsTr("Diagramm anzeigen"); checkable: true; checked: !BalanceChartPrefs.collapsed; enabled: AppModel.isUnlocked
+                     onToggled: { BalanceChartPrefs.setCollapsed(!checked); checked = Qt.binding(() => !BalanceChartPrefs.collapsed) } }
+            AppMenu {
+                title: qsTr("Diagramm")
+                enabled: AppModel.isUnlocked
+                Repeater {
+                    model: BalanceChartPrefs.styles
+                    AppMenuItem { required property var modelData; text: modelData.title; checkable: true
+                                  checked: BalanceChartPrefs.style === modelData.id
+                                  onTriggered: { checked = Qt.binding(() => BalanceChartPrefs.style === modelData.id); BalanceChartPrefs.setStyle(modelData.id) } }
+                }
+            }
+            // RootView.swift › Toggle("Privatmodus") ⇧⌘H (#719): hides amounts (or all personal data, Einstellungen › Allgemein)
+            Action { text: qsTr("Privatmodus"); shortcut: "Ctrl+Shift+H"; checkable: true; checked: PrivacyMode.enabled; onToggled: PrivacyMode.setEnabled(checked) }
             AppMenuSeparator {}
             // Like Mail/Notes: text size of the whole app (#343).
             Action { text: qsTr("Größer"); shortcut: "Ctrl++"; enabled: Theme.steppedTextSize(1) !== ""
@@ -129,6 +157,13 @@ ApplicationWindow {
         }
         AppMenu {
             title: qsTr("B&uchung")
+            // Offline accounts (#679, #81): typed bookings
+            Action { text: qsTr("Neue Buchung …"); shortcut: "Ctrl+Alt+N"; enabled: OfflineAccounts.canAddManualBooking; onTriggered: OfflineAccounts.openManualBooking() }
+            Action { text: qsTr("Buchung bearbeiten …"); enabled: OfflineAccounts.isManuallyEditable(AppModel.selectedBooking)
+                     onTriggered: OfflineAccounts.editManualBooking(AppModel.selectedBooking) }
+            Action { text: qsTr("Buchung löschen …"); enabled: OfflineAccounts.isManuallyEditable(AppModel.selectedBooking)
+                     onTriggered: OfflineAccounts.deleting = AppModel.selectedBooking }
+            AppMenuSeparator {}
             // In the list, the single keys C and R do the same (kept for speed).
             Action { text: qsTr("Kategorisieren …"); shortcut: "Ctrl+Meta+C"; enabled: AppModel.selectedBooking !== null
                      onTriggered: AppModel.showCategorizer = true }
@@ -177,9 +212,10 @@ ApplicationWindow {
             Action { text: qsTr("Nächste Buchung"); shortcut: "Ctrl+Meta+Down"; onTriggered: AppModel.moveSelection(1) }
             Action { text: qsTr("Vorherige Buchung"); shortcut: "Ctrl+Meta+Up"; onTriggered: AppModel.moveSelection(-1) }
             AppMenuSeparator {}
-            Action { text: qsTr("Alle Buchungen"); shortcut: "Ctrl+1"; onTriggered: AppModel.scope = "All" }
-            Action { text: qsTr("Alltag && Konsum"); shortcut: "Ctrl+2"; onTriggered: AppModel.scope = "Everyday" }
-            Action { text: qsTr("Sparpläne && Perks"); shortcut: "Ctrl+3"; onTriggered: AppModel.scope = "Investments" }
+            // AccountPresentation.menuTitle: booking scopes or the depot tabs (#564)
+            Action { text: DepotState.menuTitle(0, qsTr("Alle Buchungen")); shortcut: "Ctrl+1"; onTriggered: DepotState.applyScopeShortcut(0, "All") }
+            Action { text: DepotState.menuTitle(1, qsTr("Alltag && Konsum")); shortcut: "Ctrl+2"; onTriggered: DepotState.applyScopeShortcut(1, "Everyday") }
+            Action { text: DepotState.menuTitle(2, qsTr("Sparpläne && Perks")); shortcut: "Ctrl+3"; onTriggered: DepotState.applyScopeShortcut(2, "Investments") }
             // MARK: manual loans – LoanAssignMenu(model:booking: model.selectedBooking)
             AppMenuSeparator {}
             LoanAssignMenu { booking: AppModel.selectedBooking }
@@ -196,7 +232,8 @@ ApplicationWindow {
             Action { text: qsTr("Mitteilungen …"); onTriggered: Announcements.showWindow = true }
             AppMenuSeparator {}
             // #301: redacted screenshot + scrubbed diagnostics, then a prefilled issue.
-            Action { text: qsTr("Problem melden …"); shortcut: "Ctrl+Alt+B"; onTriggered: AppModel.showBugReport = true }
+            // greyed out while the report is open: its „Neu aufnehmen“ refreshes the picture (#384)
+            Action { text: qsTr("Problem melden …"); shortcut: "Ctrl+Alt+B"; enabled: !AppModel.showBugReport; onTriggered: AppModel.showBugReport = true }
             AppMenuSeparator {}
             Action { text: qsTr("Webseite && Dokumentation (girocrab.de)"); onTriggered: Qt.openUrlExternally("https://girocrab.de") }
             Action { text: qsTr("Fehler melden / Issue erstellen (GitHub)"); onTriggered: Qt.openUrlExternally("https://github.com/GiroCrab/GiroCrab/issues") }
@@ -265,18 +302,30 @@ ApplicationWindow {
             }
             // bookingColumn: Belege, Vermögen, Geplant or Lastschriften replace the booking list
             StackLayout {
-                SplitView.minimumWidth: Math.max(360, Math.min(560, window.width - sidebarPane.width - (AppModel.showInspector ? 280 : 0) - 2))
+                SplitView.minimumWidth: Math.max(360, Math.min(560, window.width - sidebarPane.width - (inspectorPane.visible ? 280 : 0) - 2))
                 SplitView.fillWidth: true
-                currentIndex: ({ documents: 1, wealth: 2, planned: 3, directDebits: 4 })[AppModel.sidebarSelection] ?? 0
+                currentIndex: DepotState.presentation === "securities" ? 5
+                              : ({ documents: 1, wealth: 2, planned: 3, directDebits: 4 })[AppModel.sidebarSelection] ?? 0
                 BookingStreamView {}
                 DocumentsView {}
                 // built only while shown (it loads the depot positions and the cash history)
                 Loader { active: AppModel.sidebarSelection === "wealth"; sourceComponent: Component { WealthView {} } }
                 Loader { active: AppModel.sidebarSelection === "planned"; sourceComponent: Component { PlannedPaymentsView {} } }
                 Loader { active: AppModel.sidebarSelection === "directDebits"; sourceComponent: Component { DirectDebitsView {} } }
+                // accountColumn (RootView.swift, #564): a securities depot has its own view; one instance
+                // per account (`.id(account.id)`), so no state of another account stays
+                Item {
+                    Repeater {
+                        model: DepotState.selectedSecuritiesDepot ? [DepotState.selectedSecuritiesDepot.id] : []
+                        DepotDetailView { required property var modelData; anchors.fill: parent; account: AppModel.account(modelData) }
+                    }
+                }
             }
             InspectorView {
-                visible: AppModel.showInspector
+                id: inspectorPane
+                // RootView.swift (#934): Belege & Postbox has its own preview; the booking inspector
+                // would show whatever booking was selected last
+                visible: AppModel.showInspector && AppModel.sidebarSelection !== "documents"
                 SplitView.minimumWidth: 280; SplitView.preferredWidth: 320; SplitView.maximumWidth: 380
             }
         }
@@ -301,25 +350,40 @@ ApplicationWindow {
                 options: AppModel.wealthScopes
                 current: AppModel.wealthScope
                 onActivated: id => AppModel.wealthScope = id
+                Accessible.name: qsTr("Ansicht")
             }
-            // DocumentsScopePicker (DocumentsUI.swift, #526) in „Belege & PostBox“
+            // DocumentsScopePicker (DocumentsUI.swift, #526) in „Belege & Postbox“
             Segmented {
                 visible: AppModel.sidebarSelection === "documents"
                 options: DocumentsScope.options
                 current: DocumentsScope.current
                 onActivated: id => DocumentsScope.current = id
+                Accessible.name: qsTr("Dokumente")
                 HoverHandler { id: docScopeHover }
                 ToolTip.text: qsTr("Alle Dokumente, eigene Belege oder Bankdokumente anzeigen"); ToolTip.visible: docScopeHover.hovered; ToolTip.delay: 600
             }
+            // DepotTabPicker (DepotDetailView.swift, #564)
             Segmented {
-                visible: AppModel.sidebarSelection !== "wealth" && AppModel.sidebarSelection !== "documents"
+                visible: DepotState.presentation === "securities"
+                options: DepotState.depotTabs
+                current: DepotState.depotTab
+                onActivated: id => DepotState.depotTab = id
+                HoverHandler { id: depotTabHover }
+                ToolTip.text: qsTr("Positionen oder Wertpapieraktivitäten (Strg+1, Strg+2)"); ToolTip.visible: depotTabHover.hovered; ToolTip.delay: 600
+            }
+            Segmented {
+                visible: AppModel.sidebarSelection !== "wealth" && AppModel.sidebarSelection !== "documents" && DepotState.presentation === "bookings"
                 options: AppModel.scopes
                 current: AppModel.scope
                 enabled: AppModel.sidebarSelection !== "newBookings"
                 onActivated: id => AppModel.scope = id
+                Accessible.name: qsTr("Ansicht")
                 ToolTip.text: qsTr("Ansicht wählen (Strg+1, Strg+2, Strg+3)")
             }
             IconButton { symbol: "paperplane"; enabled: AppModel.canTransfer; onClicked: AppModel.openTransfer(); ToolTip.text: qsTr("Neue Überweisung (Strg+N)"); ToolTip.visible: hovered }
+            // MainToolbar › ToolbarItem(id: "newBooking") (#679)
+            IconButton { symbol: "plus"; enabled: OfflineAccounts.canAddManualBooking; onClicked: OfflineAccounts.openManualBooking()
+                         ToolTip.text: qsTr("Neue Buchung (Strg+Alt+N)"); ToolTip.visible: hovered; Accessible.name: qsTr("Neue Buchung") }
             // .disabled(bankingBlocksAll).help(gate message): the wrapper sees the hover of the disabled button
             Item {
                 implicitWidth: syncAllButton.implicitWidth; implicitHeight: syncAllButton.implicitHeight
@@ -341,15 +405,27 @@ ApplicationWindow {
                 ToolTip.text: AppModel.showInspector ? qsTr("Informationen ausblenden (Strg+Alt+I)") : qsTr("Informationen einblenden (Strg+Alt+I)")
                 ToolTip.visible: hovered
             }
+            // MainToolbar › ToolbarItem(id: "privacy") (BookingListView.swift, #719)
+            IconButton {
+                symbol: PrivacyMode.enabled ? "eye.slash" : "eye"
+                checkable: true; checked: PrivacyMode.enabled
+                onToggled: PrivacyMode.setEnabled(checked)
+                ToolTip.text: PrivacyMode.enabled ? qsTr("Privatmodus beenden (Strg+Umschalt+H)")
+                    : PrivacyMode.scope === "personal" ? qsTr("Privatmodus: Beträge und persönliche Angaben ausblenden (Strg+Umschalt+H)")
+                    : qsTr("Privatmodus: Beträge ausblenden (Strg+Umschalt+H)")
+                ToolTip.visible: hovered
+            }
             TextField {
                 id: search
                 Layout.preferredWidth: Math.max(220, Math.min(510, window.width * 0.22))
-                placeholderText: qsTr("Händler, Zweck, IBAN, Betrag")
-                text: AppModel.searchText
-                onTextEdited: AppModel.searchText = text
+                // AssetAccountFrame `.searchable`: the holdings views search their own positions (#564)
+                readonly property bool holdings: DepotState.presentation !== "bookings"
+                placeholderText: holdings ? DepotState.searchPrompt : qsTr("Händler, Zweck, IBAN, Betrag")
+                text: holdings ? DepotState.query : AppModel.searchText
+                onTextEdited: { if (holdings) DepotState.query = text; else AppModel.searchText = text }
                 leftPadding: 28
                 SFIcon { symbol: "magnifyingglass"; size: 14; anchors.verticalCenter: parent.verticalCenter; x: 8 }
-                Keys.onEscapePressed: AppModel.searchText = ""
+                Keys.onEscapePressed: { if (holdings) DepotState.query = ""; else AppModel.searchText = "" }
                 Sensitive { when: search.text !== "" }   // typed names, IBANs, amounts (#301)
             }
         }
@@ -384,7 +460,7 @@ ApplicationWindow {
     CustomPeriodForm {}
     // Separate windows, created when opened (built eagerly they cost start-up time
     // and memory, the help window carries the whole help text).
-    Loader { active: AppModel.showSettings; sourceComponent: Component { SettingsWindow {} }
+    Loader { id: settingsLoader; active: AppModel.showSettings; sourceComponent: Component { SettingsWindow {} }
              onLoaded: { item.requestActivate(); item.raise() } }
     Loader { active: AppModel.showSyncLog; sourceComponent: Component { SyncLogWindow {} }
              onLoaded: { item.reload(); item.requestActivate(); item.raise() } }
@@ -393,7 +469,7 @@ ApplicationWindow {
     Loader { active: Announcements.showWindow; sourceComponent: Component { AnnouncementsWindow {} } }
     // BugReportView: its own window, so the main window stays free to be captured.
     Loader { active: AppModel.showBugReport
-             sourceComponent: Component { BugReportWindow { mainWindow: window; captureItem: rootLayout } }
+             sourceComponent: Component { BugReportWindow { mainWindow: window; captureItem: rootLayout; settingsWindow: settingsLoader.item } }
              onLoaded: { item.requestActivate(); item.raise() } }
     TwoFactorSheet {}
     BankSetupSheet {}
@@ -421,6 +497,7 @@ ApplicationWindow {
     // SystemLanguageChangedAlert: the system language moved away from the chosen app language.
     Sheet {
         id: systemLanguageChanged
+        reportCapturable: false   // an alert on the Mac (ReportDialogs.qml)
         readonly property string newCode: window.languageQuestion.startsWith("changed:") ? window.languageQuestion.slice(8) : ""
         readonly property string newName: ({ de: "Deutsch", en: "English" })[newCode] || newCode
         readonly property string currentName: ({ de: "Deutsch", en: "English" })[(AppModel.run(() => AppModel.core("language_state")) || { running: "de" }).running] || ""
@@ -472,6 +549,7 @@ ApplicationWindow {
     Loader { active: AppModel.showRuleEditor; sourceComponent: Component { RuleEditorView {} } }
     Loader { active: AppModel.showCategorizer; sourceComponent: Component { CategorizerSheet {} } }
     Loader { active: AppModel.splitBooking !== null; sourceComponent: Component { SplitSheet {} } }
+    Loader { active: AppModel.isUnlocked && AppModel.refundBooking !== null; sourceComponent: Component { RefundSheet {} } }
     Loader { active: AppModel.newCategoryRequest !== null; sourceComponent: Component { NewCategoryDialog {} } }
     Loader { active: AppModel.budgetCategoryID !== null; sourceComponent: Component { BudgetEditorSheet {} } }
     CategoryDialogs {}
@@ -493,21 +571,7 @@ ApplicationWindow {
             }
         }
     }
-    // .fileExporter(… defaultFilename: "GiroCrab-Buchungen")
-    FileDialog {
-        id: csvExporter
-        title: qsTr("Buchungen als CSV exportieren")
-        fileMode: FileDialog.SaveFile
-        defaultSuffix: "csv"
-        nameFilters: [qsTr("CSV-Dateien (*.csv)")]
-        currentFolder: StandardPaths.writableLocation(StandardPaths.DocumentsLocation)
-        selectedFile: currentFolder + "/GiroCrab-Buchungen.csv"
-        visible: AppModel.showCSVExporter
-        onAccepted: { AppModel.showCSVExporter = false; AppModel.writeFilteredBookingsCSV(AppModel.localPath(selectedFile)) }
-        onRejected: AppModel.showCSVExporter = false
-    }
-
-    // Umsätze exportieren (ExportSheet.swift); „Unter …“ asks here, after the sheet has closed.
+    // Umsätze exportieren (ExportSheet.swift); the save panel opens here, after the sheet has closed.
     Loader { active: AppModel.showExportSheet; sourceComponent: Component { ExportSheet { visible: AppModel.showExportSheet } } }
     FileDialog {
         readonly property var request: AppModel.exportSaveRequest
@@ -523,6 +587,16 @@ ApplicationWindow {
         onAccepted: BookingExport.saveExportRequest(AppModel.localPath(selectedFile))
         onRejected: BookingExport.saveExportRequest(null)
     }
+    // AppModel+Printing.swift › presentExportFiles: NSOpenPanel for the folder of the per-account files
+    FolderDialog {
+        readonly property var files: AppModel.exportFolderRequest
+        title: qsTr("Ordner für %1 Dateien wählen").arg(files ? files.length : 0)
+        acceptLabel: qsTr("Sichern")
+        currentFolder: "file://" + BookingExport.preferredDirectory()
+        visible: files !== null
+        onAccepted: BookingExport.saveExportFiles(AppModel.localPath(selectedFolder))
+        onRejected: BookingExport.saveExportFiles(null)
+    }
 
     TransferSheet {}
     PayeeCheckSheet {}
@@ -536,6 +610,9 @@ ApplicationWindow {
     AssetActionSheet {}
     AssetClassificationSheet {}
     OpeningBalanceSheet {}
+    // Offline accounts (OfflineAccountsUI.swift › offlineAccountSheets)
+    Loader { active: OfflineAccounts.bookingRequest !== null; sourceComponent: Component { ManualBookingSheet {} } }
+    OfflineAccountSheets {}
 
     // MARK: account groups & command palette (AccountGroupsUI.swift, CommandPalette.swift)
     AccountGroupDialogs {}
@@ -567,6 +644,7 @@ ApplicationWindow {
     // .alert("Stornierung nicht bestätigt") (RootView.swift)
     Sheet {
         id: transferCancelDialog
+        reportCapturable: false   // an alert on the Mac (ReportDialogs.qml)
         sheetWidth: 460
         visible: AppModel.transferCancelNotice !== null
         onClosed: AppModel.transferCancelNotice = null
@@ -592,6 +670,7 @@ ApplicationWindow {
     // .alert("Status der Überweisung unklar")
     Sheet {
         id: transferUnknownDialog
+        reportCapturable: false   // an alert on the Mac (ReportDialogs.qml)
         sheetWidth: 440
         visible: AppModel.transferUnknown !== null
         onClosed: AppModel.transferUnknown = null
@@ -614,9 +693,41 @@ ApplicationWindow {
     // .alert(errorTitle, errorMessage) with "Erneut versuchen"
     Sheet {
         id: errorDialog
+        reportCapturable: false   // an alert on the Mac (ReportDialogs.qml)
         sheetWidth: 420
         visible: AppModel.errorMessage !== ""
-        onClosed: { AppModel.errorMessage = ""; AppModel.errorTitle = ""; AppModel.errorRetry = null; AppModel.errorAlternatives = [] }
+        // AppModel.swift › errorMessage didSet: closing runs `errorOnClose` ("Überspringen" in
+        // "Alle abrufen", #1041); retry and the alternatives clear it first.
+        // The state of this alert is cleared when it is answered, not when the closing animation
+        // ends: a retry that fails at once installs a new alert, which must neither be cleared
+        // nor have its continuation run by this one's late `closed`.
+        function clearError() {
+            AppModel.errorMessage = ""; AppModel.errorTitle = ""; AppModel.errorRetry = null; AppModel.errorAlternatives = []
+            AppModel.errorCloseTitle = ""; AppModel.errorOnClose = null
+        }
+        property bool answered: false
+        // reopened for a newer alert during the exit transition: `closed` never came for the old one
+        onOpened: answered = false
+        /// A button: clears this alert, closes it, then runs `action` (none: its `errorOnClose`).
+        function answer(action) {
+            const next = action || AppModel.errorOnClose
+            answered = true
+            clearError()
+            close()
+            if (next) next()
+        }
+        onClosed: {
+            if (answered) {
+                answered = false
+                // a newer alert arrived while this one was closing: show it
+                if (AppModel.errorMessage !== "") open()
+                return
+            }
+            // closed with Esc: like the close button
+            const onClose = AppModel.errorOnClose
+            clearError()
+            if (onClose) onClose()
+        }
         ColumnLayout {
             width: errorDialog.availableWidth
             spacing: 12
@@ -626,13 +737,13 @@ ApplicationWindow {
             Repeater {
                 model: AppModel.errorAlternatives
                 Button { required property var modelData; text: modelData.title; Layout.alignment: Qt.AlignRight
-                         onClicked: { const a = modelData.action; errorDialog.close(); a() } }
+                         onClicked: errorDialog.answer(modelData.action) }
             }
             RowLayout {
                 Item { Layout.fillWidth: true }
                 Button { visible: AppModel.errorRetry !== null; text: qsTr("Erneut versuchen")
-                         onClicked: { const r = AppModel.errorRetry; errorDialog.close(); if (r) r() } }
-                Button { text: qsTr("OK"); highlighted: true; onClicked: errorDialog.close() }
+                         onClicked: errorDialog.answer(AppModel.errorRetry || (() => {})) }
+                Button { text: AppModel.errorCloseTitle || qsTr("OK"); highlighted: true; onClicked: errorDialog.answer(null) }
             }
         }
     }
@@ -641,7 +752,8 @@ ApplicationWindow {
     Timer {
         running: AppModel.screenshotMode && AppModel.vaultState !== "starting" && AppModel.vaultState !== "unlocking"
         // `--demo-sync`: long enough for the simulated PIN / TAN sheet to appear
-        interval: AppModel.optionDemoSync ? 4000 : 1500
+        // `--demo-sheet report:…`: the report opens 1.2 s after the sheet and then captures
+        interval: AppModel.optionDemoSync ? 4000 : AppModel.demoSheetOpensReport ? 4500 : 1500
         onTriggered: { AppModel.core("grab_window", { path: AppModel.screenshotPath, title: AppModel.screenshotWindow }); Qt.quit() }
     }
 }

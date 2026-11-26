@@ -20,6 +20,8 @@ struct PinSheet: View {
     private var secretLabel: String { isRah10 ? "Passwort der Schlüsseldatei" : (bankCatalog().first { $0.kind == connection.connector }?.secretLabel ?? String(localized: "PIN")) }
 
     private var isTR: Bool { connection.connector == .tradeRepublic }
+    /// BHW: the secret is first name, date of birth and postcode, not a PIN.
+    private var isBhw: Bool { connection.connector == .bhw }
 
     var body: some View {
         let d = bankCatalog().first { $0.kind == connection.connector }
@@ -54,12 +56,14 @@ struct PinSheet: View {
                 SecureField(secretLabel, text: $secret)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(start)
-                Toggle(isRah10 ? "Passwort im Tresor speichern" : "PIN im Tresor speichern", isOn: $savePin)
+                Toggle(isRah10 ? "Passwort im Tresor speichern" : isBhw ? "Anmeldedaten im Tresor speichern" : "PIN im Tresor speichern", isOn: $savePin)
                     .appFont(.caption)
                     .help("Verschlüsselt in der SQLCipher-Datenbank; beim nächsten Abruf wird nicht mehr gefragt.")
             }
             Text(isRah10
                  ? (savePin ? "Das Passwort wird verschlüsselt im Tresor gespeichert." : "Das Passwort wird nur für diesen Abruf verwendet.")
+                 : isBhw
+                 ? (savePin ? "Die Anmeldedaten werden verschlüsselt im Tresor gespeichert." : "Die Anmeldedaten werden nur für diesen Abruf verwendet und nie gespeichert.")
                  : (savePin ? "Die PIN wird verschlüsselt im Tresor gespeichert." : "Die PIN wird nur für diesen Abruf verwendet und nie gespeichert."))
                 .appFont(.caption).foregroundStyle(Theme.secondary)
             if isTR {
@@ -67,6 +71,23 @@ struct PinSheet: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Anmeldung blockiert (HTTP 403/426)?").appFont(.caption, weight: .semibold)
                     Text("Melden Sie sich im eingebauten Browser-Fenster an. GiroCrab übernimmt danach die Sitzung (tr_session) für den Abruf.")
+                        .appFont(.caption).foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        saveLoginIfChanged()
+                        dismiss()
+                        model.pendingLogin = nil
+                        model.webLoginConnection = currentConnection
+                    } label: {
+                        Label("Im Browser-Fenster anmelden …", systemImage: "safari")
+                    }
+                }
+            }
+            if connection.connector == .fnz {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Direkt-Login nicht möglich?").appFont(.caption, weight: .semibold)
+                    Text("Melden Sie sich im eingebauten Browser-Fenster an und geben Sie die Anmeldung in der FNZsecure-App frei. Der Abruf im Browser-Fenster übernimmt die Konten wie bisher.")
                         .appFont(.caption).foregroundStyle(Theme.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Button {
@@ -147,10 +168,21 @@ struct ConnectionEditSheet: View {
     @State private var selection = AccountSelectionDraft()
     /// Document retrieval of this connection (only for banks that deliver documents).
     @State private var documentsSupported = false
+    @State private var confirmResort = false
+    @State private var resorting = false
+    @State private var confirmRebuild = false
     @State private var documentsFetch = true
-    /// "Dokumente abrufen" is off: nothing that fetches documents runs (PostBox included).
+    /// "Dokumente abrufen" is off: nothing that fetches documents runs (Postbox included).
     private var documentsBlocked: Bool { documentsSupported && !documentsFetch }
     @State private var initialDocumentsFetch = true
+    /// Full fetch at the next sync (#1043): `max`, days, or "" for none.
+    @State private var fullHistory = ""
+    @State private var initialFullHistory = ""
+    /// Sharinbox: "Nicht zugeteilte Aktienrechte abrufen".
+    @State private var rightsFetch = true
+    @State private var initialRightsFetch = true
+    @State private var syncSchedule = 0
+    @State private var initialSyncSchedule = 0
     /// The values as loaded: "Speichern" is only available once something differs.
     @State private var initialValues: [String: String] = [:]
     @State private var initialTanMedium = ""
@@ -179,16 +211,19 @@ struct ConnectionEditSheet: View {
         case .direkt1822: return ["fints.url.50050201", "fints.product_id", "fints.product_version"]
         case .finTsGeneric: return isRah10 ? ["fints.product_id", "fints.product_version"] : ["fints.url.\(connection.bankCode)", "fints.product_id", "fints.product_version"]
         case .comdirect: return ["comdirect.client_id", "comdirect.client_secret"]
+        case .kontist: return ["kontist.client_id", "kontist.client_secret"]
+        case .bitcoin: return ["bitcoin.esplora_url"]
         case .payPal: return ["paypal.client_id", "paypal.client_secret", "paypal.environment"]
         case .tradeRepublic: return []
-        case .americanExpress, .amazonVisa, .advanzia: return []
+        case .americanExpress, .amazonVisa, .advanzia, .edenred: return []
         case .bunq: return ["bunq.environment"]
+        case .bitcoinCore: return ["bitcoin_core.datadir", "bitcoin_core.rpc_url"]
         case .enableBanking: return ["enablebanking.application_id", "enablebanking.private_key_pem", "enablebanking.redirect_url"]
-        case .scalableCapital, .amazonOrders, .fnz, .ibkr, .quirion, .easybank, .alteLeipziger, .volkswagenBank, .uberspace, .schwaebischHall, .equatePlus, .ffb, .fordMoney, .opelDirektbank: return []
+        case .scalableCapital, .amazonOrders, .fnz, .ibkr, .quirion, .sharinbox, .axaShareplan, .unionInvestment, .airPlus, .berghausCie, .easybank, .alteLeipziger, .volkswagenBank, .uberspace, .schwaebischHall, .equatePlus, .ffb, .fordMoney, .opelDirektbank, .hanseaticBank, .bhw, .finpension, .monefit, .goAndGrow: return []
         }
     }
 
-    /// comdirect via FinTS: the API credentials for the PostBox (#838), shown in its section.
+    /// comdirect via FinTS: the API credentials for the Postbox (#838), shown in its section.
     private var postboxKeys: [String] {
         isComdirect && connection.connector == .finTsGeneric ? ["comdirect.client_id", "comdirect.client_secret"] : []
     }
@@ -236,7 +271,7 @@ struct ConnectionEditSheet: View {
             }
         }
         Button {
-            save()
+            guard save() else { return }
             dismiss()
             model.reconnect(connection)
         } label: { Label("Neu verbinden …", systemImage: "arrow.triangle.2.circlepath") }
@@ -247,21 +282,28 @@ struct ConnectionEditSheet: View {
 
     private var isPortal: Bool { connection.connector == .americanExpress || connection.connector == .amazonVisa }
     @State private var importingStatement = false
+    @State private var importingFinpension = false
     @State private var confirmSwitch = false
-    /// comdirect via FinTS: PostBox through the bank's API as well (#838).
+    /// comdirect via FinTS: Postbox through the bank's API as well (#838).
     @State private var postbox = false
     /// comdirect logins can switch between FinTS and comdirect's own API.
+    /// Consorsbank via FinTS: documents from the Online-Archiv as well (#1024).
+    private var isConsorsbankFinTS: Bool {
+        connection.connector == .finTsGeneric && connection.bankCode == "76030080"
+    }
     private var isComdirect: Bool {
         connection.connector == .comdirect
             || (connection.connector == .finTsGeneric && ["20041111", "20041133", "20041144", "20041155"].contains(connection.bankCode))
     }
     @State private var showAdvanced = false
 
-    private var usesPin: Bool { [.volksbankKasselGoettingen, .direkt1822, .finTsGeneric, .comdirect, .tradeRepublic, .bunq, .ibkr, .easybank, .alteLeipziger, .volkswagenBank, .uberspace, .ffb, .fordMoney, .opelDirektbank].contains(connection.connector) }
+    private var usesPin: Bool { [.volksbankKasselGoettingen, .direkt1822, .finTsGeneric, .comdirect, .tradeRepublic, .bunq, .ibkr, .easybank, .alteLeipziger, .volkswagenBank, .uberspace, .ffb, .fordMoney, .opelDirektbank, .hanseaticBank, .bhw, .kontist, .monefit, .finpension, .goAndGrow, .fnz].contains(connection.connector) }
+    /// Logins whose stored secret is a password, not a PIN.
+    private var usesPassword: Bool { [.easybank, .alteLeipziger, .uberspace, .fordMoney, .opelDirektbank, .hanseaticBank, .kontist, .monefit, .finpension, .goAndGrow].contains(connection.connector) }
     private var isTR: Bool { connection.connector == .tradeRepublic }
-    /// Amex: user name and password for the portal login, kept in the vault and
+    /// Amex and Amazon Visa: portal credentials are kept as vault secrets and
     /// filled into the login form of the portal window.
-    private var savesPortalLogin: Bool { connection.connector == .americanExpress }
+    private var savesPortalLogin: Bool { AppModel.supportsStoredPortalLogin(connection.connector) }
     @State private var storePortalLogin = false
     @State private var portalUser = ""
     @State private var initialPortalUser = ""
@@ -282,6 +324,16 @@ struct ConnectionEditSheet: View {
             Form {
                 Section {
                     TextField("Anzeigename", text: $name)
+                    // why a new name may not show in the sidebar (#1467)
+                    switch model.accountsWithOwnBankLabel(connectionID: connection.id) {
+                    case 0: EmptyView()
+                    case 1:
+                        Text("Ein Konto dieses Zugangs zeigt in der Seitenleiste einen eigenen Banknamen oder keinen (Kontoeinstellungen).")
+                            .appFont(.caption).foregroundStyle(Theme.secondary)
+                    case let n:
+                        Text("\(n) Konten dieses Zugangs zeigen in der Seitenleiste einen eigenen Banknamen oder keinen (Kontoeinstellungen).")
+                            .appFont(.caption).foregroundStyle(Theme.secondary)
+                    }
                     TextField(descriptor?.loginLabel ?? String(localized: "Benutzerkennung"), text: $login)
                         .disabled(isRah10)
                         .autocorrectionDisabled()
@@ -293,9 +345,9 @@ struct ConnectionEditSheet: View {
                         LabeledContent("BLZ", value: blz)
                     }
                     if usesPin {
-                        Toggle(isRah10 ? "Passwort im Tresor speichern" : connection.connector == .bunq ? "API-Schlüssel im Tresor speichern" : connection.connector == .ibkr ? "Flex-Query-ID im Tresor speichern" : [.easybank, .alteLeipziger, .uberspace, .fordMoney, .opelDirektbank].contains(connection.connector) ? "Passwort im Tresor speichern" : "PIN im Tresor speichern", isOn: $storePin)
+                        Toggle(isRah10 ? "Passwort im Tresor speichern" : connection.connector == .bunq ? "API-Schlüssel im Tresor speichern" : connection.connector == .ibkr ? "Flex-Query-ID im Tresor speichern" : connection.connector == .bhw ? "Anmeldedaten im Tresor speichern" : usesPassword ? "Passwort im Tresor speichern" : "PIN im Tresor speichern", isOn: $storePin)
                         if storePin {
-                            SecureField(isRah10 ? "Passwort der Schlüsseldatei (leer = unverändert)" : status?.hasPin == true ? "Gespeicherte PIN (leer = unverändert)" : (connection.connector == .ibkr ? "Flex-Query-ID" : [.easybank, .alteLeipziger, .uberspace, .fordMoney, .opelDirektbank].contains(connection.connector) ? "Passwort" : "PIN"), text: $pin)
+                            SecureField(isRah10 ? "Passwort der Schlüsseldatei (leer = unverändert)" : status?.hasPin == true ? "Gespeicherte PIN (leer = unverändert)" : (connection.connector == .ibkr ? "Flex-Query-ID" : connection.connector == .bhw ? "Vorname;TT.MM.JJJJ;PLZ" : usesPassword ? "Passwort" : "PIN"), text: $pin)
                         }
                     }
                     if isFinTs {
@@ -306,7 +358,11 @@ struct ConnectionEditSheet: View {
                     }
                     if documentsSupported {
                         Toggle("Dokumente abrufen", isOn: $documentsFetch)
-                            .help("Belege, Kontoauszüge und PostBox-Dokumente werden bei jedem Abruf geladen. Aus: keine neuen Dokumente, bereits gespeicherte bleiben. Beim Einschalten lädt der nächste Abruf fehlende Dokumente nach.")
+                            .help("Belege, Kontoauszüge und Postbox-Dokumente werden bei jedem Abruf geladen. Aus: keine neuen Dokumente, bereits gespeicherte bleiben. Beim Einschalten lädt der nächste Abruf fehlende Dokumente nach.")
+                    }
+                    if connection.connector == .sharinbox {
+                        Toggle("Nicht zugeteilte Aktienrechte abrufen", isOn: $rightsFetch)
+                            .help("Aktienrechte, die erst später zugeteilt werden, erscheinen als eigene Position im Depot. Aus: die Position wird entfernt und nicht mehr abgerufen.")
                     }
                 } header: { Text("Zugang").appSectionHeader() }
                 if connection.connector == .advanzia {
@@ -328,13 +384,29 @@ struct ConnectionEditSheet: View {
                         }
                     }
                 }
+                if connection.connector == .finpension {
+                    Section {
+                        Text("Optional können Sie hier auch eine CSV- oder JSON-Exportdatei (Transaktionsbericht oder Depotaufstellung) aus Ihrem Finpension-Konto manuell importieren.")
+                            .appFont(.caption).foregroundStyle(Theme.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button { importingFinpension = true } label: { Label("Finpension-Export importieren …", systemImage: "doc.badge.plus") }
+                            .buttonStyle(.bordered)
+                            .fileImporter(isPresented: $importingFinpension, allowedContentTypes: [.commaSeparatedText, .json, .plainText, .data]) { result in
+                                if case .success(let url) = result {
+                                    guard save() else { return }
+                                    model.importFinpension(connection, url: url)
+                                    dismiss()
+                                }
+                            }
+                    }
+                }
                 if isPortal {
                     Section {
                         Text("Melden Sie sich im Browser-Fenster mit Ihrem normalen Benutzernamen, Passwort und 2FA an. GiroCrab liest die Umsätze direkt aus dem Portal – es sind keine API-Schlüssel nötig. Die Sitzung bleibt für spätere Abrufe erhalten.")
                             .appFont(.caption).foregroundStyle(Theme.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         Button {
-                            save()
+                            guard save() else { return }
                             dismiss()
                             model.webLoginConnection = model.connections.first { $0.id == connection.id } ?? connection
                         } label: { Label("Anmelden & Abrufen", systemImage: "safari") }
@@ -342,7 +414,7 @@ struct ConnectionEditSheet: View {
                         Button { importingStatement = true } label: { Label("CSV- oder PDF-Kontoauszug importieren …", systemImage: "doc.badge.plus") }
                             .fileImporter(isPresented: $importingStatement, allowedContentTypes: [.commaSeparatedText, .plainText, .pdf, .data]) { result in
                                 if case .success(let url) = result {
-                                    save()
+                                    guard save() else { return }
                                     model.importStatement(connection, url: url)
                                     dismiss()
                                 }
@@ -350,9 +422,11 @@ struct ConnectionEditSheet: View {
                         if savesPortalLogin {
                             Toggle("Anmeldedaten im Tresor speichern", isOn: $storePortalLogin)
                             if storePortalLogin {
-                                TextField("Benutzername", text: $portalUser)
-                                    .autocorrectionDisabled()
-                                    .textContentType(.username)
+                                if connection.connector == .americanExpress {
+                                    TextField("Benutzername", text: $portalUser)
+                                        .autocorrectionDisabled()
+                                        .textContentType(.username)
+                                }
                                 SecureField(status?.hasPin == true ? "Gespeichertes Passwort (leer = unverändert)" : "Passwort", text: $pin)
                                     .textContentType(.password)
                                 Text("GiroCrab trägt beide verschlüsselt gespeichert ins Anmeldeformular ein. „Anmelden“ und den Bestätigungscode bestätigen Sie selbst.")
@@ -371,11 +445,12 @@ struct ConnectionEditSheet: View {
                     }
                 }
                 // Browser-only portals keep their session cookies in the app's web
-                // store: offer to remove them like for the card portals above.
-                if connection.connector == .schwaebischHall {
+                // store: offer to remove them like for the card portals above. For
+                // Edenred this revokes the remembered sign-in (SSO on edenred.io too).
+                if [.schwaebischHall, .edenred].contains(connection.connector) {
                     Section {
                         Button {
-                            save()
+                            guard save() else { return }
                             dismiss()
                             model.webLoginConnection = model.connections.first { $0.id == connection.id } ?? connection
                         } label: { Label("Anmelden & Abrufen", systemImage: "safari") }
@@ -400,7 +475,7 @@ struct ConnectionEditSheet: View {
                     if connection.connector == .finTsGeneric {
                         Section {
                             ForEach(postboxKeys, id: \.self) { key in field(key) }
-                            Toggle("PostBox über die Schnittstelle der Bank abrufen", isOn: Binding(
+                            Toggle("Postbox über die Schnittstelle der Bank abrufen", isOn: Binding(
                                 get: { postbox },
                                 set: { on in
                                     // the switch needs the credentials stored
@@ -415,20 +490,76 @@ struct ConnectionEditSheet: View {
                             }
                             if postbox {
                                 Button {
-                                    save()
+                                    guard save() else { return }
                                     dismiss()
                                     model.fetchComdirectPostbox(model.connections.first { $0.id == connection.id } ?? connection)
-                                } label: { Label("PostBox jetzt abrufen", systemImage: "tray.and.arrow.down") }
+                                } label: { Label("Postbox jetzt abrufen", systemImage: "tray.and.arrow.down") }
                                     .disabled(model.syncingConnectionID != nil || documentsBlocked)
                             }
                         } header: {
-                            Text("PostBox").appSectionHeader()
+                            Text("Postbox").appSectionHeader()
                         } footer: {
-                            Text("Kontoauszüge, Finanzreport und Wertpapierabrechnungen aus der comdirect-PostBox, höchstens einmal pro Woche beim Abruf. Dafür sind Client-ID und Client-Secret der comdirect-API nötig und eine eigene Freigabe in der photoTAN-App. Wertpapierdokumente kommen ans Depot, die übrigen auf das erste Girokonto. Über das Kontextmenü in „Belege & PostBox“ lässt sich ein Dokument einem anderen Konto zuordnen.")
+                            Text("Kontoauszüge, Finanzreport und Wertpapierabrechnungen aus der comdirect-Postbox, höchstens einmal pro Woche beim Abruf. Dafür sind Client-ID und Client-Secret der comdirect-API nötig und eine eigene Freigabe in der photoTAN-App. Wertpapierdokumente kommen ans Depot, die übrigen auf das erste Girokonto. Über das Kontextmenü in „Belege & Postbox“ lässt sich ein Dokument einem anderen Konto zuordnen.")
                                 .appFont(.caption).foregroundStyle(Theme.secondary)
                                 .leadingFooter()
                         }
                     }
+                }
+                if isConsorsbankFinTS {
+                    Section {
+                        Toggle("Online-Archiv abrufen", isOn: Binding(
+                            get: { postbox },
+                            set: { on in
+                                model.setComdirectPostbox(connection.id, on)
+                                postbox = model.comdirectPostboxEnabled(connection.id)
+                            }))
+                            .disabled(documentsBlocked)
+                        if documentsBlocked {
+                            Label("Wird nicht abgerufen, solange „Dokumente abrufen“ oben ausgeschaltet ist.", systemImage: "info.circle")
+                                .appFont(.caption).foregroundStyle(Theme.secondary)
+                        }
+                        if postbox {
+                            Button {
+                                guard save() else { return }
+                                dismiss()
+                                model.fetchComdirectPostbox(model.connections.first { $0.id == connection.id } ?? connection)
+                            } label: { Label("Online-Archiv jetzt abrufen", systemImage: "tray.and.arrow.down") }
+                                .disabled(model.syncingConnectionID != nil || documentsBlocked)
+                        }
+                    } header: {
+                        Text("Online-Archiv").appSectionHeader()
+                    } footer: {
+                        Text("Kontoauszüge, Abrechnungen, Depotauszüge und Steuerdokumente aus dem Online-Archiv der Consorsbank, höchstens einmal pro Woche beim Abruf. GiroCrab meldet sich dafür mit Kontonummer und PIN dieses Zugangs im Online-Banking an, die Anmeldung geben Sie in der Consorsbank App frei. Die Schnittstelle ist inoffiziell. Gespeicherte Dokumente werden nicht erneut geladen, denn jeder Abruf markiert ein Dokument bei der Bank als gelesen.")
+                            .appFont(.caption).foregroundStyle(Theme.secondary)
+                            .leadingFooter()
+                    }
+                }
+                if model.supportsSyncSchedule(connection) {
+                    Section {
+                        Picker("Abrufintervall", selection: $syncSchedule) {
+                            ForEach(AutoSync.scheduleOptions, id: \.self) { hours in
+                                Text(AutoSync.label(hours)).tag(hours)
+                            }
+                            if !AutoSync.scheduleOptions.contains(syncSchedule) {
+                                Text(AutoSync.label(syncSchedule)).tag(syncSchedule)
+                            }
+                        }
+                    } header: { Text("Abruf").appSectionHeader() }
+                }
+                Section {
+                    Picker("Beim nächsten Abruf", selection: $fullHistory) {
+                        Text("Ab dem neuesten Umsatz").tag("")
+                        ForEach(HistoryRange.pickerOptions, id: \.setting) { Text($0.title).tag($0.setting) }
+                        if !fullHistory.isEmpty, !HistoryRange.pickerOptions.contains(where: { $0.setting == fullHistory }) {
+                            Text("\(Int(fullHistory) ?? 90) Tage").tag(fullHistory)
+                        }
+                    }
+                } header: {
+                    Text("Umsätze").appSectionHeader()
+                } footer: {
+                    Text("Ein Zeitraum holt beim nächsten Abruf alle Umsätze daraus, auch für Konten, die schon Umsätze haben. Vorhandene Umsätze werden nicht doppelt angelegt. Für mehr als 90 Tage verlangen viele Banken eine TAN.")
+                        .appFont(.caption).foregroundStyle(Theme.secondary)
+                        .leadingFooter()
                 }
                 Section {
                     // saved by the sheet's own Speichern, so there is a single place to confirm
@@ -446,14 +577,20 @@ struct ConnectionEditSheet: View {
                             if st.hasSession {
                                 Button("Sitzung löschen …", role: .destructive) { confirmClear = .tradeRepublic }
                             }
+                            Button("Historie neu aufbauen …") { confirmRebuild = true }
+                                .disabled(model.syncingConnectionID != nil)
                         }
                     }
                     if let t = connection.lastSyncUnix {
                         LabeledContent("Letzter Abruf") { Text(Date(timeIntervalSince1970: TimeInterval(t)), style: .relative) }
                     }
+                    if isTR || isComdirect || [.fnz, .quirion].contains(connection.connector) {
+                        Button("Dokumente neu einsortieren …") { confirmResort = true }
+                            .disabled(resorting || model.syncingConnectionID != nil)
+                    }
                     if isTR {
                         Button {
-                            save()
+                            guard save() else { return }
                             dismiss()
                             model.webLoginConnection = model.connections.first { $0.id == connection.id } ?? connection
                         } label: { Label("Im Browser-Fenster anmelden …", systemImage: "safari") }
@@ -491,6 +628,24 @@ struct ConnectionEditSheet: View {
                 ? "GiroCrab ruft comdirect danach per FinTS ab. Die Bankleitzahl kommt aus der IBAN Ihrer Konten. Beim ersten Abruf werden PIN und Freigabe in der App erneut abgefragt."
                 : "GiroCrab ruft comdirect danach über die Schnittstelle der Bank ab. Dafür sind Client-ID und Client-Secret nötig.")
         }
+        .confirmationDialog("Dokumente neu einsortieren?", isPresented: $confirmResort, titleVisibility: .visible) {
+            Button("Neu einsortieren") {
+                resorting = true
+                Task {
+                    await model.resortPortalDocuments(connection.id)
+                    resorting = false
+                }
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("GiroCrab prüft die vorhandenen Belege dieses Bankzugangs erneut. Dabei können sich Dokumenttypen und manuell gewählte Ablagekonten ändern. Bestehende Buchungsverknüpfungen bleiben erhalten. Offene Belege können eine neue Verknüpfung erhalten, auch wenn Sie diese zuvor gelöst haben.")
+        }
+        .confirmationDialog("Historie neu aufbauen?", isPresented: $confirmRebuild, titleVisibility: .visible) {
+            Button("Neu aufbauen") { model.resetTradeRepublicHistory(connection.id) }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Die folgenden Abrufe holen Buchungen, Wertpapieraktivitäten und noch fehlende Dokumente nach. Das kann einige Abrufe dauern.")
+        }
         .confirmationDialog("Sitzung löschen?", isPresented: Binding(get: { confirmClear != nil }, set: { if !$0 { confirmClear = nil } }),
                             titleVisibility: .visible, presenting: confirmClear) { kind in
             Button("Sitzung löschen", role: .destructive) {
@@ -525,9 +680,12 @@ struct ConnectionEditSheet: View {
         case .volksbankKasselGoettingen, .direkt1822, .finTsGeneric: return "FinTS 3.0"
         case .comdirect: return "comdirect REST-API"
         case .payPal: return "PayPal REST-App"
+        case .kontist: return "Kontist OAuth2-Client"
+        case .bitcoin: return "Bitcoin-Server (Esplora)"
         case .bunq: return "bunq API"
         case .ibkr: return "Interactive Brokers Flex Web Service"
         case .alteLeipziger: return "fin4u"
+        case .bitcoinCore: return String(localized: "Bitcoin Core (eigener Knoten)")
         default: return "Enable Banking (PSD2)"
         }
     }
@@ -573,7 +731,8 @@ struct ConnectionEditSheet: View {
                     revealButton(key)
                 }
             } else {
-                TextField(label, text: binding(key))
+                // a prompt, so an empty field is visible (and clickable) in the grouped form
+                TextField(label, text: binding(key), prompt: Text("nicht gesetzt"))
                     .autocorrectionDisabled()
             }
             if let help = entry?.help {
@@ -625,12 +784,17 @@ struct ConnectionEditSheet: View {
         if values != initialValues { return true }
         if isFinTs, tanMedium.trimmingCharacters(in: .whitespaces) != initialTanMedium { return true }
         if documentsSupported, documentsFetch != initialDocumentsFetch { return true }
+        if connection.connector == .sharinbox, rightsFetch != initialRightsFetch { return true }
+        if syncSchedule != initialSyncSchedule { return true }
+        if fullHistory != initialFullHistory { return true }
         // Amex portal login (user name, password, save switch) and Advanzia (password, release method)
         // are not in `values`.
         if savesPortalLogin,
            storePortalLogin != initialStorePortalLogin || !pin.isEmpty
             || portalUser.trimmingCharacters(in: .whitespaces) != initialPortalUser { return true }
         if connection.connector == .advanzia, advanziaSettings.hasChanges { return true }
+        // saving resolves a conflict with another device, even unchanged (#962)
+        if model.enableBankingLoginHasConflict(connection.id) { return true }
         return selection.hasChanges
     }
     /// Mac: the trash in the list of connections removes it, so the sheet has no button for that.
@@ -647,23 +811,42 @@ struct ConnectionEditSheet: View {
             .disabled(connection.connector == .advanzia && (advanziaSettings.busy || !advanziaSettings.loaded))
     }
 
+    private func saveSyncScheduleIfChanged() -> Bool {
+        guard syncSchedule != initialSyncSchedule else { return true }
+        guard model.setSyncSchedule(connection.id, syncSchedule) else { return false }
+        initialSyncSchedule = syncSchedule
+        return true
+    }
+
+    /// Before anything that fetches: the next sync must reach back as chosen (#1043).
+    /// `force`: a fetch starts right away, so the shown period is stored even when it is the one
+    /// loaded: a full sync that finished while the sheet was open has deleted the stored one.
+    private func saveFullHistoryIfChanged(force: Bool = false) -> Bool {
+        guard force || fullHistory != initialFullHistory else { return true }
+        guard model.setFullHistory(connection.id, fullHistory) else { return false }
+        initialFullHistory = fullHistory
+        return true
+    }
+
     /// The login's settings and the account selection, saved together; a fetch only starts after
     /// the selection is stored (a switched-off account must not be fetched).
     private func saveAll(thenSync: Bool = false) {
+        guard !thenSync || saveFullHistoryIfChanged(force: true) else { return }
         if connection.connector == .advanzia {
+            guard saveSyncScheduleIfChanged(), saveFullHistoryIfChanged() else { return }
             Task { @MainActor in
                 guard let updated = await advanziaSettings.save(connection: connection, name: name, login: login, model: model) else { return }
                 dismiss()
-                if thenSync { model.requestSync(updated) }
+                if thenSync { model.requestFullSync(updated) }
             }
             return
         }
-        save()
+        guard save() else { return }
         let id = connection.id
         let draft = selection
         Task { @MainActor in
             if await draft.saveIfChanged(model: model, connectionId: id) {
-                if thenSync, let c = model.connections.first(where: { $0.id == id }) { model.requestSync(c) }
+                if thenSync, let c = model.connections.first(where: { $0.id == id }) { model.requestFullSync(c) }
             } else if let message = draft.error {
                 model.showError(String(localized: "Kontenauswahl nicht gespeichert"), message)
             }
@@ -676,14 +859,24 @@ struct ConnectionEditSheet: View {
         login = connection.loginName
         status = model.connectionStatus(connection.id)
         storePin = status?.hasPin ?? false
-        if isComdirect, connection.connector == .finTsGeneric { postbox = model.comdirectPostboxEnabled(connection.id) }
+        if isComdirect || isConsorsbankFinTS, connection.connector == .finTsGeneric { postbox = model.comdirectPostboxEnabled(connection.id) }
         documentsSupported = model.documentsFetchSupported(connection.id)
         documentsFetch = model.documentsFetchEnabled(connection.id)
         initialDocumentsFetch = documentsFetch
+        if connection.connector == .sharinbox {
+            rightsFetch = model.sharinboxRightsEnabled(connection.id)
+            initialRightsFetch = rightsFetch
+        }
+        syncSchedule = model.syncSchedule(connection.id)
+        initialSyncSchedule = syncSchedule
+        fullHistory = model.pendingFullHistory(connection.id)
+        initialFullHistory = fullHistory
         if isFinTs { tanMedium = model.revealSetting(tanMediumKey) }
         if savesPortalLogin {
-            portalUser = model.revealSetting(AppModel.portalLoginKey(connection.id))
-            storePortalLogin = status?.hasPin == true || !portalUser.isEmpty
+            let storedUser = model.revealSetting(AppModel.portalLoginKey(connection.id))
+            portalUser = connection.connector == .amazonVisa ? login : storedUser
+            storePortalLogin = !AppDefaults.store.bool(forKey: AppModel.portalLoginAutofillDisabledKey(connection.id))
+                && (status?.hasPin == true || !storedUser.isEmpty)
             initialPortalUser = portalUser
             initialStorePortalLogin = storePortalLogin
         }
@@ -716,10 +909,20 @@ struct ConnectionEditSheet: View {
         }
     }
 
-    private func save() {
+    /// Stores or clears the portal password without disturbing an existing alert.
+    private func savePortalPin(_ value: String?) -> Bool {
+        model.setConnectionPin(connection.id, value)
+    }
+
+    private func save() -> Bool {
+        guard saveSyncScheduleIfChanged(), saveFullHistoryIfChanged() else { return false }
         if documentsSupported, documentsFetch != initialDocumentsFetch {
             model.setDocumentsFetch(connection.id, documentsFetch)
             initialDocumentsFetch = documentsFetch
+        }
+        if connection.connector == .sharinbox, rightsFetch != initialRightsFetch {
+            model.setSharinboxRights(connection.id, rightsFetch)
+            initialRightsFetch = rightsFetch
         }
         let l = isTR ? normalizePhoneNumber(input: login) : login.trimmingCharacters(in: .whitespaces)
         model.updateConnection(connection.id, name: name, login: l)
@@ -732,13 +935,26 @@ struct ConnectionEditSheet: View {
         }
         if savesPortalLogin {
             let key = AppModel.portalLoginKey(connection.id)
-            let user = portalUser.trimmingCharacters(in: .whitespaces)
+            let user = connection.connector == .amazonVisa
+                ? l : portalUser.trimmingCharacters(in: .whitespaces)
+            let disabledKey = AppModel.portalLoginAutofillDisabledKey(connection.id)
             if !storePortalLogin {
-                model.setConnectionPin(connection.id, nil)
-                model.saveSetting(key, "")
+                if savePortalPin(nil) {
+                    model.saveSetting(key, "")
+                    AppDefaults.store.removeObject(forKey: disabledKey)
+                } else {
+                    // The old vault password may still exist: suppress autofill even
+                    // though the username secret must remain until the clear succeeds.
+                    AppDefaults.store.set(true, forKey: disabledKey)
+                }
             } else {
-                if user != model.revealSetting(key) { model.saveSetting(key, user) }
-                if !pin.isEmpty { model.setConnectionPin(connection.id, pin) }
+                let passwordReady = pin.isEmpty || savePortalPin(pin)
+                if passwordReady {
+                    AppDefaults.store.removeObject(forKey: disabledKey)
+                    if user != model.revealSetting(key) { model.saveSetting(key, user) }
+                } else {
+                    AppDefaults.store.set(true, forKey: disabledKey)
+                }
             }
         }
         saveSettings(keys + advancedKeys + postboxKeys)
@@ -748,6 +964,9 @@ struct ConnectionEditSheet: View {
             if id != loadedEBApp.id.trimmingCharacters(in: .whitespacesAndNewlines)
                 || pem != loadedEBApp.pem.trimmingCharacters(in: .whitespacesAndNewlines) {
                 model.setConnectionEnableBankingApp(connection.id, applicationID: id, pem: pem)
+            } else {
+                // saved again unchanged: resolves a conflict with another device (#962)
+                model.keepEnableBankingLoginApp(connection.id)
             }
         }
         if isFinTs {
@@ -758,8 +977,10 @@ struct ConnectionEditSheet: View {
         // the sheet can stay open (Speichern): what was saved is the new "unchanged"
         initialValues = values
         initialTanMedium = tanMedium.trimmingCharacters(in: .whitespaces)
+        if connection.connector == .amazonVisa { portalUser = l }
         initialPortalUser = portalUser.trimmingCharacters(in: .whitespaces)
         initialStorePortalLogin = storePortalLogin
+        return true
     }
 }
 

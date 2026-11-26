@@ -1,9 +1,12 @@
 import SwiftUI
 import GiroCrabCore
+#if os(macOS)
+import AppKit
+#endif
 
 /// Column 2: calm booking stream. Fills the space between sidebar and
-/// inspector, bookings grouped into white day cards
-/// with the daily sum in the card header.
+/// inspector, bookings grouped into flat day sections separated by
+/// full-width dividers instead of cards.
 struct BookingStreamView: View {
     @Environment(\.bookingDensity) private var density
     @Environment(\.textScale) private var textScale
@@ -13,27 +16,25 @@ struct BookingStreamView: View {
 
     @Environment(AppModel.self) private var model
     @FocusState private var focused: Bool
-    @AppStorage("showAccountAnalytics") private var showAnalytics: Bool = false
-    /// View › "Auswertungen anzeigen" (GitHub #233): hides the charts and analysis cards.
-    @AppStorage(ViewLayout.statisticsKey) private var showStatistics: Bool = true
-    @AppStorage(ViewLayout.budgetsKey) private var showBudgets: Bool = true
-    #if os(iOS)
-    @Environment(\.horizontalSizeClass) private var hSize
-    @State private var showCashflowIOS = false
-    #endif
 
     var body: some View {
         @Bindable var model = model
-        let isOverview: Bool = { if case .allAccounts? = model.sidebarSelection { return true }; return false }()
+        let isOverview = model.showsOverview
         // „Neue Umsätze“: account cards instead of day cards, no charts
-        let isNewBookings = model.sidebarSelection == .newBookings
-        let cards = ViewLayout.cards(statistics: showStatistics, budgets: showBudgets)
+        let isNewBookings = model.showsNewBookings
         let emptyVault = !model.demoActive && model.allAccounts.isEmpty
         ScrollViewReader { proxy in
             VStack(spacing: 0) {
                 // Security lock: first, above everything else (stays visible).
-                BankingPolicyBanner()
-                AnnouncementBanner()
+                // Outside the ScrollView like the header: they end where the cards below end, not
+                // under the scroll bar (#1535).
+                VStack(spacing: 0) {
+                    BankingPolicyBanner()
+                    AnnouncementBanner()
+                }
+                #if os(macOS)
+                .padding(.trailing, scrollerInset)
+                #endif
                 if let focus = model.merchantFocus {
                     MerchantFocusBar(focus: focus)
                 }
@@ -42,7 +43,7 @@ struct BookingStreamView: View {
                 #endif
                 ScrollView {
                     // Spacing 0: the stream below is one flat run of day headers and
-                    // rows that form the day cards; everything above it is one block.
+                    // rows; dividers provide the structure, everything above is one block.
                     LazyVStack(alignment: .leading, spacing: 0) {
                         #if !os(iOS)
                         // The scroll-to-top target is the very first thing in the scroll
@@ -65,35 +66,7 @@ struct BookingStreamView: View {
                         if !emptyVault && model.scope != .investments {
                             MerchantLogoTipView()
                         }
-                        if model.scope == .investments {
-                            InvestmentDashboardView()
-                        } else if cards.any, !isNewBookings, !model.allAccounts.isEmpty, isOverview || showAnalytics {
-                            // Overview: always; single account: only when toggled on.
-                            #if os(iOS)
-                            if cards.cashflow {
-                                DisclosureGroup("Cashflow-Analyse", isExpanded: $showCashflowIOS) {
-                                    VStack(spacing: ViewLayout.cardGap) {
-                                        CashflowCard()
-                                        if cards.budgets { BudgetProgressCard() }
-                                    }
-                                    .padding(.top, 8)
-                                }
-                                .appFont(.subheadline, weight: .medium)
-                                .padding(.horizontal, 14).padding(.vertical, 10)
-                                .frame(maxWidth: .infinity)
-                                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Theme.card))
-                            } else {
-                                BudgetProgressCard()
-                            }
-                            #else
-                            if cards.cashflow {
-                                CashflowCard().transition(Motion.slide(.top))
-                            }
-                            if cards.budgets {
-                                BudgetProgressCard().transition(Motion.slide(.top))
-                            }
-                            #endif
-                        }
+                        StreamAnalysisCards(isOverview: isOverview, isNewBookings: isNewBookings, hasAccounts: !model.allAccounts.isEmpty)
                         if model.isLoadingSelection {
                             ProgressView().controlSize(.small)
                                 .frame(maxWidth: .infinity)
@@ -104,7 +77,7 @@ struct BookingStreamView: View {
                             ContentUnavailableView(
                                 model.searchText.isEmpty ? "Keine Buchungen" : "Keine Treffer",
                                 systemImage: model.searchText.isEmpty ? "tray" : "magnifyingglass",
-                                description: Text(model.searchText.isEmpty ? "Konto abrufen oder anderen Zeitraum wählen." : "Nichts passt zu „\(redaction.masking(model.searchText))“.")
+                                description: Text(model.searchText.isEmpty ? "Konto abrufen oder anderen Zeitraum wählen." : "Nichts passt zu „\(redaction.masking(model.effectiveSearchText.isEmpty ? model.searchText : model.effectiveSearchText))“.")
                             )
                             .padding(.top, 40)
                         }
@@ -119,14 +92,15 @@ struct BookingStreamView: View {
                                 if density == .compact, case .header = item { return false }
                                 return true
                             }) { item in
+                                // No `.id(day/booking)` here: identity is the position (`StreamItem`),
+                                // an explicit id would rebuild every row of a new list.
                                 switch item {
-                                case .header(let day):
-                                    DayHeader(day: day, balance: model.listBalances.days[day.date]).padding(.top, day.id == firstDayID ? ViewLayout.cardGap : 14)
-                                        .trackScrollDay(day.date).id(day.id)
-                                case .row(let b, let isLast):
+                                case .header(let day, let n):
+                                    DayHeader(day: day, balance: model.listBalances.days[day.date]).padding(.top, n == 0 ? ViewLayout.cardGap : 14)
+                                        .trackScrollDay(day.date)
+                                case .row(let b, let isLast, _):
                                     DayCardRow(booking: b, isLast: isLast, balance: model.listBalances.bookings[b.id])
                                         .trackScrollDay(b.bookingDate)
-                                        .id(b.id)
                                 }
                             }
                         }
@@ -135,13 +109,19 @@ struct BookingStreamView: View {
                                 .padding(.top, 14)
                         }
                     }
-                    .padding(.horizontal, 20)
+                    .padding(.horizontal, 16)
                     #if os(iOS)
                     .padding(.top, 4)
                     #endif
-                    .padding(.bottom, 18)
+                    .padding(.bottom, 14)
                     .frame(maxWidth: .infinity)
-                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+                    #if os(macOS)
+                    // One value, so the view re-runs only when a scroller comes or goes, not at every
+                    // step of a resize or sidebar animation.
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.bounds(of: .named(StreamDayTracker.space)).map { max(0, $0.width - proxy.size.width) } ?? 0
+                    } action: { scrollerInset = $0 }
+                    #endif
                 }
                 .coordinateSpace(name: StreamDayTracker.space)
                 .frame(minHeight: 0, maxHeight: .infinity)
@@ -156,35 +136,25 @@ struct BookingStreamView: View {
                     }
                 }
             }
-            .background(Theme.canvas)
-            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { columnWidth = $0 }
-            #if os(iOS)
-            // iPhone: the detail column is not reachable by tapping, so show it as a sheet.
-            .capturableSheet(isPresented: Binding(
-                get: { hSize == .compact && model.showBookingSheet && model.selectedBookingID != nil },
-                set: { if !$0 { model.showBookingSheet = false } }
-            )) {
-                NavigationStack { InspectorView() }
-                    .presentationDetents([.medium, .large])
-            }
-            #endif
+            .background(Theme.systemBackground)
             // Drop a receipt anywhere on the stream: matched by amount/date/merchant.
             .dropDestination(for: URL.self) { urls, _ in
                 model.dropAnywhere(urls)
             }
             .background(SelectionScroller(proxy: proxy))
-            // another account, group, period or view: back to the newest day
-            .onChange(of: model.sidebarSelection) { _, _ in scrollToTop(proxy) }
-            .onChange(of: model.period) { _, _ in scrollToTop(proxy) }
+            // another account, group, period or view: back to the newest day; for a sidebar
+            // selection or a period once its data is in (`AppModel.requestStreamTop`)
+            .onChange(of: model.streamTopRequest) { _, _ in proxy.scrollTo(Self.topID, anchor: .top) }
             .onChange(of: model.scope) { _, _ in scrollToTop(proxy) }
             .onChange(of: model.scrollToDay) { _, jump in
                 guard let day = jump?.day else { return }
                 let first = model.dayGroups.first(where: { $0.date == day })?.bookings.first
+                let slots = model.streamSlots
                 withAnimation(Motion.animation(.easeOut(duration: 0.25))) {
-                    if density == .compact, let first {
-                        proxy.scrollTo(first.id, anchor: .top)
-                    } else {
-                        proxy.scrollTo(day, anchor: .top)
+                    if density == .compact, let first, let slot = slots.booking[first.id] {
+                        proxy.scrollTo(slot, anchor: .top)
+                    } else if let slot = slots.day[day] {
+                        proxy.scrollTo(slot, anchor: .top)
                     }
                 }
                 // select the day's first booking so the detail pane follows
@@ -198,9 +168,9 @@ struct BookingStreamView: View {
                     let token = jump?.token
                     Task { @MainActor in
                         try? await Task.sleep(for: .milliseconds(350))
-                        guard model.scrollToDay?.token == token else { return }
+                        guard model.scrollToDay?.token == token, let slot = model.streamSlots.booking[first.id] else { return }
                         withAnimation(Motion.animation(.easeOut(duration: 0.15))) {
-                            proxy.scrollTo(first.id, anchor: density == .standard ? nil : .top)
+                            proxy.scrollTo(slot, anchor: density == .standard ? nil : .top)
                         }
                     }
                 }
@@ -219,6 +189,13 @@ struct BookingStreamView: View {
         }
         .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
         .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
+        // Bild↓/Bild↑ page through the list, Pos1/Ende jump to its ends (GitHub #1561);
+        // `SelectionScroller` keeps the selected row in view, also when the target row
+        // is already selected (`keyboardScrollToken`).
+        .onKeyPress(.pageDown) { model.moveSelection(AppModel.keyboardPageStep); return .handled }
+        .onKeyPress(.pageUp) { model.moveSelection(-AppModel.keyboardPageStep); return .handled }
+        .onKeyPress(.home) { model.moveSelection(-Int.max); return .handled }
+        .onKeyPress(.end) { model.moveSelection(Int.max); return .handled }
         .onKeyPress(.return) {
             // The balance chart sits inside the list: with keyboard focus there,
             // Return belongs to the chart (jump to the chosen day).
@@ -241,7 +218,7 @@ struct BookingStreamView: View {
         .onCommand(#selector(NSResponder.selectAll(_:))) { model.selectAllBookings() }
         // ⌘C copies the selected booking (Edit ▸ Copy)
         .onCopyCommand {
-            guard let b = model.selectedBooking else { return [] }
+            guard redaction.allowsWholeBookingCopy, let b = model.selectedBooking else { return [] }
             return [NSItemProvider(object: b.clipboardLine as NSString)]
         }
         #endif
@@ -263,7 +240,7 @@ struct BookingStreamView: View {
         // A real window title (Window menu, Mission Control, VoiceOver); the
         // toolbar keeps its room for the scope picker.
         #if os(iOS)
-        .modifier(WindowTitle(title: model.title))
+        .modifier(WindowTitle())
         #endif
         .bookingOutputSheets()
     }
@@ -291,30 +268,21 @@ struct BookingStreamView: View {
                 .padding(.top, 4)
                 .padding(.bottom, 6)
                 #else
-                .padding(.horizontal, 20)
-                .padding(.top, 18)
-                .padding(.bottom, ViewLayout.cardGap)
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
+                .padding(.bottom, ViewLayout.sectionSpacing)
                 #endif
                 .frame(maxWidth: .infinity)
+                // Full-width line between the pinned header and the scroll content.
+                #if os(macOS)
+                .overlay(alignment: .bottom) { Divider() }
+                #endif
                 .padding(.trailing, scrollerInset)
     }
 
     /// macOS: width a scroller takes from the scroll area; the pinned header
     /// (outside the ScrollView) gets the same trailing inset to stay aligned.
-    @State private var columnWidth: CGFloat = 0
-    @State private var contentWidth: CGFloat = 0
-    private var scrollerInset: CGFloat {
-        #if os(macOS)
-        (columnWidth > 0 && contentWidth > 0) ? max(0, columnWidth - contentWidth) : 0
-        #else
-        0
-        #endif
-    }
-
-    private var firstDayID: String? {
-        for case .header(let d) in model.streamItems { return d.id }
-        return nil
-    }
+    @State private var scrollerInset: CGFloat = 0
 
     private static let topID = "stream-top"
     #if !os(iOS)
@@ -329,6 +297,61 @@ struct BookingStreamView: View {
     }
 }
 
+
+/// Investment dashboard or the cashflow and budget cards above the booking stream. A view of
+/// its own: its `@AppStorage` settings never compare equal, so in `BookingStreamView` they made
+/// the whole stream re-run whenever its parent was re-created (on every sidebar selection).
+private struct StreamAnalysisCards: View {
+    @Environment(AppModel.self) private var model
+    let isOverview: Bool
+    let isNewBookings: Bool
+    let hasAccounts: Bool
+    @AppStorage("showAccountAnalytics") private var showAnalytics: Bool = false
+    /// View › "Auswertungen anzeigen" (GitHub #233): hides the charts and analysis cards.
+    @AppStorage(ViewLayout.statisticsKey) private var showStatistics: Bool = true
+    @AppStorage(ViewLayout.budgetsKey) private var showBudgets: Bool = true
+    #if os(iOS)
+    @State private var showCashflowIOS = false
+    #endif
+
+    var body: some View {
+        let cards = ViewLayout.cards(statistics: showStatistics, budgets: showBudgets)
+        if model.scope == .investments {
+            InvestmentDashboardView()
+        } else if cards.any, !isNewBookings, hasAccounts, isOverview || showAnalytics {
+            // Overview: always; single account: only when toggled on.
+            #if os(iOS)
+            if cards.cashflow {
+                DisclosureGroup("Cashflow-Analyse", isExpanded: $showCashflowIOS) {
+                    VStack(spacing: 0) {
+                        CashflowCard()
+                        if cards.budgets {
+                            Divider()
+                            BudgetProgressCard()
+                        }
+                    }
+                }
+                .appFont(.subheadline, weight: .medium)
+                .flatSection(horizontal: 14, vertical: 6)
+            } else {
+                BudgetProgressCard()
+            }
+            #else
+            VStack(spacing: 0) {
+                if cards.cashflow {
+                    CashflowCard().transition(Motion.slide(.top))
+                }
+                if cards.cashflow && cards.budgets {
+                    Divider()
+                }
+                if cards.budgets {
+                    BudgetProgressCard().transition(Motion.slide(.top))
+                }
+            }
+            #endif
+        }
+    }
+}
 
 /// Print and export sheets plus the file exporters behind the menu commands; shared by the
 /// booking list and the depot view, so a command works in both.
@@ -390,7 +413,7 @@ struct MerchantFocusBar: View {
             Image(systemName: "storefront").foregroundStyle(Theme.secondary)
             Text("Alle Buchungen von").foregroundStyle(Theme.secondary)
             Text(focus.name).fontWeight(.semibold).lineLimit(1).sensitive(.personal)
-            Text(verbatim: "· \(model.periodTitle)").foregroundStyle(Theme.secondary).lineLimit(1)
+            Text(verbatim: "· \(model.shownPeriod.title)").foregroundStyle(Theme.secondary).lineLimit(1)
             Spacer(minLength: 8)
             Button("Zurück", systemImage: "xmark.circle.fill") { model.leaveMerchantFocus() }
                 .buttonStyle(.borderless)
@@ -398,43 +421,16 @@ struct MerchantFocusBar: View {
                 .help("Händler-Filter aufheben und zur vorherigen Ansicht zurückkehren")
         }
         .appFont(.callout)
-        .padding(.horizontal, 20).padding(.vertical, 8)
+        .padding(.horizontal, 16).padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.card)
         .overlay(alignment: .bottom) { Divider() }
     }
 }
 
+/// The stream is one flat run of rows: no rounded day cards, no strokes.
 struct DayCardSegment: ViewModifier {
-    @Environment(\.bookingDensity) private var density
-    let isTop: Bool
-    let isBottom: Bool
-
     func body(content: Content) -> some View {
-        let r: CGFloat = 12
-        let shape = UnevenRoundedRectangle(
-            topLeadingRadius: isTop ? r : 0, bottomLeadingRadius: isBottom ? r : 0,
-            bottomTrailingRadius: isBottom ? r : 0, topTrailingRadius: isTop ? r : 0,
-            style: .continuous)
-        if density == .compact {
-            content.frame(maxWidth: .infinity)
-        } else {
-            content
-                .frame(maxWidth: .infinity)
-                .background(shape.fill(Theme.card))
-                .clipShape(shape)
-                .overlay {
-                    // The border of the whole card: stroke a shape that reaches 1 pt past
-                    // an open edge and clip it, so only top/bottom slices draw that edge.
-                    Color.clear.overlay {
-                        shape.strokeBorder(Theme.border, lineWidth: 1)
-                            .padding(.top, isTop ? 0 : -1)
-                            .padding(.bottom, isBottom ? 0 : -1)
-                    }
-                    .clipped()
-                    .allowsHitTesting(false)
-                }
-        }
+        content.frame(maxWidth: .infinity)
     }
 }
 
@@ -468,12 +464,12 @@ struct DayHeader: View {
                         .help("Kontostand am Ende des Tages")
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, density == .compact ? 4 : 10)
+            .padding(.horizontal, 12)
+            .padding(.vertical, density == .compact ? 3 : 6)
             .background(marked ? Theme.accent.opacity(0.12) : Color.clear)
-            Rectangle().fill(Theme.border).frame(height: 1)
+            Divider()
         }
-        .modifier(DayCardSegment(isTop: true, isBottom: false))
+        .modifier(DayCardSegment())
     }
 }
 
@@ -485,7 +481,11 @@ private struct StreamDayTracker: ViewModifier {
     /// Distance from the top edge of the scroll view in points.
     private static let line: CGFloat = 24
     @Environment(AppModel.self) private var model
-    @State private var crossing = false
+    /// The day this element counted in `scrollCrossing` while it crosses the line; nil = not on
+    /// the line. Kept instead of a flag because elements are reused for other days (positional
+    /// identity, `StreamItem`): a release must hit the day that was counted, whichever of the
+    /// geometry callback and the day change runs first.
+    @State private var counted: String?
     let day: String
 
     func body(content: Content) -> some View {
@@ -494,26 +494,36 @@ private struct StreamDayTracker: ViewModifier {
                 let f = proxy.frame(in: .named(Self.space))
                 return f.minY <= Self.line && f.maxY > Self.line
             } action: { crosses in
-                guard crosses != crossing else { return }
-                crossing = crosses
+                guard crosses != (counted != nil) else { return }
                 if crosses {
-                    model.scrollCrossing[day, default: 0] += 1
+                    count(day)
                     if model.scrollFocusDay != day { model.scrollFocusDay = day }
                 } else {
-                    release()
+                    releaseCounted()
                 }
             }
             // the lazy stack drops rows that scrolled far away without a last callback
-            .onDisappear {
-                guard crossing else { return }
-                crossing = false
-                release()
+            .onDisappear { releaseCounted() }
+            // Reused for another day while on the line: the count moves to the new day. The
+            // chart marker is left alone; a new list brings its own (`requestStreamTop`), and
+            // pointing it at whatever day sits at the old offset made it jump.
+            .onChange(of: day) {
+                guard counted != nil else { return }
+                releaseCounted()
+                count(day)
             }
+    }
+
+    private func count(_ day: String) {
+        model.scrollCrossing[day, default: 0] += 1
+        counted = day
     }
 
     /// A day has several elements (header, rows): the focus ends only when none of them is
     /// left on the line. A short delay covers the hand-over to the next day's element.
-    private func release() {
+    private func releaseCounted() {
+        guard let day = counted else { return }
+        counted = nil
         let left = (model.scrollCrossing[day] ?? 1) - 1
         model.scrollCrossing[day] = left > 0 ? left : nil
         guard left <= 0, model.scrollFocusDay == day else { return }
@@ -525,15 +535,16 @@ private struct StreamDayTracker: ViewModifier {
 }
 
 private extension View {
-    /// Must come before `.id(...)`: after it, the geometry modifier takes the scroll target away
-    /// from `ScrollViewProxy.scrollTo` and every jump to a day or booking does nothing.
+    /// Rows carry no `.id(...)` (see `StreamItem`); one placed after this modifier would take the
+    /// scroll target away from `ScrollViewProxy.scrollTo`, so every jump would do nothing.
     func trackScrollDay(_ day: String) -> some View { modifier(StreamDayTracker(day: day)) }
 }
 
-/// One booking of a day card; the last one closes the card.
+/// One booking row of a flat day section; the last one ends the day's dividers.
 struct DayCardRow: View {
     @Environment(\.textScale) private var textScale
     @Environment(\.bookingDensity) private var density
+    @Environment(\.reportRedaction) private var redaction
     @Environment(AppModel.self) private var model
     let booking: Booking
     let isLast: Bool
@@ -544,51 +555,54 @@ struct DayCardRow: View {
     var body: some View {
         let b = booking
         VStack(spacing: 0) {
-                BookingRow(booking: b, compactDetailsCollapsed: compactDetailsCollapsed, balance: balance)
+                BookingRow(booking: b, compactDetailsCollapsed: compactDetailsCollapsed, balance: balance) {
+                    selectRow(togglesDetails: false)
+                }
                     .dropDestination(for: URL.self) { urls, _ in
                         guard model.attach(urls, to: b) else { return false }
                         model.selectedBookingID = b.id
                         return true
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        #if os(macOS)
+                    #if os(macOS)
+                    .modifier(BookingRowClicks(selectRow: { flags in
                         // Finder-style: ⌘-click adds/removes, ⇧-click selects a range.
-                        let flags = ClickModifiers.atLastMouseDown
-                        if density == .compact, model.selectedBookingID == b.id,
-                           !flags.contains(.command), !flags.contains(.shift) {
-                            compactDetailsCollapsed.toggle()
-                        } else {
-                            compactDetailsCollapsed = false
-                        }
-                        model.selectBooking(b.id, toggle: flags.contains(.command), extend: flags.contains(.shift))
-                        #else
-                        if density == .compact, model.selectedBookingID == b.id {
-                            compactDetailsCollapsed.toggle()
-                        } else {
-                            compactDetailsCollapsed = false
-                        }
-                        model.selectBooking(b.id)
-                        #endif
-                        model.showBookingSheet = true
-                    }
-                    .modifier(RowSelectionTraits(id: b.id))
-                    // simultaneous, so single clicks keep selecting without the double-click delay
+                        selectRow(toggle: flags.contains(.command), extend: flags.contains(.shift))
+                    }, openNote: { model.editNote(for: b) }))
+                    #else
+                    .contentShape(Rectangle())
+                    .onTapGesture { selectRow() }
                     .simultaneousGesture(TapGesture(count: 2).onEnded { model.editNote(for: b) })
+                    #endif
+                    .modifier(RowSelectionTraits(id: b.id))
                     .contextMenu { rowMenu(b) }
                     #if os(macOS)
-                    // onto a sidebar category (#366); the payload is read when the drag starts
-                    .draggable(BookingDrag.payload(model.categorizeTargets(for: b).map(\.id)))
+                    // The payload is read when a row drag starts outside the selectable text.
+                    .onDrag { model.dragItem(for: b).itemProvider() }
                     #endif
             if !isLast || density == .compact {
-                Rectangle().fill(Theme.border.opacity(0.7)).frame(height: 1)
-                    .padding(.leading, density == .compact ? 14 : 64)
+                Divider()
+                    .padding(.leading, density == .compact ? 12 : 48)
             }
         }
-        .modifier(DayCardSegment(isTop: false, isBottom: isLast))
+        .modifier(DayCardSegment())
         .onChange(of: model.selectedBookingID) { _, id in
             if id != booking.id { compactDetailsCollapsed = false }
         }
+        // the row is reused for another booking (positional identity, `StreamItem`)
+        .onChange(of: booking.id) { compactDetailsCollapsed = false }
+    }
+
+    private func selectRow(toggle: Bool = false, extend: Bool = false, togglesDetails: Bool = true) {
+        if density == .compact, model.selectedBookingID == booking.id, !toggle, !extend {
+            if togglesDetails { compactDetailsCollapsed.toggle() }
+        } else {
+            compactDetailsCollapsed = false
+        }
+        model.selectBooking(booking.id, toggle: toggle, extend: extend, fromListClick: true)
+        model.showBookingSheet = true
+        #if os(macOS)
+        model.focusListToken &+= 1
+        #endif
     }
 
     @ViewBuilder
@@ -597,7 +611,15 @@ struct DayCardRow: View {
         Button("Regel für diesen Händler erstellen …", systemImage: "wand.and.stars") { model.openRuleEditor(from: b) }
         Button("Notiz bearbeiten …", systemImage: "note.text") { model.editNote(for: b) }
         TagsMenu(model: model, booking: b)
-        Button("Umsatz aufteilen (Splitbuchung) …", systemImage: "arrow.triangle.branch") { model.splitBooking = b }
+        // #1663: a common share opens the sheet with that share already in the second part
+        Menu("Umsatz aufteilen (Splitbuchung)", systemImage: "arrow.triangle.branch") {
+            ForEach(SplitMath.shares, id: \.self) { percent in
+                Button { model.openSplit(b, percent: percent) } label: { Text(verbatim: SplitMath.label(percent)) }
+            }
+            Divider()
+            Button("Andere Aufteilung …") { model.openSplit(b) }
+        }
+        RefundLinkMenu(model: model, booking: b)
         LoanAssignMenu(model: model, booking: b, hidesWhenUnavailable: true)
         OfflineBookingMenu(model: model, booking: b)
         Divider()
@@ -609,7 +631,11 @@ struct DayCardRow: View {
             .disabled(!model.canTransfer)
         Button("Als Dauerauftrag anlegen …", systemImage: "repeat") { model.newStandingOrder(from: b) }
             .disabled(!model.canMakeStandingOrder(from: b))
-        Button("Umsatz kopieren", systemImage: "doc.on.doc") { copyToPasteboard(b.clipboardLine) }
+        Button("Umsatz kopieren", systemImage: "doc.on.doc") {
+            guard redaction.allowsWholeBookingCopy else { return }
+            copyToPasteboard(b.clipboardLine)
+        }
+        .disabled(!redaction.allowsWholeBookingCopy)
         exportMenuButton(for: b)
         Divider()
         Button(b.checked ? "Als neu markieren" : "Als geprüft markieren", systemImage: "checkmark.circle") { model.setChecked(!b.checked, for: b) }
@@ -659,6 +685,98 @@ enum ListPurpose {
     }
 }
 
+private struct BookingNoteIndicator: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.reportRedaction) private var redaction
+    @Environment(\.textScale) private var textScale
+    let booking: Booking
+    #if os(macOS)
+    @State private var isHovered = false
+    @State private var didClickDuringHover = false
+    @State private var showsPreview = false
+
+    private var canShowPreview: Bool {
+        isHovered && !didClickDuringHover && !redaction.contains(.personal)
+    }
+    #endif
+
+    var body: some View {
+        let note = booking.note.trimmingCharacters(in: .whitespacesAndNewlines)
+        ZStack {
+            if !note.isEmpty {
+                Button {
+                    #if os(macOS)
+                    didClickDuringHover = isHovered
+                    showsPreview = false
+                    #endif
+                    model.editNote(for: booking)
+                } label: {
+                    SpiralNotebook()
+                        .stroke(style: StrokeStyle(lineWidth: 1.15, lineCap: .round))
+                        .frame(width: 13 * textScale, height: 14 * textScale)
+                        .foregroundStyle(Theme.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .bookingRowControl()
+                .accessibilityLabel("Notiz bearbeiten")
+                #if os(macOS)
+                .onHover { inside in
+                    isHovered = inside
+                    if !inside { didClickDuringHover = false }
+                }
+                .task(id: canShowPreview) {
+                    guard canShowPreview else {
+                        showsPreview = false
+                        return
+                    }
+                    try? await Task.sleep(for: .milliseconds(500))
+                    if !Task.isCancelled { showsPreview = true }
+                }
+                .onDisappear {
+                    isHovered = false
+                    didClickDuringHover = false
+                    showsPreview = false
+                }
+                .capturablePopover(isPresented: $showsPreview, arrowEdge: .bottom) {
+                    Text(verbatim: preview(of: note))
+                        .appFont(.callout)
+                        .lineLimit(3)
+                        .frame(maxWidth: 280 * textScale, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .sensitive()
+                        .padding(10)
+                }
+                #endif
+            }
+        }
+        .frame(width: 18 * textScale, height: 16 * textScale)
+    }
+
+    private func preview(of note: String) -> String {
+        let limited = note.prefix(240)
+        let lines = limited.split(separator: "\n", maxSplits: 3, omittingEmptySubsequences: false)
+        let preview = lines.prefix(3).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return limited.count < note.count || lines.count > 3 ? preview + " …" : preview
+    }
+}
+
+private struct SpiralNotebook: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path(roundedRect: CGRect(x: 1.5, y: 2.75, width: 10, height: 10.5), cornerRadius: 1.5)
+        for x in [4.0, 6.5, 9.0] {
+            path.move(to: CGPoint(x: x, y: 1))
+            path.addLine(to: CGPoint(x: x, y: 4.25))
+        }
+        path.move(to: CGPoint(x: 4, y: 7))
+        path.addLine(to: CGPoint(x: 9, y: 7))
+        path.move(to: CGPoint(x: 4, y: 9.5))
+        path.addLine(to: CGPoint(x: 8, y: 9.5))
+        return path.applying(CGAffineTransform(scaleX: rect.width / 13, y: rect.height / 14))
+    }
+}
+
 /// Exactly three elements: signet · name + subtitle · amount.
 struct BookingRow: View {
     @Environment(\.reportRedaction) private var redaction
@@ -668,6 +786,7 @@ struct BookingRow: View {
     let booking: Booking
     var compactDetailsCollapsed = false
     var balance: RunningBalance?
+    var onTextSingleClick: (() -> Void)?
     /// Amazon orders: drill-down of all items (and the refunded order's items)
     /// below the row; collapsed rows keep the uniform list height.
     @State private var amazonExpanded = false
@@ -708,6 +827,7 @@ struct BookingRow: View {
                     .foregroundStyle(Theme.secondary)
                     .lineLimit(1)
                     .fixedSize()
+                    .bookingNoteOccupied()
                     .frame(width: 80 * textScale, alignment: .leading)
             }
             MerchantSignet(merchant: booking.merchant, categorySymbol: booking.categorySymbol, size: isSingleLine ? 26 : 36, showNewDot: !booking.checked)
@@ -719,13 +839,11 @@ struct BookingRow: View {
                             .strokeBorder(Theme.secondary, style: StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
                     }
                 }
+                .bookingNoteOccupied()
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
-                    Text(booking.merchant.name.isEmpty ? booking.bookingText : booking.merchant.name)
-                        .sensitive()
-                        .appFont(.body, weight: .semibold)
-                        .foregroundStyle(Theme.text)
-                        .lineLimit(showsDetails ? nil : 1)
+                    BookingRowText(booking.merchant.name.isEmpty ? booking.bookingText : booking.merchant.name,
+                                   prominent: true, wraps: showsDetails, onSingleClick: onTextSingleClick)
                         .fixedSize(horizontal: false, vertical: true)
                         .layoutPriority(1)
                     if booking.documentCount > 0 {
@@ -741,6 +859,7 @@ struct BookingRow: View {
                             .help("Wiederkehrende Buchung")
                             .accessibilityLabel("Wiederkehrend")
                     }
+                    RefundLinkMarker(booking: booking)
                     if isSingleLine && showsCategoryChip {
                         // Keep the name and amount first. Show the category only
                         // when its complete label fits; the purpose yields first.
@@ -759,24 +878,17 @@ struct BookingRow: View {
                         .layoutPriority(-1)
                     }
                     if isSingleLine, !visiblePurpose.isEmpty {
-                        Text(visiblePurpose)
-                            .sensitive()
-                            .appFont(.callout)
-                            .foregroundStyle(Theme.secondary)
-                            .lineLimit(1)
+                        BookingRowText(visiblePurpose, onSingleClick: onTextSingleClick)
                             .layoutPriority(-2)
                     }
                 }
+                .bookingNoteOccupied()
                 if !showsDetails && !isSingleLine {
                     HStack(spacing: 6) {
                         #if !os(iOS)
                         if model.showsAccountMarkers {
-                            ViewThatFits(in: .horizontal) {
-                                AccountChip(label: model.accountShortLabel(booking.accountId), color: model.accountColor(booking.accountId),
-                                            symbol: model.accountSymbol(booking.accountId), compact: compactChip)
-                                AccountChip(label: model.accountShortLabel(booking.accountId), color: model.accountColor(booking.accountId),
-                                            symbol: model.accountSymbol(booking.accountId), compact: true)
-                            }
+                            AccountChip(label: model.accountShortLabel(booking.accountId), color: model.accountColor(booking.accountId),
+                                        symbol: model.accountSymbol(booking.accountId), compact: compactChip)
                         }
                         #endif
                         // category with the sidebar's icon and colour, then the payment method
@@ -794,11 +906,7 @@ struct BookingRow: View {
                             let itemsText = refundSource.map { "· \($0.items)  ↩" }
                                 ?? (ref.items.isEmpty ? nil : "· \(ref.items)")
                             if let itemsText {
-                                Text(itemsText)
-                                    .sensitive()
-                                    .appFont(.callout)
-                                    .foregroundStyle(Theme.secondary)
-                                    .lineLimit(1)
+                                BookingRowText(itemsText, onSingleClick: onTextSingleClick)
                                     .layoutPriority(-1)
                                     .help(ref.isRefund
                                           ? "Erstattung für Bestellung #\(ref.code)"
@@ -835,15 +943,12 @@ struct BookingRow: View {
                                         .foregroundStyle(Theme.tertiary)
                                 }
                                 .buttonStyle(.borderless)
+                                .bookingRowControl()
                                 .help(amazonExpanded ? "Artikel einklappen" : "Alle Artikel anzeigen")
                                 .accessibilityLabel(amazonExpanded ? Text("Artikel einklappen") : Text("Alle Artikel anzeigen"))
                             }
                         } else if density == .compact, !density.purpose(for: booking).isEmpty {
-                            Text(density.purpose(for: booking))
-                                .sensitive()
-                                .appFont(.callout)
-                                .foregroundStyle(Theme.secondary)
-                                .lineLimit(1)
+                            BookingRowText(density.purpose(for: booking), onSingleClick: onTextSingleClick)
                                 .layoutPriority(-1)
                         } else if let counter = model.counterAccount(for: booking) {
                             Text("· ⇄ \(counter.name)")
@@ -860,6 +965,7 @@ struct BookingRow: View {
                                 .layoutPriority(-1)
                         }
                     }
+                    .bookingNoteOccupied()
                     .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                     .clipped()
                 }
@@ -867,12 +973,19 @@ struct BookingRow: View {
             .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             .layoutPriority(0)
             Spacer(minLength: isSingleLine ? 0 : 8)
-            // the row just checked in a list of new bookings stays without a mark until it leaves
-            if booking.checked, model.lingeringBookingID != booking.id {
-                Image(systemName: "checkmark")
-                    .appFont(.caption, weight: .semibold)
-                    .foregroundStyle(Theme.tertiary)
-                    .help("Geprüft")
+            HStack(spacing: 4) {
+                BookingNoteIndicator(booking: booking)
+                    .bookingNoteOccupied()
+                // Reserve both slots so the note stays beside the checkmark even on unchecked rows.
+                ZStack {
+                    if booking.checked, model.lingeringBookingID != booking.id {
+                        Image(systemName: "checkmark")
+                            .appFont(.caption, weight: .semibold)
+                            .foregroundStyle(Theme.tertiary)
+                            .help("Geprüft")
+                    }
+                }
+                .frame(width: 14 * textScale, height: 16 * textScale)
             }
             if booking.isPending {
                 Image(systemName: "clock")
@@ -888,7 +1001,7 @@ struct BookingRow: View {
                     // Order account: the direction is never colour alone — charges get a
                     // minus, refunds a plus (and a spoken label); both are badged
                     // symmetrically (same padding, same alignment).
-                    Text(ref.isRefund ? Money.signed(booking.amountCents) : Money.format(-abs(booking.amountCents)))
+                    Text(ref.isRefund ? Money.signed(booking.amountCents, currency: booking.currency) : Money.format(-abs(booking.amountCents), currency: booking.currency))
                         .sensitive(.amounts)
                         .appFont(.body, weight: .semibold, monospacedDigit: true)
                         .foregroundStyle(ref.isRefund ? Theme.inflow : Theme.charge)
@@ -896,9 +1009,9 @@ struct BookingRow: View {
                         .background(Capsule().fill(ref.isRefund ? Theme.inflowBadge : Theme.outflowBadge))
                         .lineLimit(1).fixedSize()
                         .help(ref.isRefund ? "Gutschrift (Erstattung)" : "Bestellung")
-                        .accessibilityLabel(Text(verbatim: "\(ref.isRefund ? String(localized: "Erstattung") : String(localized: "Belastung")): \(redaction.masking(Money.format(abs(booking.amountCents)), .amounts))"))
+                        .accessibilityLabel(Text(verbatim: "\(ref.isRefund ? String(localized: "Erstattung") : String(localized: "Belastung")): \(redaction.masking(Money.format(abs(booking.amountCents), currency: booking.currency), .amounts))"))
                 } else {
-                    AmountLabel(cents: booking.amountCents)
+                    AmountLabel(cents: booking.amountCents, currency: booking.currency)
                         .lineLimit(1)
                         .fixedSize()
                         .padding(.horizontal, booking.isPending ? 6 : 0)
@@ -920,18 +1033,16 @@ struct BookingRow: View {
                         .accessibilityLabel(Text(verbatim: "\(String(localized: "Saldo")): \(redaction.masking(balance.text, .amounts))"))
                 }
             }
+            .bookingNoteOccupied()
         }
         if (showsDetails || density == .standard), amazonRef == nil, !visiblePurpose.isEmpty {
-            Text(visiblePurpose)
-                .sensitive()
-                .appFont(.callout)
-                .foregroundStyle(Theme.secondary)
-                .lineLimit(showsDetails ? nil : 1)
+            BookingRowText(visiblePurpose, wraps: showsDetails, onSingleClick: onTextSingleClick)
                 .fixedSize(horizontal: false, vertical: true)
+                .bookingNoteOccupied()
                 .padding(.leading, detailInset)
         }
         if showsDetails {
-            BookingInlineDetails(booking: booking)
+            BookingInlineDetails(booking: booking, showsCategoryDropdown: showsCategoryChip, onTextSingleClick: onTextSingleClick)
                 .padding(.top, 4)
                 .padding(.leading, detailInset)
         }
@@ -941,26 +1052,25 @@ struct BookingRow: View {
                 if let source = model.amazonRefundSource(booking) {
                     Text("Erstattung zu:").appFont(.caption2).foregroundStyle(Theme.tertiary)
                     ForEach(source.list, id: \.self) { item in
-                        Text(item).sensitive().appFont(.callout).foregroundStyle(Theme.secondary)
-                            .textSelection(.enabled)
+                        orderItemText(item)
                     }
                 } else {
                     ForEach(ref.itemList, id: \.self) { item in
-                        Text(item).sensitive().appFont(.callout).foregroundStyle(Theme.secondary)
-                            .textSelection(.enabled)
+                        orderItemText(item)
                     }
                 }
             }
+            .bookingNoteOccupied()
             .padding(.leading, detailInset)
             .padding(.bottom, 4)
         }
         }
         #if os(macOS)
-        .frame(minHeight: (effectiveDensity == .compact ? 28 : 44) * textScale, alignment: .top)
+        .frame(minHeight: (effectiveDensity == .compact ? 26 : 36) * textScale, alignment: .top)
         #else
-        .frame(minHeight: 44, alignment: .top)
+        .frame(minHeight: 40, alignment: .top)
         #endif
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 12)
         .padding(.vertical, effectiveDensity.verticalPadding * textScale)
         .background {
             ZStack {
@@ -968,6 +1078,18 @@ struct BookingRow: View {
                 if booking.isPending { PendingHatch() }
                 RowSelectionBackground(id: booking.id)
             }
+        }
+        // the row is reused for another booking (positional identity, `StreamItem`)
+        .onChange(of: booking.id) { amazonExpanded = false }
+    }
+
+    @ViewBuilder
+    private func orderItemText(_ item: String) -> some View {
+        let text = Text(item).sensitive().appFont(.callout).foregroundStyle(Theme.secondary)
+        if redaction.allowsBookingTextCopy {
+            text.textSelection(.enabled)
+        } else {
+            text
         }
     }
 }
@@ -998,7 +1120,19 @@ private struct SelectionSummaryBar: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        if model.isMultiSelection {
+        if model.isSelectingAllBookings || model.selectAllAfterReload {
+            // ⌘A loads the rest of the list first (#1696): no partial count or sum meanwhile
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Alle \(model.bookingCountLabel) Buchungen werden ausgewählt …")
+                    .appFont(.callout, weight: .medium, monospacedDigit: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 20).padding(.vertical, 10)
+            .frame(maxWidth: .infinity)
+            .background(.bar)
+            .overlay(alignment: .top) { Divider() }
+        } else if model.isMultiSelection {
             let totals = model.selectionTotals
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text("\(model.selectedBookingIDs.count) Buchungen ausgewählt")
@@ -1074,13 +1208,29 @@ private struct SelectionScroller: View {
                 guard let id else { return }
                 // the day jump already scrolled to the day: do not override it
                 if model.jumpSelectedBookingID == id { model.jumpSelectedBookingID = nil; return }
-                // Every row is an element of the lazy stream, so the proxy finds it
-                // even while it is off-screen.
-                withAnimation(Motion.animation(.easeOut(duration: 0.15))) {
-                    // Expanded rows can exceed the viewport: keep their title visible.
-                    proxy.scrollTo(id, anchor: density == .standard ? nil : .top)
-                }
+                scroll(to: id)
             }
+            // A keyboard move onto the row that is already selected (Pos1 on the first row,
+            // Ende/Bild↓ on the last) changes no selection: scroll to it anyway.
+            .onChange(of: model.keyboardScrollToken) { _, _ in
+                guard let id = model.selectedBookingID else { return }
+                scroll(to: id)
+            }
+    }
+
+    private func scroll(to id: Booking.ID) {
+        let byKeyboard = model.keyboardSelectedBookingID == id
+        model.keyboardSelectedBookingID = nil
+        // Every row is an element of the lazy stream, so the proxy finds it
+        // even while it is off-screen; its target is its position (`StreamItem`).
+        // „Neue Umsätze“ shows its cards instead of the stream.
+        guard let slot = model.showsNewBookings ? .newBooking(id) : model.streamSlots.booking[id] else { return }
+        // Without animation for the keyboard: while an arrow key is held down each step restarted
+        // it, and the list fell behind the selection until the key was released.
+        withAnimation(byKeyboard ? nil : Motion.animation(.easeOut(duration: 0.15))) {
+            // Expanded rows can exceed the viewport: keep their title visible.
+            proxy.scrollTo(slot, anchor: density == .standard ? nil : .top)
+        }
     }
 }
 
@@ -1088,22 +1238,51 @@ private struct SelectionScroller: View {
 /// ("Ohne Kategorie" like the sidebar entry, in the warning colour).
 struct BookingCategoryLabel: View {
     let booking: Booking
+    var showsPath = false
     @Environment(AppModel.self) private var model
+    #if os(macOS)
+    @State private var showsPicker = false
+    #endif
 
     var body: some View {
         let none = booking.categoryName.isEmpty
         let color = none ? Theme.warning : Color.readable(hex: booking.categoryColorHex)
         HStack(spacing: 3) {
-            Image(systemName: none ? "questionmark.folder" : (booking.categorySymbol.isEmpty ? "tag.fill" : booking.categorySymbol))
+            #if os(macOS)
+            Button { showsPicker = true } label: {
+                HStack(spacing: 3) {
+                    label(none: none)
+                    Image(systemName: "chevron.down").appFont(.caption2).accessibilityHidden(true)
+                }
+                .foregroundStyle(color)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .bookingRowControl()
+            .capturablePopover(isPresented: $showsPicker, arrowEdge: .bottom) {
+                BookingCategoryPicker(booking: booking) { showsPicker = false }
+                    .environment(model)
+            }
+            .onChange(of: booking.id) { showsPicker = false }
+            #else
+            label(none: none).foregroundStyle(color)
+            #endif
+            if none { BookingSuggestionHint(booking: booking) }
+        }
+    }
+
+    private func label(none: Bool) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: none
+                ? "questionmark.folder"
+                : (booking.categorySymbol.isEmpty ? SymbolCatalog.defaultCategorySymbol : booking.categorySymbol))
                 .appFont(.caption)
-            Text(none ? model.uncategorizedLabel : booking.categoryName)
+            let name = showsPath && !booking.categoryPath.isEmpty ? booking.categoryPath : booking.categoryName
+            Text(none ? model.uncategorizedLabel : name)
                 .sensitive(.labels)
                 .appFont(.callout, weight: .medium)
                 .lineLimit(1)
-                .foregroundStyle(color)
-            if none { BookingSuggestionHint(booking: booking) }
         }
-        .foregroundStyle(color)
     }
 }
 
@@ -1135,11 +1314,13 @@ struct AccountChip: View {
     let label: String
     let color: Color
     var symbol = "building.columns"
-    /// Narrow rows: just the symbol (the category keeps the room).
+    /// Narrow rows: just the symbol (the category keeps the room). Otherwise the label shows
+    /// whenever the whole chip fits the room the row offers.
     var compact = false
 
     var body: some View {
-        HStack(spacing: 4) {
+        AccountChipLayout {
+            Capsule().fill(color.opacity(0.12))
             Image(systemName: symbol)
                 .appFont(.caption, weight: .semibold)
                 .foregroundStyle(color)
@@ -1151,13 +1332,65 @@ struct AccountChip: View {
                     .lineLimit(1)
             }
         }
-        .padding(.horizontal, compact ? 0 : 6)
-        .padding(.vertical, 1.5)
-        .background(Capsule().fill(color.opacity(compact ? 0 : 0.12)))
-        .fixedSize()
+        // a label that does not fit is placed outside the chip
+        .clipped()
         .help(label)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text("Konto: \(label)"))
+    }
+}
+
+/// Symbol and label in a tinted capsule, or only the symbol when the full chip does not fit
+/// the offered width (or there is no label). One layout instead of `ViewThatFits` over a full
+/// and a compact chip, which built and measured both for every booking row on screen.
+/// Subviews: capsule, symbol, optional label.
+private struct AccountChipLayout: Layout {
+    private static let padding: CGFloat = 6
+    private static let spacing: CGFloat = 4
+    private static let vertical: CGFloat = 1.5
+
+    /// Ideal sizes, measured once per subview change: the stack around the chip asks for its
+    /// size several times per layout pass.
+    struct Sizes {
+        var icon: CGSize
+        var label: CGSize?
+        var full: CGSize?
+        var compact: CGSize
+    }
+
+    func makeCache(subviews: Subviews) -> Sizes {
+        let icon = subviews[1].sizeThatFits(.unspecified)
+        let label = subviews.count > 2 ? subviews[2].sizeThatFits(.unspecified) : nil
+        let full = label.map {
+            CGSize(width: Self.padding * 2 + icon.width + Self.spacing + $0.width,
+                   height: max(icon.height, $0.height) + Self.vertical * 2)
+        }
+        return Sizes(icon: icon, label: label, full: full,
+                     compact: CGSize(width: icon.width, height: icon.height + Self.vertical * 2))
+    }
+
+    func updateCache(_ cache: inout Sizes, subviews: Subviews) {
+        cache = makeCache(subviews: subviews)
+    }
+
+    /// The full chip when it fits `width` (nil: ideal size, no limit).
+    private func full(_ cache: Sizes, within width: CGFloat?) -> CGSize? {
+        cache.full.flatMap { (width ?? .infinity) >= $0.width ? $0 : nil }
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Sizes) -> CGSize {
+        full(cache, within: proposal.width) ?? cache.compact
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Sizes) {
+        let showsLabel = full(cache, within: bounds.width + 0.5) != nil
+        let iconX = bounds.minX + (showsLabel ? Self.padding : 0)
+        subviews[0].place(at: bounds.origin, proposal: showsLabel ? ProposedViewSize(bounds.size) : .zero)
+        subviews[1].place(at: CGPoint(x: iconX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(cache.icon))
+        guard subviews.count > 2, let label = cache.label else { return }
+        // outside the clipped bounds when it does not fit
+        let labelX = showsLabel ? iconX + cache.icon.width + Self.spacing : bounds.maxX + 1000
+        subviews[2].place(at: CGPoint(x: labelX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(label))
     }
 }
 
@@ -1165,18 +1398,22 @@ struct AccountChip: View {
 /// emerald (or blue) badge; the sign always carries the direction too.
 struct AmountLabel: View {
     let cents: Int64
+    /// The booking's own currency; an empty one is EUR (as in the core).
+    var currency: String = "EUR"
     @Environment(\.negativeAmountStyle) private var negativeStyle
+
+    private var code: String { currency.isEmpty ? "EUR" : currency.uppercased() }
 
     var body: some View {
         if cents > 0 {
-            Text(Money.signed(cents))
+            Text(Money.signed(cents, currency: code))
                 .sensitive(.amounts)
                 .appFont(.body, weight: .semibold, monospacedDigit: true)
                 .foregroundStyle(negativeStyle.positiveColor)
                 .padding(.horizontal, 8).padding(.vertical, 3)
                 .background(Capsule().fill(negativeStyle.positiveBadge))
         } else {
-            Text(Money.format(cents))
+            Text(Money.format(cents, currency: code))
                 .sensitive(.amounts)
                 .appFont(.body, weight: .medium, monospacedDigit: true)
                 .foregroundStyle(cents < 0 ? negativeStyle.color : Theme.outflow)
@@ -1190,7 +1427,7 @@ struct LoadMoreBookingsFooter: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            Text("\(model.bookings.count) von \(model.bookings.count + model.remainingBookingCount) Buchungen geladen – ältere Buchungen sind noch nicht sichtbar.")
+            Text("\(model.loadedMatchingCount) von \(model.loadedMatchingCount + model.remainingBookingCount) Buchungen geladen – ältere Buchungen sind noch nicht sichtbar.")
                 .appFont(.caption).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             // always laid out, only faded: the footer keeps its height while a page loads
@@ -1212,17 +1449,18 @@ struct LoadMoreBookingsFooter: View {
     }
 }
 
-/// macOS: the window carries the view's title, the toolbar does not show it
-/// (macOS 15+). iOS keeps the empty navigation title as before.
+/// Window title from `model.title`, read in the modifier's own body so a title change re-runs
+/// only this modifier, not the view that applies it. macOS: the window carries the view's
+/// title, the toolbar does not show it (macOS 15+). iOS keeps the empty navigation title.
 struct WindowTitle: ViewModifier {
-    let title: String
+    @Environment(AppModel.self) private var model
     /// The title bar is drawn by AppKit, so `.sensitive()` cannot cover it:
     /// any bug report capture shows the app name (the title may be an account).
     @Environment(\.reportRedaction) private var redaction
 
     func body(content: Content) -> some View {
         #if os(macOS)
-        let title = redaction.isDisjoint(with: [.personal, .labels]) ? title : "GiroCrab"
+        let title = redaction.isDisjoint(with: [.personal, .labels]) ? model.title : "GiroCrab"
         if #available(macOS 15.0, *) {
             content.navigationTitle(title).toolbar(removing: .title)
         } else {
@@ -1237,10 +1475,17 @@ struct WindowTitle: ViewModifier {
 /// Toolbar of the booking list. macOS: customizable (View › Symbolleiste
 /// anpassen …) – Überweisen and Abrufen are shown by default, the rest can be
 /// added; every command is also in the menu bar. iOS: unchanged.
+///
+/// macOS: the modifier's body reads no model state and holds no `@AppStorage`; each item's
+/// content is a view of its own that reads what it shows. Rebuilding the toolbar content
+/// re-bridges every item to AppKit (`ToolbarBridge`), so it must not happen on each sidebar
+/// or booking selection: a read here (or an `@AppStorage`, which never compares equal when
+/// the parent re-creates this modifier) did exactly that.
 struct MainToolbar: ViewModifier {
     @Environment(AppModel.self) private var model
-    @AppStorage(ViewLayout.inspectorKey) private var showInspector = true
+    #if os(iOS)
     @AppStorage(PrivacyMode.enabledKey) private var privacyMode = false
+    #endif
 
     func body(content: Content) -> some View {
         #if os(iOS)
@@ -1272,44 +1517,23 @@ struct MainToolbar: ViewModifier {
         #else
         content.toolbar(id: "girocrab.main") {
             ToolbarItem(id: "scope", placement: .principal) {
-                // Keep one customizable toolbar item, with the filter for the current view.
-                if model.sidebarSelection == .wealth {
-                    WealthScopePicker()
-                } else if model.sidebarSelection == .documents {
-                    DocumentsScopePicker()
-                } else {
-                    switch model.presentation {
-                    case .securities: DepotTabPicker()
-                    // Sachwerte have neither booking scopes nor depot tabs; the item stays so the
-                    // customizable toolbar keeps its layout
-                    case .tangible: Color.clear.frame(width: 1, height: 1).accessibilityHidden(true)
-                    case .bookings: BookingScopePicker().disabled(model.sidebarSelection == .newBookings)
-                    }
-                }
+                ScopeToolbarControl()
             }
-            .defaultCustomization(.visible, options: .alwaysAvailable) // pinned: not draggable/removable, so the others keep their slots (#609)
+            .defaultCustomization(.visible, options: .alwaysAvailable) // always in the palette; SwiftUI still lets the user remove it from the bar (#609, #1832)
             ToolbarItem(id: "transfer", placement: .primaryAction) {
-                Button { model.openTransfer() } label: { Label("Überweisen", systemImage: "paperplane") }
-                    .help("Neue Überweisung (⌘N)")
-                    .disabled(!model.canTransfer)
+                TransferToolbarButton()
             }
             ToolbarItem(id: "newBooking", placement: .primaryAction) {
-                Button { model.openManualBooking() } label: { Label("Neue Buchung", systemImage: "plus") }
-                    .help("Neue Buchung (⌥⌘N)")
-                    .disabled(!model.canAddManualBooking)
+                NewBookingToolbarButton()
             }
             ToolbarItem(id: "sync", placement: .primaryAction) {
-                Button { model.requestSyncAll() } label: { Label("Abrufen", systemImage: "arrow.triangle.2.circlepath") }
-                    .help(model.bankingBlocksAll ? (BankingPolicy.shared.gate?.message ?? "") : String(localized: "Alle Konten abrufen (⌘R)"))
-                    .disabled(model.bankingBlocksAll)
+                SyncToolbarButton()
             }
             ToolbarItem(id: "inspector", placement: .primaryAction) {
-                Button { showInspector.toggle() } label: { Label("Informationen", systemImage: "sidebar.trailing") }
-                    .help(showInspector ? String(localized: "Informationen ausblenden (⌥⌘I)") : String(localized: "Informationen einblenden (⌥⌘I)"))
+                InspectorToolbarButton()
             }
             ToolbarItem(id: "privacy", placement: .primaryAction) {
-                Toggle(isOn: $privacyMode) { Label("Privatmodus", systemImage: privacyMode ? "eye.slash" : "eye") }
-                    .help(privacyMode ? String(localized: "Privatmodus beenden (⇧⌘H)") : String(localized: "Privatmodus: Beträge ausblenden (⇧⌘H)"))
+                PrivacyToolbarToggle()
             }
             extraToolbarItems
         }
@@ -1338,9 +1562,7 @@ struct MainToolbar: ViewModifier {
                 .help("Kategorisierungsregeln … (⌥⌘K)")
         }
         ToolbarItem(id: "lock", placement: .primaryAction, showsByDefault: false) {
-            Button { model.lock() } label: { Label("Tresor sperren", systemImage: "lock") }
-                .help("Tresor sperren (⌃⌘L)")
-                .disabled(!model.hasOwnVault)
+            LockToolbarButton()
         }
         ToolbarItem(id: "settings", placement: .primaryAction, showsByDefault: false) {
             SettingsLink { Label("Einstellungen", systemImage: "gearshape") }
@@ -1351,17 +1573,109 @@ struct MainToolbar: ViewModifier {
 }
 
 #if os(macOS)
+/// The scope toolbar item: the filter of the view in the booking column.
+private struct ScopeToolbarControl: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        // Keep one customizable toolbar item, with the filter for the current view.
+        if model.mainColumn == .wealth {
+            WealthScopePicker()
+        } else if model.mainColumn == .documents {
+            DocumentsScopePicker()
+        } else {
+            switch model.presentation {
+            case .securities: DepotTabPicker()
+            // Sachwerte have neither booking scopes nor depot tabs; the item stays so the
+            // customizable toolbar keeps its layout
+            case .tangible: Color.clear.frame(width: 1, height: 1).accessibilityHidden(true)
+            case .bookings: BookingScopePicker().disabled(model.sidebarRowSelection(for: .newBookings).isSelected)
+            }
+        }
+    }
+}
+
+private struct TransferToolbarButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button { model.openTransfer() } label: { Label("Überweisen", systemImage: "paperplane") }
+            .help("Neue Überweisung (⌘N)")
+            .disabled(!model.canTransfer)
+    }
+}
+
+private struct NewBookingToolbarButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button { model.openManualBooking() } label: { Label("Neue Buchung", systemImage: "plus") }
+            .help("Neue Buchung (⌥⌘N)")
+            .disabled(!model.canAddManualBooking)
+    }
+}
+
+private struct SyncToolbarButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button { model.requestSyncAll() } label: { Label("Abrufen", systemImage: "arrow.triangle.2.circlepath") }
+            .help(model.bankingBlocksAll ? (BankingPolicy.shared.gate?.message ?? "") : String(localized: "Alle Konten abrufen (⌘R)"))
+            .disabled(model.bankingBlocksAll)
+    }
+}
+
+private struct InspectorToolbarButton: View {
+    @AppStorage(ViewLayout.inspectorKey) private var showInspector = true
+
+    var body: some View {
+        Button { showInspector.toggle() } label: { Label("Informationen", systemImage: "sidebar.trailing") }
+            .help(showInspector ? String(localized: "Informationen ausblenden (⌥⌘I)") : String(localized: "Informationen einblenden (⌥⌘I)"))
+    }
+}
+
+private struct PrivacyToolbarToggle: View {
+    @AppStorage(PrivacyMode.enabledKey) private var privacyMode = false
+    @AppStorage(PrivacyMode.scopeKey) private var privacyScope = PrivacyMode.defaultScope
+
+    var body: some View {
+        Toggle(isOn: $privacyMode) { Label("Privatmodus", systemImage: privacyMode ? "eye.slash" : "eye") }
+            .help(privacyMode ? String(localized: "Privatmodus beenden (⇧⌘H)")
+                : privacyScope == .personal ? String(localized: "Privatmodus: Beträge und persönliche Angaben ausblenden (⇧⌘H)")
+                : String(localized: "Privatmodus: Beträge ausblenden (⇧⌘H)"))
+    }
+}
+
+private struct LockToolbarButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button { model.lock() } label: { Label("Tresor sperren", systemImage: "lock") }
+            .help("Tresor sperren (⌃⌘L)")
+            .disabled(!model.hasOwnVault)
+    }
+}
+
 /// Modifier keys held at the last mouse-down in the app. SwiftUI runs a tap
 /// gesture after the event has passed, so `NSApp.currentEvent` no longer
 /// carries them; a local monitor records them as the click arrives.
 @MainActor
 enum ClickModifiers {
     private(set) static var atLastMouseDown: NSEvent.ModifierFlags = []
+    private(set) static var bookingTextHandledMouseDown = false
+    private(set) static var bookingTextInClickSequence = false
     private static var monitor: Any?
+
+    static func handledBookingTextMouseDown() {
+        bookingTextHandledMouseDown = true
+        bookingTextInClickSequence = true
+    }
 
     static func install() {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { event in
+            bookingTextHandledMouseDown = false
+            if event.clickCount <= 1 { bookingTextInClickSequence = false }
             atLastMouseDown = event.modifierFlags.intersection([.command, .shift, .option, .control])
             return event
         }

@@ -16,6 +16,19 @@ private func detailText(_ s: DepotSlice, total: Int64, currency: String) -> Stri
     return "\(s.label) · \(Money.format(s.cents, currency: currency)) · \(shareText(s.cents, of: total))\(positions)"
 }
 
+/// The legend's hover: with a ring's bindings it highlights the slice and shows the card at the pointer, without
+/// them (the shared picture) the entry keeps its plain tooltip.
+private struct LegendSliceHover: ViewModifier {
+    let id: String
+    let help: String
+    let hovered: Binding<String?>?
+    let spot: Binding<HoverCardSpot?>?
+
+    func body(content: Content) -> some View {
+        if let hovered, let spot { content.sliceHover(id: id, hovered: hovered, spot: spot) } else { content.help(help) }
+    }
+}
+
 /// Name, amount and share per slice; a long name wraps to a second line and is complete in the tooltip.
 struct CompositionLegend: View {
     @Environment(\.textScale) private var textScale
@@ -24,28 +37,41 @@ struct CompositionLegend: View {
     let currency: String
     var selected: String?
     var select: ((DepotSlice) -> Void)?
+    /// Hover highlight and card of the ring this legend belongs to (#889).
+    var hovered: Binding<String?>?
+    var spot: Binding<HoverCardSpot?>?
+
+    static func markerOpacity(id: String, selected: String?, hovered: String?) -> Double {
+        if let selected {
+            if selected == id { return 1 }
+            return hovered == id ? 0.75 : 0.35
+        }
+        return hovered == nil || hovered == id ? 1 : 0.5
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(slices) { s in
+                let isSelected = selected == s.id
                 Button { select?(s) } label: {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Circle().fill(s.color).frame(width: 9, height: 9).accessibilityHidden(true)
-                    Text(s.label).sensitive(s.personal ? .personal : .labels).lineLimit(2)
-                        .foregroundStyle(s.unclassified ? Theme.secondary : Theme.text)
-                    Spacer(minLength: 8)
-                    Text(Money.format(s.cents, currency: currency)).sensitive(.amounts).foregroundStyle(Theme.secondary)
-                    Text(shareText(s.cents, of: total)).sensitive(.amounts).foregroundStyle(Theme.secondary)
-                        .frame(minWidth: 46 * textScale, alignment: .trailing)
-                }
-                .appFont(.caption, monospacedDigit: true)
-                .contentShape(Rectangle())
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Circle().fill(s.color).frame(width: 9, height: 9)
+                            .opacity(Self.markerOpacity(id: s.id, selected: selected, hovered: hovered?.wrappedValue))
+                            .accessibilityHidden(true)
+                        Text(s.label).sensitive(s.personal ? .personal : .labels).lineLimit(2)
+                            .foregroundStyle(s.unclassified ? Theme.secondary : Theme.text)
+                        Spacer(minLength: 8)
+                        Text(Money.format(s.cents, currency: currency)).sensitive(.amounts).foregroundStyle(Theme.secondary)
+                        Text(shareText(s.cents, of: total)).sensitive(.amounts).foregroundStyle(Theme.secondary)
+                            .frame(minWidth: 46 * textScale, alignment: .trailing)
+                    }
+                    .appFont(.caption, weight: isSelected ? .semibold : nil, monospacedDigit: true)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .opacity(selected == nil || selected == s.id ? 1 : 0.35)
-                .help(detailText(s, total: total, currency: currency))
+                .modifier(LegendSliceHover(id: s.id, help: detailText(s, total: total, currency: currency), hovered: hovered, spot: spot))
                 .accessibilityElement(children: .combine)
-                .accessibilityAddTraits(selected == s.id ? [.isButton, .isSelected] : .isButton)
+                .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
                 .accessibilityHint(select == nil ? "" : String(localized: "Positionen dieser Gruppe anzeigen oder Filter aufheben"))
             }
         }
@@ -63,33 +89,22 @@ struct CompositionRing: View {
     let currency: String
     var selected: String?
     var select: ((DepotSlice) -> Void)?
+    /// Slice under the pointer (macOS): highlighted in the ring and the legend, named in a card at the pointer (#889).
+    @State private var hovered: String?
+    @State private var spot: HoverCardSpot?
+
+    private var active: String? { hovered ?? selected }
 
     private var ring: some View {
         Chart(slices) { s in
             SectorMark(angle: .value("Wert", s.cents), innerRadius: .ratio(0.66), angularInset: 1.5)
                 .cornerRadius(3)
                 .foregroundStyle(s.color)
-                .opacity(selected == nil || selected == s.id ? 1 : 0.3)
+                .opacity(active == nil || active == s.id ? 1 : 0.3)
         }
         .chartLegend(.hidden)
-        .chartOverlay { proxy in
-            GeometryReader { geo in
-                Color.clear.contentShape(Rectangle()).onTapGesture { location in
-                    guard let select, let plot = proxy.plotFrame else { return }
-                    let frame = geo[plot]
-                    let dx = location.x - frame.midX, dy = location.y - frame.midY
-                    let distance = hypot(dx, dy), radius = min(frame.width, frame.height) / 2
-                    guard distance >= radius * 0.66, distance <= radius else { return }
-                    let radians = atan2(dx, -dy)
-                    let angle = Angle.radians(radians < 0 ? radians + 2 * .pi : radians)
-                    guard let value: Double = proxy.value(atAngle: angle) else { return }
-                    var end = 0.0
-                    for s in slices where s.cents > 0 {
-                        end += Double(s.cents)
-                        if value < end { select(s); return }
-                    }
-                }
-            }
+        .pieHover(parts: slices.map { ($0.id, $0.cents) }, innerRatio: 0.66, hovered: $hovered, spot: $spot) { id in
+            if let select, let s = slices.first(where: { $0.id == id }) { select(s) }
         }
         .frame(width: ringSize, height: ringSize)
         .sensitive()
@@ -111,13 +126,20 @@ struct CompositionRing: View {
             // a long legend (all positions unfolded) starts at the top; the ring is not centred beside it
             HStack(alignment: slices.count > 9 ? .top : .center, spacing: 28) {
                 ring
-                CompositionLegend(slices: slices, total: total, currency: currency, selected: selected, select: select)
+                CompositionLegend(slices: slices, total: total, currency: currency, selected: selected, select: select,
+                                  hovered: $hovered, spot: $spot)
                     .frame(maxWidth: 560 * textScale, alignment: .leading)
                 Spacer(minLength: 0)
             }
             VStack(alignment: .leading, spacing: 14) {
                 ring.frame(maxWidth: .infinity)
-                CompositionLegend(slices: slices, total: total, currency: currency, selected: selected, select: select)
+                CompositionLegend(slices: slices, total: total, currency: currency, selected: selected, select: select,
+                                  hovered: $hovered, spot: $spot)
+            }
+        }
+        .hoverCardHost(spot) { id in
+            if let s = slices.first(where: { $0.id == id }) {
+                PieDetailCard(label: s.label, cents: s.cents, total: total, currency: currency, personal: s.personal)
             }
         }
     }
@@ -142,30 +164,31 @@ struct CompositionRankBars: View {
         let scale = max(shown.map(\.cents).max() ?? 1, 1)
         VStack(alignment: .leading, spacing: 8) {
             ForEach(shown) { s in
+                let isSelected = selected == s.id
                 Button { select?(s) } label: {
-                HStack(spacing: 10) {
-                    Text(s.label).sensitive(s.personal ? .personal : .labels).lineLimit(2)
-                        .foregroundStyle(s.unclassified ? Theme.secondary : Theme.text)
-                        .frame(width: 150 * textScale, alignment: .leading)
-                    GeometryReader { geo in
-                        RoundedRectangle(cornerRadius: 3, style: .continuous).fill(s.color)
-                            .frame(width: max(geo.size.width * CGFloat(s.cents) / CGFloat(scale), 2))
+                    HStack(spacing: 10) {
+                        Text(s.label).sensitive(s.personal ? .personal : .labels).lineLimit(2)
+                            .foregroundStyle(s.unclassified ? Theme.secondary : Theme.text)
+                            .frame(width: 150 * textScale, alignment: .leading)
+                        GeometryReader { geo in
+                            RoundedRectangle(cornerRadius: 3, style: .continuous).fill(s.color)
+                                .frame(width: max(geo.size.width * CGFloat(s.cents) / CGFloat(scale), 2))
+                        }
+                        .frame(height: 12 * textScale)
+                        .opacity(selected == nil || isSelected ? 1 : 0.35)
+                        .sensitive()
+                        Text(Money.format(s.cents, currency: currency)).sensitive(.amounts).foregroundStyle(Theme.secondary)
+                            .frame(minWidth: 96 * textScale, alignment: .trailing)
+                        Text(shareText(s.cents, of: total)).sensitive(.amounts).foregroundStyle(Theme.secondary)
+                            .frame(minWidth: 46 * textScale, alignment: .trailing)
                     }
-                    .frame(height: 12 * textScale)
-                    .sensitive()
-                    Text(Money.format(s.cents, currency: currency)).sensitive(.amounts).foregroundStyle(Theme.secondary)
-                        .frame(minWidth: 96 * textScale, alignment: .trailing)
-                    Text(shareText(s.cents, of: total)).sensitive(.amounts).foregroundStyle(Theme.secondary)
-                        .frame(minWidth: 46 * textScale, alignment: .trailing)
-                }
-                .appFont(.caption, monospacedDigit: true)
-                .contentShape(Rectangle())
+                    .appFont(.caption, weight: isSelected ? .semibold : nil, monospacedDigit: true)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .opacity(selected == nil || selected == s.id ? 1 : 0.35)
                 .help(detailText(s, total: total, currency: currency))
                 .accessibilityElement(children: .combine)
-                .accessibilityAddTraits(selected == s.id ? [.isButton, .isSelected] : .isButton)
+                .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
             }
             if let rest {
                 Divider()
@@ -265,7 +288,8 @@ struct CompositionTreemap: View {
     }
 
     private func tile(_ s: DepotSlice, _ r: CGRect) -> some View {
-        let ink = TileInk.color(on: s.color, in: environment)
+        let dimmed = selected != nil && selected != s.id
+        let ink = dimmed ? Color.primary : TileInk.color(on: s.color, in: environment)
         // what fits is judged by the length of the text (scaled with the font), not by fixed widths
         let inner = r.width - 16
         let share = shareText(s.cents, of: total)
@@ -278,7 +302,7 @@ struct CompositionTreemap: View {
         let shareOnly = !both && !nameOnly && shareFits && r.height > 18 * textScale
         let summary = detailText(s, total: total, currency: currency)
         return RoundedRectangle(cornerRadius: 6, style: .continuous)
-            .fill(s.color)
+            .fill(s.color.opacity(dimmed ? 0.35 : 1))
             .frame(width: max(r.width, 0), height: max(r.height, 0))
             .overlay(alignment: .topLeading) {
                 VStack(alignment: .leading, spacing: 1) {
@@ -303,7 +327,6 @@ struct CompositionTreemap: View {
             .onHover { inside in
                 if inside { hovered = s.id } else if hovered == s.id { hovered = nil }
             }
-            .opacity(selected == nil || selected == s.id ? 1 : 0.35)
             .onTapGesture { select?(s) }
             .help(summary)
             .accessibilityElement(children: .ignore)

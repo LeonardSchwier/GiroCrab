@@ -22,13 +22,7 @@ Sheet {
     readonly property var popularNames: ["ING", "DKB", "comdirect", "Postbank", "Consorsbank", "N26", "C24", "Revolut", "bunq", "Trade Republic", "Scalable Capital", "PayPal"]
     readonly property var modeOrder: ["FinTs", "OwnApi", "Psd2"]
 
-    /// Connectors whose sign-in the Linux UI has no flow for yet (they would open the wrong
-    /// browser login): EquatePlus (#720, EquatePlusUI.swift) is left out of the search.
-    readonly property var linuxUnsupported: ["EquatePlus"]
-    function search(q, limit) {
-        return AppModel.core("search_banks", { query: q, live_psd2: [], per_group_limit: limit || 12 })
-            .filter(r => linuxUnsupported.indexOf(r.connector) < 0)
-    }
+    function search(q, limit) { return AppModel.core("search_banks", { query: q, live_psd2: [], per_group_limit: limit || 12 }) }
     readonly property bool searching: query.trim() !== ""
     readonly property var results: searching ? search(query) : []
     function key(s) { return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "") }
@@ -57,6 +51,8 @@ Sheet {
     function groupTitle(m) { return m === "FinTs" ? qsTr("Direkt (FinTS 3.0 / HBCI)") : m === "OwnApi" ? qsTr("Direkt (Eigene API)") : qsTr("PSD2 (via Enable Banking)") }
     function groupHint(m) { return m === "FinTs" ? qsTr("Keine Registrierung bei Dritten nötig") : m === "OwnApi" ? qsTr("Direkter Zugang über die API der Bank")
                                                  : qsTr("Benötigt eine kostenlose eigene Enable-Banking-Anwendung") }
+    /// AddBankSheet.displayName (#935)
+    function displayName(r) { return r.connector === "Advanzia" ? qsTr("Advanzia Bank (Zugang mein.advanzia.com)") : r.name }
     function symbolOf(r) {
         if (r.connector) { const d = AppModel.descriptor(r.connector); if (d) return d.sf_symbol }
         return r.mode === "Psd2" ? "building.columns.circle" : "building.columns"
@@ -71,7 +67,8 @@ Sheet {
         const kind = selected.connector || (selected.mode === "FinTs" ? "FinTsGeneric" : "EnableBanking")
         const d = AppModel.descriptor(kind)
         if (!d) return []
-        return d.required_settings.filter(k => { const e = AppModel.settingEntry(k); return !(e && e.has_value) && !(k === "fints.product_id" && AppModel.fintsProductIDSource !== "") })
+        // AddBankAssistant.swift › missingSettings: the FinTS product ID is never asked for (#842/#865)
+        return AppModel.userRequiredKeys(d.required_settings).filter(k => { const e = AppModel.settingEntry(k); return !(e && e.has_value) })
     }
     // RAH-10: the settings (FinTS product registration) come first, then the key file
     readonly property bool isLastStep: (step === "setup" && !isRah10) || (step === "access" && missingSettings.length === 0)
@@ -106,7 +103,7 @@ Sheet {
             ColumnLayout { spacing: 3; Layout.fillWidth: true
                 Text { font.pixelSize: Theme.title3 + 2; font.weight: Font.DemiBold; color: Theme.text
                        text: sheet.step === "bank" ? qsTr("Bank hinzufügen") : sheet.step === "setup" ? qsTr("Einrichten")
-                           : (sheet.selected && sheet.selected.id === sheet.manualFinTs.id ? qsTr("Andere FinTS-Bank") : (sheet.selected ? sheet.selected.name : "")) }
+                           : (sheet.selected && sheet.selected.id === sheet.manualFinTs.id ? qsTr("Andere FinTS-Bank") : (sheet.selected ? sheet.displayName(sheet.selected) : "")) }
                 Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: Theme.callout + 1; color: Theme.secondary
                        text: sheet.step === "bank" ? qsTr("Suchen Sie Ihre Bank nach Name, Bankleitzahl oder IBAN.")
                            : sheet.step === "access" ? qsTr("Wie GiroCrab die Umsätze abruft. PIN und TAN fragt GiroCrab erst beim ersten Abruf ab.")
@@ -178,7 +175,7 @@ Sheet {
                                 anchors.fill: parent; anchors.leftMargin: 10; spacing: 10
                                 SFIcon { symbol: modelData.rah10 ? "key" : modelData.manual ? "square.and.pencil" : (modelData.bank ? sheet.symbolOf(modelData.bank) : ""); size: 18; Layout.preferredWidth: 22 }
                                 ColumnLayout { spacing: 1; Layout.fillWidth: true
-                                    Text { text: modelData.manual ? qsTr("Andere FinTS-Bank") : (modelData.bank ? modelData.bank.name : ""); font.pixelSize: Theme.body + 1; color: Theme.text
+                                    Text { text: modelData.manual ? qsTr("Andere FinTS-Bank") : (modelData.bank ? sheet.displayName(modelData.bank) : ""); font.pixelSize: Theme.body + 1; color: Theme.text
                                            Layout.fillWidth: true; elide: Text.ElideRight }
                                     Text { text: modelData.rah10 ? qsTr("Bestehende HBCI-Datei mit Profil 10 importieren")
                                                : modelData.manual ? qsTr("Bankleitzahl und FinTS-Adresse selbst eingeben") : (modelData.bank ? sheet.detailLine(modelData.bank) : "")
@@ -344,12 +341,11 @@ Sheet {
             Text {
                 visible: !ff.known
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: Theme.caption
-                color: (ff.blz !== "" && !ff.blzValid) || (ff.url !== "" && !ff.urlValid) ? "orange" : Theme.secondary
+                color: (ff.blz !== "" && !ff.blzValid) || (ff.url !== "" && !ff.urlValid) ? Theme.warning : Theme.secondary
                 text: (ff.blz !== "" && !ff.blzValid) || (ff.url !== "" && !ff.urlValid) ? qsTr("Bankleitzahl: genau 8 Ziffern · FinTS-Adresse: beginnt mit https://")
                     : ff.blzValid && ff.found === null ? qsTr("Diese Bankleitzahl steht nicht im Verzeichnis. Tragen Sie die FinTS-Adresse Ihrer Bank selbst ein.") : ""
             }
             Text { text: qsTr("Anmeldung"); font.pixelSize: Theme.callout; font.weight: Font.DemiBold; color: Theme.secondary; Layout.topMargin: 6 }
-            DemoHintBanner { visible: AppModel.demoActive || ff.blz === "99999999"; Layout.fillWidth: true; onFill: login.text = "demo" }
             GridLayout {
                 columns: 2; columnSpacing: 12; rowSpacing: 8; Layout.fillWidth: true
                 Text { text: qsTr("Anmeldename"); color: Theme.text }
@@ -357,6 +353,8 @@ Sheet {
                 Text { text: qsTr("TAN-Medium"); color: Theme.text }
                 TextField { id: tanMedium; Layout.fillWidth: true; placeholderText: qsTr("Optional") }
             }
+            // in the footer, not above the fields: no box in a box (HIG, #881)
+            DemoHintBanner { visible: AppModel.demoActive || ff.blz === "99999999"; Layout.fillWidth: true; onFill: login.text = "demo" }
             AddFormFooter {
                 lines: [ff.isPostbank ? qsTr("Postbank: Als Anmeldename die Postbank ID verwenden, nicht die Kontonummer.") : "",
                         ff.needsMediumHint ? qsTr("Fordert die Bank ein TAN-Medium (Fehler 9210), tragen Sie den Gerätenamen aus der BestSign- oder App-Verwaltung ein, z. B. SO:Gerätename.")
@@ -373,13 +371,12 @@ Sheet {
             spacing: 10
             readonly property string kind: sheet.selected.connector
             readonly property var d: AppModel.descriptor(kind)
-            readonly property bool loginRequired: ["Comdirect", "TradeRepublic", "VolksbankKasselGoettingen", "Direkt1822", "FinTsGeneric"].indexOf(kind) >= 0
+            readonly property bool loginRequired: ["Comdirect", "TradeRepublic", "Advanzia", "VolksbankKasselGoettingen", "Direkt1822", "FinTsGeneric"].indexOf(kind) >= 0
             readonly property bool canAdd: !loginRequired || login.text.trim() !== ""
             function commit() {
                 AppModel.addConnection(kind, kind === "TradeRepublic" ? AppModel.core("normalize_phone_number", { input: login.text }) : login.text)
             }
             Text { text: qsTr("Zugang"); font.pixelSize: Theme.callout; font.weight: Font.DemiBold; color: Theme.secondary }
-            DemoHintBanner { visible: AppModel.demoActive; Layout.fillWidth: true; onFill: login.text = "demo" }
             GridLayout {
                 columns: 2; columnSpacing: 12; rowSpacing: 8; Layout.fillWidth: true
                 Text { text: kf.d ? kf.d.login_label : ""; color: Theme.text }
@@ -389,6 +386,8 @@ Sheet {
                 Text { visible: kf.d && kf.d.bank_code !== ""; text: qsTr("Bankleitzahl"); color: Theme.text }
                 Text { visible: kf.d && kf.d.bank_code !== ""; text: kf.d ? kf.d.bank_code : ""; color: Theme.secondary }
             }
+            // in the footer, not above the fields: no box in a box (HIG, #881)
+            DemoHintBanner { visible: AppModel.demoActive; Layout.fillWidth: true; onFill: login.text = "demo" }
             AddFormFooter { lines: [kf.d ? kf.d.note : ""] }
         }
     }
@@ -408,12 +407,13 @@ Sheet {
                 Text { text: qsTr("Verfahren"); color: Theme.text }
                 Text { text: qsTr("PSD2 über Enable Banking"); color: Theme.secondary }
             }
-            DemoHintBanner { visible: AppModel.demoActive; Layout.fillWidth: true; onFill: label.text = "demo" }
             GridLayout {
                 columns: 2; columnSpacing: 12; Layout.fillWidth: true
                 Text { text: qsTr("Bezeichnung"); color: Theme.text }
                 TextField { id: label; Layout.fillWidth: true; placeholderText: qsTr("Optional") }
             }
+            // in the footer, not above the fields: no box in a box (HIG, #881)
+            DemoHintBanner { visible: AppModel.demoActive; Layout.fillWidth: true; onFill: label.text = "demo" }
             AddFormFooter { lines: [sheet.selected.tested, qsTr("Sie melden sich in einem GiroCrab-Fenster direkt bei Ihrer Bank an. Dafür brauchen Sie eine kostenlose eigene Anwendung auf enablebanking.com – die Einrichtung führt Sie Schritt für Schritt hindurch.")] }
         }
     }

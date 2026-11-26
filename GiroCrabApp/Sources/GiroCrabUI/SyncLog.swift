@@ -27,6 +27,24 @@ extension AppModel {
         }
     }
 
+    /// What a finished sync tells the Abrufprotokoll: the bookings, then what else it delivered
+    /// (documents, securities transactions, depot positions). Zero counts stay out.
+    static func syncLogMessage(_ s: SyncSummary) -> String {
+        var parts = [s.transactionsImported == 0 ? String(localized: "Keine neuen Buchungen")
+                     : String(localized: "\(Int(s.transactionsImported)) neue Buchungen")]
+        if s.documentsImported > 0 { parts.append(String(localized: "\(Int(s.documentsImported)) neue Dokumente")) }
+        if s.securityTransactions > 0 { parts.append(String(localized: "\(Int(s.securityTransactions)) Wertpapiergeschäfte")) }
+        if s.holdings > 0 { parts.append(String(localized: "\(Int(s.holdings)) Positionen")) }
+        // the log must show why no document came: the retrieval is switched off for this login
+        if s.documentsOff { parts.append(String(localized: "Dokumentenabruf aus")) }
+        if s.historyIncomplete {
+            let progress = HistoryProgress(remaining: Int(s.historyRemaining), total: Int(s.historyTotal)).text
+            parts.append(String(localized: "Historie noch nicht vollständig") + (progress.isEmpty ? "" : " (\(progress))"))
+        }
+        parts.append(contentsOf: s.warnings + s.hints)
+        return parts.joined(separator: " · ")
+    }
+
     /// CSV of the rows the log window shows.
     static func syncLogCSV(_ entries: [SyncLogEntry]) -> String {
         func field(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
@@ -46,6 +64,7 @@ extension SyncLogOutcome {
     var title: String {
         switch self {
         case .ok: String(localized: "Erfolgreich")
+        case .partial: String(localized: "Teilweise")
         case .error: String(localized: "Fehler")
         case .cancelled: String(localized: "Abgebrochen")
         }
@@ -55,6 +74,7 @@ extension SyncLogOutcome {
     var symbol: String {
         switch self {
         case .ok: "checkmark.circle.fill"
+        case .partial: "exclamationmark.circle.fill"
         case .error: "exclamationmark.triangle.fill"
         case .cancelled: "minus.circle.fill"
         }
@@ -63,6 +83,7 @@ extension SyncLogOutcome {
     var tint: Color {
         switch self {
         case .ok: .green
+        case .partial: .orange
         case .error: .red
         case .cancelled: .secondary
         }
@@ -149,8 +170,8 @@ struct SyncLogView: View {
                 .pickerStyle(.menu)
             }
             ToolbarItem {
-                Toggle(isOn: $onlyErrors) { Label("Nur Fehler", systemImage: "exclamationmark.triangle") }
-                    .help("Nur fehlgeschlagene Abrufe zeigen")
+                Toggle(isOn: $onlyErrors) { Label("Nur Fehler und Teilweise", systemImage: "exclamationmark.triangle") }
+                    .help("Nur fehlgeschlagene und unvollständige Abrufe zeigen")
             }
             ToolbarItem {
                 Button { startExport() } label: { Label("Exportieren …", systemImage: "square.and.arrow.up") }

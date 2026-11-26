@@ -7,12 +7,16 @@ struct InspectorSectionCard: View {
     let booking: Booking
     /// In the edit mode a card that would not show for this booking stands in as a placeholder.
     var placeholderWhenEmpty = false
+    var scrollToNote: (() -> Void)?
 
     var body: some View {
         switch section {
         case .receipt: ReceiptCard(booking: booking)
-        case .note: NoteCard(booking: booking).id(booking.id)
-        case .tags: TagsCard(booking: booking).id(booking.id)
+        case .note: NoteCard(booking: booking, scrollToNote: scrollToNote)
+        case .tags: TagsCard(booking: booking)
+        case .refunds:
+            if booking.refundMarker != "none" { RefundLinksCard(booking: booking) }
+            else if placeholderWhenEmpty { InspectorPlaceholderCard(section: section, hint: "Mit einer Erstattung verknüpft") }
         case .salary:
             if booking.amountCents > 0 {
                 SalaryCard(booking: booking)
@@ -62,11 +66,11 @@ struct InspectorLayoutBar: View {
             .buttonStyle(.borderless)
             .help(editing ? Text("Bearbeitung der Seitenleiste beenden") : Text("Reihenfolge der Bereiche ändern und Bereiche ausblenden"))
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 8)
-        .padding(.bottom, 4)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 3)
         .frame(maxWidth: .infinity)
-        .background(Theme.canvas)
+        .background(Theme.systemBackground)
     }
 }
 
@@ -227,7 +231,7 @@ private struct InspectorPlaceholderCard: View {
                 .foregroundStyle(Theme.text)
             Text(hint).appFont(.caption).foregroundStyle(Theme.secondary)
         }
-        .card()
+        .flatSection()
     }
 }
 

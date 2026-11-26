@@ -7,8 +7,10 @@ struct SidebarView: View {
     /// The one sidebar dialog on screen (group dialogs live in `model.groupDialog`).
     @State private var dialog: SidebarDialog?
     @State private var budgetCategory: IDBox?
+    /// The account whose settings sheet is open.
     @State private var editedAccount: IDBox?
     @AppStorage(ViewLayout.budgetsKey) private var showBudgets = true
+    @AppStorage(SidebarDensity.defaultsKey) private var density: SidebarDensity = .defaultValue
     /// Where a drop would land: a thin line above or below one row.
     @State private var dropLine: DropLine?
     /// Collapsed state of the section headers (Kategorien lives in the model).
@@ -20,13 +22,18 @@ struct SidebarView: View {
     static let captionInsets = rowInsets
     private static let rowInsets = EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 6)
 
+    private func groupVerticalPadding(depth: UInt32 = 0) -> CGFloat {
+        if density.usesTighterAccountSpacing { return depth == 0 ? 3 : 2 }
+        return depth == 0 ? 6 : 4
+    }
+
     private func toggler(_ flag: Binding<Bool>) -> () -> Void {
         { withAnimation(Motion.animation(.easeInOut(duration: 0.15))) { flag.wrappedValue.toggle() } }
     }
 
     var body: some View {
         @Bindable var model = model
-        List(selection: $model.interactiveSidebarSelection) {
+        SidebarSelectionList(density: density) {
             // Pages across all accounts that are opened daily or as a starting point stay above the
             // account tree: with many accounts they must not end up below the visible part.
             // „Neue Umsätze“ (#352)
@@ -60,7 +67,7 @@ struct SidebarView: View {
             // the root of the account tree
             // no system badge here: it took the room of the name („All…“); „Neue Umsätze“ and the accounts show the count
             AllAccountsRow()
-                .modifier(AccountRowHeight())
+                .modifier(AccountRowHeight(density: density))
                 .listRowInsets(Self.rowInsets)
                 .tag(SidebarItem.allAccounts)
                 .contextMenu {
@@ -100,13 +107,22 @@ struct SidebarView: View {
             .badge(model.mandateCount)
             .tag(SidebarItem.directDebits)
             .listRowInsets(Self.rowInsets)
+            // „Abos“ (#1787): marked recurring expenses
+            HStack(spacing: DisclosureChevron.gap) {
+                SidebarLeadingSlot()
+                Image(systemName: "repeat.circle").foregroundStyle(Theme.secondary).frame(width: 20)
+                Text("Abos & Verträge").fontWeight(.medium).appDefaultFont()
+                Spacer()
+            }
+            .tag(SidebarItem.subscriptions)
+            .listRowInsets(Self.rowInsets)
             }
             SidebarCaption("Dokumente", open: !documentsCollapsed, toggle: toggler($documentsCollapsed))
             if !documentsCollapsed {
             HStack(spacing: DisclosureChevron.gap) {
                 SidebarLeadingSlot()
                 Image(systemName: "doc.on.doc").foregroundStyle(Theme.secondary).frame(width: 20)
-                Text("Belege & PostBox").fontWeight(.medium).appDefaultFont()
+                Text("Belege & Postbox").fontWeight(.medium).appDefaultFont()
                 Spacer()
             }
             .badge(model.unseenDocumentCount)
@@ -135,7 +151,7 @@ struct SidebarView: View {
                                 .foregroundStyle(model.missingSettings(for: c).isEmpty ? Theme.secondary : Theme.warning)
                         }
                         Spacer()
-                        Button(model.missingSettings(for: c).isEmpty ? "Abrufen" : "Einrichten") { model.requestSync(c) }
+                        Button(model.missingSettings(for: c).isEmpty ? "Abrufen" : "Einrichten") { model.requestFullSync(c) }
                             .controlSize(.small)
                             .disabled(model.bankingGate(for: c) != nil)
                             .help(model.bankingGate(for: c)?.message ?? "")
@@ -163,9 +179,11 @@ struct SidebarView: View {
                 Group {
                     HStack(spacing: DisclosureChevron.gap) {
                         SidebarLeadingSlot()
-                        Image(systemName: "questionmark.folder").foregroundStyle(Theme.warning).frame(width: 20)
-                        Text(model.uncategorizedLabel).appDefaultFont().sensitive(.labels)
-                        Spacer()
+                        HStack(spacing: CategoryRow.symbolGap) { // same gap as the rows below (#1534)
+                            Image(systemName: "questionmark.folder").foregroundStyle(Theme.warning).frame(width: 20)
+                            Text(model.uncategorizedLabel).appDefaultFont().sensitive(.labels)
+                            Spacer()
+                        }
                     }
                     .contextMenu {
                         Button("Umbenennen …", systemImage: "pencil") { model.groupDialog = .renameUncategorized }
@@ -180,15 +198,10 @@ struct SidebarView: View {
                 }
             }
         }
-        .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .refreshable { await model.refreshCurrentView() }
         .background(Theme.sidebar)
         .navigationTitle("GiroCrab")
-        #if os(macOS)
-        // Keep traffic lights / sidebar toggle clear of the first row.
-        .safeAreaInset(edge: .top, spacing: 0) { Color.clear.frame(height: 28) }
-        #endif
         .safeAreaInset(edge: .bottom) {
             HStack(spacing: 6) {
                 // Marketing screenshots (`--screenshot`) look like a real vault: no demo banner.
@@ -234,7 +247,7 @@ struct SidebarView: View {
         ) { d in
             switch d {
             case .archiveAccount(let a): Button("Archivieren") { model.setAccountArchived(a, true) }
-            case .deleteAccount(let a): Button("Löschen", role: .destructive) { model.deleteAccount(a.id) }
+            case .deleteAccount(let a): AccountDeletionPrompt.confirmButton { model.deleteAccount(a.id) }
             case .removeConnection(let id): Button("Entfernen", role: .destructive) { model.removeConnection(id) }
             case .deleteCategory(let c): Button("Löschen", role: .destructive) { model.deleteCategory(c.id) }
             }
@@ -243,15 +256,14 @@ struct SidebarView: View {
             switch d {
             case .archiveAccount:
                 Text("Das Konto wird nicht mehr abgerufen, von Regeln nicht mehr verändert und zählt nicht mehr zur Gesamtsumme. Buchungen, Kategorien, Belege und die Gruppe bleiben erhalten. Es lässt sich jederzeit reaktivieren.")
-            case .deleteAccount(let a):
-                Text("Das Konto wird samt \(a.transactionCount) Buchungen, Belegen und Depotpositionen unwiderruflich gelöscht – auch aus Auswertungen und Kategoriesummen. Ist es das letzte Konto seines Bankzugangs, wird auch der Bankzugang mit den gespeicherten Zugangsdaten entfernt.")
+            case .deleteAccount(let a): AccountDeletionPrompt.message(a)
             case .deleteCategory:
                 Text("Die Kategorie wird samt ihren Unterkategorien und Regeln unwiderruflich gelöscht. Zugeordnete Buchungen bleiben erhalten und stehen danach ohne Kategorie da.")
             case .removeConnection:
                 Text("Alle Konten dieses Bankzugangs werden samt Buchungen, Belegen und gespeicherten Zugangsdaten aus dem Tresor gelöscht. Das lässt sich nicht widerrufen.")
             }
         }
-        .capturableSheet(item: $editedAccount) { box in AccountEditSheet(accountID: box.id).environment(model) }
+        .capturableSheet(item: $editedAccount) { box in AccountSettingsView(accountID: box.id).environment(model) }
         .capturableSheet(item: $budgetCategory) { box in BudgetEditorSheet(categoryID: box.id).environment(model) }
     }
 
@@ -278,11 +290,11 @@ struct SidebarView: View {
             // restore its own saved collapse state for sidebar sections.
             SectionHeader(
                 name: group.name, sfSymbol: group.sfSymbol, balanceCents: group.balanceCents,
-                selected: model.sidebarSelection == .group(group.id),
+                item: .group(group.id),
                 isLoanGroup: !group.accounts.isEmpty && group.accounts.allSatisfy { $0.kind == .loan },
                 open: open, toggle: toggle
             )
-                .padding(.top, 10)
+                .padding(.vertical, groupVerticalPadding())
                 .listRowInsets(Self.rowInsets)
                 .groupHeaderTap(SidebarItem.group(group.id), toggle: toggle)
                 #if os(iOS)
@@ -292,6 +304,8 @@ struct SidebarView: View {
                 #endif
             ForEach(open ? listed : []) { account in
                 accountRow(account)
+                    // icon on the section header's icon axis, as under „Gruppen“ (#1534)
+                    .padding(.leading, DisclosureChevron.iconInset)
             }
             }
         }
@@ -311,12 +325,12 @@ struct SidebarView: View {
                 }
                 SectionHeader(
                     name: group.name, sfSymbol: group.sfSymbol, balanceCents: group.balanceCents,
-                    selected: model.sidebarSelection == .bank(group.id),
+                    item: .bank(group.id),
                     isLoanGroup: !group.accounts.isEmpty && group.accounts.allSatisfy { $0.kind == .loan },
                     nameRedaction: [],
                     open: open, toggle: toggle
                 )
-                .padding(.top, 10)
+                .padding(.vertical, groupVerticalPadding())
                 .listRowInsets(Self.rowInsets)
                 .groupHeaderTap(SidebarItem.bank(group.id), toggle: toggle)
                 #if os(iOS)
@@ -326,6 +340,8 @@ struct SidebarView: View {
                 #endif
                 ForEach(open ? listed : []) { account in
                     accountRow(account)
+                        // icon on the bank header's icon axis, as under „Gruppen“ (#1534)
+                        .padding(.leading, DisclosureChevron.iconInset)
                 }
             }
         }
@@ -340,7 +356,9 @@ struct SidebarView: View {
             let toggle = { withAnimation(Motion.animation(.easeInOut(duration: 0.15))) { model.toggleCollapsed(group) } }
             let indent = CGFloat(group.depth) * DisclosureChevron.indentStep
             UserGroupHeader(group: group, open: open, toggle: toggle)
-                .padding(.vertical, 3) // taller hit area for the drop zones
+                // The same room above and below, so the selection pill sits around the text, and a taller
+                // hit area for the drop zones (#1534)
+                .padding(.vertical, groupVerticalPadding(depth: group.depth))
                 // an account goes to the top of this group; a group above it
                 // (upper half) or into it as a subgroup (lower half)
                 .modifier(DropSlot(key: "g:" + group.uuid, inset: 0, line: $dropLine, edge: { half in
@@ -349,8 +367,7 @@ struct SidebarView: View {
                     return model.canDropGroup(dragged, on: group, into: into) ? (into ? .into : .above) : nil
                 }, perform: { items, edge in
                     handleDrop(items, into: group, row: nil, edge: edge)
-                }, freeLeading: 12))  // the expand/collapse arrow
-                .padding(.top, group.depth == 0 ? 10 : 4)
+                }, freeLeading: DisclosureChevron.width))  // the expand/collapse arrow
                 .padding(.leading, indent)
                 .listRowInsets(Self.rowInsets)
                 .groupHeaderTap(SidebarItem.userGroup(group.uuid), toggle: toggle)
@@ -444,7 +461,7 @@ struct SidebarView: View {
     /// `drop` sits inside the context menu (and the caller's drag), so its drop
     /// zones don't cover the row for clicks.
     private func accountRow(_ account: Account, drop: DropSlot? = nil) -> some View {
-        AccountRow(account: account, syncing: model.syncingConnectionID != nil && model.syncingConnectionID == account.connectionId)
+        AccountRow(account: account, syncing: model.isSyncing(account))
             .dropSlot(drop)
             .background {
                 if dialogAccountID == account.id {
@@ -467,36 +484,32 @@ struct SidebarView: View {
 
     @ViewBuilder
     private func accountMenu(_ account: Account) -> some View {
-        // same order as a group's menu: rename, look, place – then what only
-        // accounts have – then archive / delete
-        Button("Konto bearbeiten …", systemImage: "square.and.pencil") { editedAccount = IDBox(id: account.id) }
-        Button("Umbenennen …", systemImage: "pencil") { model.groupDialog = .renameAccount(account) }
-        Button("Symbol & Farbe …", systemImage: "paintpalette") { model.iconColorTarget = .account(account.id) }
+        // name, symbol & colour, Kontoart, Kontoinhaber, Startsaldo and the rest of the
+        // account's data live in the settings window; the menu keeps the actions
+        Button("Einstellungen …", systemImage: "gearshape") { editedAccount = IDBox(id: account.id) }
         CategoryChipToggle(accountID: account.id)
-        // an offline account is always cash (#679)
-        if !model.isOffline(account.id) {
-            Menu("Kontoart ändern …", systemImage: "list.bullet.rectangle") {
-                ForEach(AccountKind.importChoices, id: \.self) { k in
-                    Button { model.setAccountKind(account.id, to: k) } label: {
-                        Text(verbatim: k == account.kind ? "✓ \(k.label)" : k.label)
-                    }
-                }
-            }
-        }
-        Button("Kontoinhaber …", systemImage: "person.crop.circle") { model.groupDialog = .editOwner(account) }
         AccountGroupMenu(account: account)
+        // the account's own switch for the overall money totals (#337); the
+        // group (or a group that group is in) and archiving can still keep it
+        // out — the row's tooltip explains that precedence
+        Toggle(isOn: Binding(
+            get: { account.includeInTotal },
+            set: { model.setAccountIncludeInTotal(account, $0) }
+        )) {
+            Label("In Gesamtsummen zählen", systemImage: "plus.forwardslash.minus")
+        }
         Divider()
         Button("Alle Buchungen als gelesen markieren", systemImage: "checkmark.circle") { model.markAllChecked(accountIDs: [account.id]) }
         ManualLoanAccountMenu(model: model, account: account)
-        OpeningBalanceMenuItem(model: model, account: account)
         OfflineAccountMenuItems(model: model, account: account)
         if !account.isArchived, let cid = account.connectionId, let conn = model.connections.first(where: { $0.id == cid }) {
-            Button("\(account.name) abrufen", systemImage: "arrow.triangle.2.circlepath") { model.requestSync(conn) }
-                .disabled(model.bankingGate(for: conn) != nil)
+            Button("\(account.name) abrufen", systemImage: "arrow.triangle.2.circlepath") { model.requestSyncAccount(account) }
+                .disabled(model.bankingGate(for: conn) != nil || model.syncingConnectionID != nil)
         }
         AccountCopyMenu(account: account)
         Button("Belege anzeigen", systemImage: "doc.text.magnifyingglass") {
             model.documentsAccountFilter = account.id
+            model.documentsConnectionFilter = nil
             model.interactiveSidebarSelection = .documents
         }
         Divider()
@@ -532,9 +545,16 @@ struct SidebarView: View {
                 }
                 .padding(.leading, indent)
                 .listRowInsets(Self.rowInsets)
+                #if os(macOS)
+                // a category dragged here goes above this row, or into it (lower half)
+                .modifier(categoryDropSlot(node, indent: indent, takesBookings: false, chevron: true))
+                #endif
                 .tag(SidebarItem.category(node.id))
                 .contextMenu { categoryMenu(node.category) }
                 .modifier(CategoryIconColorPopover(id: node.id))
+                #if os(macOS)
+                .draggable(GroupDrag.category(node.id))
+                #endif
                 if open {
                     categoryRows(kids, depth: depth + 1)
                 }
@@ -546,17 +566,40 @@ struct SidebarView: View {
                 .padding(.leading, indent)
                 .listRowInsets(Self.rowInsets)
                 #if os(macOS)
-                // only leaves take dragged bookings, as only leaves are assigned
-                .modifier(DropSlot(key: "c:\(node.id)", inset: 0, line: $dropLine, edge: { _ in .into }, perform: { items, _ in
-                    model.dropBookings(items, onCategory: node.id)
-                }, takesBookings: true))
+                // only leaves take dragged bookings, as only leaves are assigned;
+                // a dragged category goes above or below, or into a main category (#977)
+                .modifier(categoryDropSlot(node, indent: indent, takesBookings: true))
                 #endif
                 .tag(SidebarItem.category(node.id))
                 .contextMenu { categoryMenu(node.category) }
                 .modifier(CategoryIconColorPopover(id: node.id))
+                #if os(macOS)
+                .draggable(GroupDrag.category(node.id))
+                #endif
             }
         })
     }
+
+    #if os(macOS)
+    /// Drop zones of a category row (#977): a category goes above the row (upper
+    /// half), below it or – on a row with sub-categories or a main category – into
+    /// it as its last sub-category (lower half). Bookings (`takesBookings`, leaves
+    /// only) are assigned to the row's category. The slot sits outside the row's
+    /// `indent` padding, so on a row with a `chevron` the zones leave the indent
+    /// and the arrow free, else it takes no clicks below the first level (#1137).
+    private func categoryDropSlot(_ node: CategoryNode, indent: CGFloat, takesBookings: Bool, chevron: Bool = false) -> DropSlot {
+        DropSlot(key: "c:\(node.id)", inset: indent, line: $dropLine, edge: { half in
+            guard let dragged = GroupDrag.draggedCategory else { return .into }
+            guard model.canDropCategory(dragged, on: node.id) else { return nil }
+            return half == .below && model.categoryTakesDropInto(node.id) ? .into : half
+        }, perform: { items, edge in
+            if items.contains(where: { GroupDrag.categoryID($0) != nil }) {
+                return model.dropCategory(items, onto: node.id, place: edge == .into ? .into : edge == .below ? .after : .before)
+            }
+            return takesBookings && model.dropBookings(items, onCategory: node.id)
+        }, freeLeading: chevron ? indent + DisclosureChevron.width : 0, takesBookings: takesBookings, takesCategories: true)
+    }
+    #endif
 
     @ViewBuilder
     private func categoryMenu(_ category: GiroCrabCore.Category) -> some View {
@@ -581,6 +624,10 @@ struct SidebarView: View {
                 }
             }
         }
+        Button("Nach oben", systemImage: "arrow.up") { model.shiftCategory(category.id, by: -1) }
+            .disabled(!model.canShiftCategory(category.id, by: -1))
+        Button("Nach unten", systemImage: "arrow.down") { model.shiftCategory(category.id, by: 1) }
+            .disabled(!model.canShiftCategory(category.id, by: 1))
         Button("Duplizieren", systemImage: "plus.square.on.square") { model.duplicateCategory(category.id) }
         Divider()
         Button("Neue Unterkategorie …", systemImage: "plus") { model.newCategoryRequest = NewCategoryRequest(parent: category.id) }
@@ -592,12 +639,57 @@ struct SidebarView: View {
     }
 }
 
-/// Gives single-line rows ("Alle Konten") the height of a two-line account row,
-/// text centred vertically in the selection pill (#658).
+/// Sets the minimum height of the "Alle Konten" row for the chosen density,
+/// keeping its text centred in the selection pill (#658).
 private struct AccountRowHeight: ViewModifier {
     @Environment(\.textScale) private var scale
+    let density: SidebarDensity
+
     func body(content: Content) -> some View {
-        content.frame(minHeight: 34 * scale, alignment: .center)
+        let minHeight: CGFloat = density.usesTighterAccountSpacing ? 26 : 34
+        content.frame(minHeight: minHeight * scale)
+    }
+}
+
+/// The sidebar `List` and its selection. Reading the selection binding made the reading view
+/// depend on `sidebarSelection`: in `SidebarView` every click re-ran its whole body and rebuilt
+/// the outline. Here only this wrapper re-runs; its rows are the value `SidebarView` built last,
+/// so they stay as they are and only the selection highlight moves.
+private struct SidebarSelectionList<Content: View>: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.textScale) private var textScale
+    let density: SidebarDensity
+    let content: Content
+
+    init(density: SidebarDensity, @ViewBuilder content: () -> Content) {
+        self.density = density
+        self.content = content()
+    }
+
+    var body: some View {
+        #if os(macOS)
+        let list = List(selection: Binding(get: { model.sidebarSelection }, set: { model.selectFromSidebar($0) })) {
+            // The first row starts at the height of the middle column's heading (#1544), e.g. „Belege & Postbox“:
+            // just below the toolbar, which also keeps the traffic lights / sidebar toggle clear.
+            // The list's own top margin does that; an extra row (the earlier 28 pt one) could not be
+            // made smaller, as the list gives every row a minimum height. A content margin, not a
+            // safe-area padding: the padding moved the scroll view itself 14 pt down, so the line
+            // AppKit shows once the list is scrolled sat below the toolbar line, with a band above it.
+            content.listRowSeparator(.hidden)
+        }
+        .contentMargins(.top, 14, for: .scrollContent)
+        if density.usesTighterAccountSpacing {
+            // The macOS sidebar style has its own minimum height.
+            list.listStyle(.inset)
+                .environment(\.defaultMinListRowHeight, 27 * textScale)
+        } else {
+            list.listStyle(.sidebar)
+        }
+        #else
+        @Bindable var model = model
+        List(selection: $model.interactiveSidebarSelection) { content }
+            .listStyle(.sidebar)
+        #endif
     }
 }
 
@@ -624,17 +716,23 @@ struct DisclosureChevron: View {
 }
 
 struct SectionHeader: View {
-    /// Selected header: hierarchical styles so macOS can draw them light on the
-    /// accent-coloured selection (fixed theme colours stay dark there).
+    @Environment(AppModel.self) private var model
     let name: String
     let sfSymbol: String
     let balanceCents: Int64
-    var selected: Bool = false
+    /// The header's own sidebar item. Its selection flag (`sidebarRowSelection(for:)`) is read
+    /// here, so a selection change re-runs only the old and the new header, not
+    /// `SidebarView.body` (the whole outline).
+    let item: SidebarItem
     var isLoanGroup: Bool = false
     /// Bug report screenshot (#301): category-like group names hide on request, bank names stay visible.
     var nameRedaction: ReportRedaction = .labels
     var open: Bool = true
     var toggle: () -> Void = {}
+
+    /// Selected header: hierarchical styles so macOS can draw them light on the
+    /// accent-coloured selection (fixed theme colours stay dark there).
+    private var selected: Bool { model.sidebarRowSelection(for: item).isSelected }
 
     var body: some View {
         HStack(spacing: 5) {
@@ -674,8 +772,10 @@ struct AccountRow: View {
     /// Selected row: the amount uses the hierarchical `.primary` style, which
     /// macOS turns white on the accent-coloured selection (fixed theme colours
     /// stay dark there). `backgroundProminence` is not set in a macOS sidebar.
-    private var onSelection: Bool { model.sidebarSelection == .account(account.id) }
+    private var onSelection: Bool { model.sidebarRowSelection(for: .account(account.id)).isSelected }
     @Environment(\.reportRedaction) private var redaction
+    @Environment(\.textScale) private var textScale
+    @AppStorage(SidebarDensity.defaultsKey) private var density: SidebarDensity = .defaultValue
     let account: Account
     var syncing: Bool = false
 
@@ -684,94 +784,170 @@ struct AccountRow: View {
         return max(0, min(1, 1 - Double(-account.balanceCents) / Double(p)))
     }
 
+    private var signetSize: CGFloat { density == .compact ? 20 : 24 }
+    private var signetGap: CGFloat { density == .compact ? DisclosureChevron.gap : 9 }
+    private var detailIndent: CGFloat { signetSize * textScale + signetGap }
+
     var body: some View {
-        HStack(spacing: DisclosureChevron.gap) {
-            // tinted like the account's marker in the booking list
-            AccountSignet(account: account, size: 20, color: model.accountColor(account.id), onSelection: onSelection)
-                .overlay(alignment: .topTrailing) {
-                    // unread count pinned to the icon's corner, so the subtitle stays untruncated
-                    if let text = NewCountBadge.label(for: Int(account.newCount)) {
-                        Text(verbatim: text)
-                            .appFont(.caption2, weight: .bold, monospacedDigit: true)
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 4)
-                            .frame(minWidth: 14, minHeight: 14)
-                            .background(Capsule().fill(Theme.accent))
-                            .overlay(Capsule().strokeBorder(.background, lineWidth: 1.5))
-                            .fixedSize()
-                            .offset(x: 5, y: -4)
-                            .accessibilityLabel(Text("\(Int(account.newCount)) neue Buchungen"))
-                    }
-                }
-            VStack(alignment: .leading, spacing: 1) {
-                // row 1: the whole width for the name
-                HStack(spacing: 4) {
-                    // the owner takes no room in the title line: tooltip only
-                    Text(account.name).appFont(.callout, weight: .medium).lineLimit(1).sensitive()
-                        .help(redaction.masking(account.owner))
-                    if account.accessRevoked {
-                        Image(systemName: "lock.slash")
-                            .appFont(.caption2)
-                            .foregroundStyle(Theme.warning)
-                            .help("Zugriff entzogen: Die Bank liefert dieses Konto nicht mehr. Buchungen bleiben erhalten.")
-                            .accessibilityLabel(Text("Zugriff entzogen"))
-                    }
-                    Spacer(minLength: 4)
-                    if syncing {
-                        ProgressView().controlSize(.mini)
-                            .accessibilityLabel(Text("Wird synchronisiert"))
-                    }
-                }
-                // row 2: bank / loan progress left, balance right
-                HStack(spacing: 6) {
-                    if let repaid {
-                        ProgressView(value: repaid)
-                            .progressViewStyle(.linear)
-                            .tint(Theme.loan.opacity(0.7))
-                            .controlSize(.mini)
-                            .frame(maxWidth: 44)
-                            .sensitive(.amounts)
-                            .help(redaction.masking("\(repaid.formatted(.percent.precision(.fractionLength(0)))) getilgt", .amounts))
-                        Text("\(repaid.formatted(.percent.precision(.fractionLength(0)))) getilgt")
-                            .sensitive(.amounts)
-                            .appFont(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else if let date = account.archivedDate {
-                        Text("Archiviert \(date.formatted(.dateTime.day(.twoDigits).month(.twoDigits).year(.twoDigits)))")
-                            .appFont(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                            .help("Archiviert – wird nicht mehr abgerufen")
-                    } else {
-                        Text(searchAwareSubtitle)
-                            .sensitive(searchAwareSubtitle == account.bankName ? [] : .personal) // owner / IBAN hits
-                            .appFont(.caption2, design: ibanSubtitle ? .monospaced : .default)
-                            .foregroundStyle(.secondary)
+        let line2 = secondLine
+        VStack(alignment: .leading, spacing: density.usesTighterAccountSpacing ? 0 : 1) {
+            HStack(spacing: signetGap) {
+                AccountSignet(account: account, size: signetSize, color: model.accountColor(account.id), onSelection: onSelection)
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(account.name)
+                            .appFont(density == .compact ? .callout : .body, weight: .medium)
                             .lineLimit(1)
+                            .sensitive()
+                            .help(redaction.masking(account.owner))
+                        if density == .spacious && showsInitials(line2) {
+                            Text(verbatim: SidebarDensity.initials(of: account.owner))
+                                .appFont(.caption2, weight: .semibold)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4)
+                                .background(.secondary.opacity(0.15), in: Capsule())
+                                .fixedSize()
+                                .sensitive()
+                        }
+                        revokedIcon
+                        NewCountBadge(count: Int(account.newCount), onSelection: onSelection)
+                            .layoutPriority(1)
+                        if syncing {
+                            ProgressView().controlSize(.mini)
+                                .accessibilityLabel(Text("Wird synchronisiert"))
+                        }
+                        exclusionIndicator
                     }
                     Spacer(minLength: 4)
-                    // archived accounts show no balance (#667)
+                    // Archived accounts show no balance (#667).
                     if !account.isArchived {
-                        Text(Money.format(account.balanceCents, currency: account.currency))
-                            .sensitive(.amounts)
-                            .appFont(.subheadline, monospacedDigit: true)
-                            .fixedSize() // the subtitle truncates, never the balance (#343)
-                            .foregroundStyle(onSelection ? AnyShapeStyle(.primary) : AnyShapeStyle(account.kind == .loan ? Theme.loan : (account.balanceCents < 0 ? Theme.negative : Theme.text)))
+                        balance(density == .compact ? .subheadline : .callout)
+                            .layoutPriority(1)
                     }
                 }
             }
+            detailLine(line2)
         }
-        .padding(.vertical, 1)
-        .opacity(account.isArchived ? 0.55 : 1)
-        // one element per account: unread count, name, bank / loan progress, balance
+        .padding(.vertical, density.usesTighterAccountSpacing ? 0 : 1)
+        .opacity(account.isArchived ? 0.55 : (account.showsTotalExclusionIndicator ? 0.6 : 1))
+        // reachable explanation (#337): why the account stays out of the totals
+        // although its own switch is on — the group that wins, or archiving
+        .helpIfPresent(model.totalExclusionReason(account, redaction: redaction))
         .accessibilityElement(children: .combine)
     }
 
+    private enum SecondLine {
+        case archived(Date)
+        case loan(Double)
+        case subtitle(String)
+    }
+
+    private var secondLine: SecondLine {
+        if let repaid { return .loan(repaid) }
+        if let date = account.archivedDate { return .archived(date) }
+        return .subtitle(searchAwareSubtitle)
+    }
+
+    @ViewBuilder private func detailLine(_ line: SecondLine) -> some View {
+        switch line {
+        case .archived(let date):
+            archivedLabel(date)
+                .padding(.leading, detailIndent)
+        case .loan(let repaid):
+            HStack(spacing: 6) {
+                ProgressView(value: repaid)
+                    .progressViewStyle(.linear)
+                    .tint(Theme.loan.opacity(0.7))
+                    .controlSize(.mini)
+                    .frame(maxWidth: density == .compact ? 44 : 110)
+                    .sensitive(.amounts)
+                    .help(redaction.masking(repaidText(repaid), .amounts))
+                if density == .spacious {
+                    Spacer(minLength: 4)
+                }
+                if density == .compact || !account.isArchived {
+                    Text(repaidText(repaid))
+                        .sensitive(.amounts)
+                        .appFont(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(density == .compact ? 2 : 1)
+                        .fixedSize(horizontal: density == .spacious, vertical: true)
+                }
+            }
+            .padding(.leading, detailIndent)
+        case .subtitle(let text):
+            if !text.isEmpty {
+                subtitle(text)
+                    .padding(.leading, detailIndent)
+            }
+        }
+    }
+
+    private func repaidText(_ repaid: Double) -> String {
+        String(localized: "\(repaid.formatted(.percent.precision(.fractionLength(0)))) getilgt")
+    }
+
+    @ViewBuilder private var revokedIcon: some View {
+        if account.accessRevoked {
+            Image(systemName: "lock.slash")
+                .appFont(.caption2)
+                .foregroundStyle(Theme.warning)
+                .help("Zugriff entzogen: Die Bank liefert dieses Konto nicht mehr. Buchungen bleiben erhalten.")
+                .accessibilityLabel(Text("Zugriff entzogen"))
+        }
+    }
+
+    /// Outside the overall money totals (#337): like a group's eye.slash —
+    /// the effective flag (own switch, group, archiving).
+    @ViewBuilder private var exclusionIndicator: some View {
+        if account.showsTotalExclusionIndicator {
+            AccountTotalExclusionIndicator(
+                help: model.totalExclusionIconHelp(account, redaction: redaction))
+        }
+    }
+
+    private func archivedLabel(_ date: Date) -> some View {
+        Text("Archiviert \(date.formatted(.dateTime.day(.twoDigits).month(.twoDigits).year(.twoDigits)))")
+            .appFont(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            .help("Archiviert – wird nicht mehr abgerufen")
+    }
+
+    /// Bank, note or search hit below the name. Only the plain bank name stays
+    /// visible in reports: owner / IBAN hits and the user's own bank label are personal.
+    private func subtitle(_ text: String) -> some View {
+        Text(text)
+            .sensitive(text == account.bankName && account.bankLabel == nil ? [] : .personal)
+            .appFont(.caption2, design: model.isSidebarAccountSearching && text == formatIBAN(account.iban) ? .monospaced : .default)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+    }
+
+    private func balance(_ style: Font.TextStyle) -> some View {
+        Text(Money.format(account.balanceCents, currency: account.currency))
+            .sensitive(.amounts)
+            .appFont(style, monospacedDigit: true)
+            .fixedSize() // the name / subtitle truncates, never the balance (#343)
+            .foregroundStyle(onSelection ? AnyShapeStyle(.primary) : AnyShapeStyle(account.kind == .loan ? Theme.loan : (account.balanceCents < 0 ? Theme.negative : Theme.text)))
+    }
+
+    /// The initials chip, unless the subtitle the row shows already names the owner
+    /// (accounts of the same name told apart by owner, or an owner hit while searching).
+    /// Archived accounts and loans show a date or the repayment bar there, so they keep it.
+    private func showsInitials(_ line2: SecondLine) -> Bool {
+        guard !SidebarDensity.initials(of: account.owner).isEmpty else { return false }
+        guard case .subtitle(let text) = line2 else { return true }
+        if text == account.owner { return false } // owner hit while searching
+        // same-named accounts told apart by owner: the distinction is the owner itself
+        return !(model.accountDistinction(account) == account.owner && text.contains(account.owner))
+    }
+
     /// While searching, prefer Kontoinhaber or IBAN so the hit is obvious.
-    /// Bank name and the account note (#679), e.g. "Bargeld" without a bank shows just its note.
+    /// Bank name (or the user's label for it, #1467) and the account note (#679), e.g. "Bargeld" without a bank shows just its note.
     private var baseSubtitle: String {
         let note = model.accountNote(for: account.id).replacingOccurrences(of: "\n", with: " ")
         // the owner tells accounts of the same name apart
         let owner = model.accountDistinction(account)
-        return [account.bankName, owner, note].filter { !$0.isEmpty }.joined(separator: " · ")
+        return [account.sidebarBankName, owner, note].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     private var searchAwareSubtitle: String {
@@ -790,28 +966,41 @@ struct AccountRow: View {
         }
         return baseSubtitle
     }
-
-    private var ibanSubtitle: Bool {
-        model.isSidebarAccountSearching && searchAwareSubtitle == formatIBAN(account.iban)
-    }
 }
 
 struct CategoryRow: View {
+    /// Gap between a category's symbol and its name.
+    static let symbolGap: CGFloat = 8
+    @Environment(AppModel.self) private var model
     let category: GiroCrabCore.Category
 
     var body: some View {
-        HStack(spacing: 8) {
+        // "Zusätzlich" (#1049): what the category holds in currencies other than EUR, under its total.
+        let other = (model.categoryOtherTotals[category.id] ?? []).map { Money.format($0.cents, currency: $0.currency) }.joined(separator: " · ")
+        HStack(spacing: Self.symbolGap) {
             Image(systemName: category.sfSymbol)
                 .foregroundStyle(Color.readable(hex: category.colorHex).opacity(0.85))
                 .frame(width: 20)
             Text(category.name).lineLimit(1).appDefaultFont().sensitive(.labels)
             Spacer(minLength: 4)
-            if category.totalCents != 0 {
-                Text(Money.format(category.totalCents))
-                    .sensitive(.amounts)
-                    .appFont(.caption, monospacedDigit: true)
-                    .fixedSize()
-                    .foregroundStyle(.secondary) // follows selection, Dark Mode, Increase Contrast
+            if category.totalCents != 0 || !other.isEmpty {
+                VStack(alignment: .trailing, spacing: 1) {
+                    if category.totalCents != 0 {
+                        Text(Money.format(category.totalCents, currency: model.categorySumCurrency))
+                            .sensitive(.amounts)
+                            .appFont(.caption, monospacedDigit: true)
+                            .fixedSize()
+                            .foregroundStyle(.secondary) // follows selection, Dark Mode, Increase Contrast
+                    }
+                    if !other.isEmpty {
+                        Text("Zusätzlich: \(other)")
+                            .sensitive(.amounts)
+                            .appFont(.caption2, monospacedDigit: true)
+                            .fixedSize()
+                            .foregroundStyle(.secondary)
+                            .help("Weitere Währungen werden nicht umgerechnet und nicht in die Summe einbezogen.")
+                    }
+                }
             }
         }
     }
@@ -864,6 +1053,17 @@ private struct DropSlot: ViewModifier {
     /// Mark only booking drags (category rows), else only account and group
     /// drags. Gates just the mark: `perform` ignores foreign payloads itself.
     var takesBookings = false
+    /// Also mark a category drag (#977; category rows).
+    var takesCategories = false
+
+    /// Whether the drag in progress is one this row marks: bookings only on
+    /// `takesBookings` rows, categories only on `takesCategories` rows, else only
+    /// account and group drags.
+    private var acceptsDrag: Bool {
+        if BookingDrag.isDragged { return takesBookings }
+        if GroupDrag.draggedCategory != nil { return takesCategories }
+        return !takesBookings && !takesCategories
+    }
 
     /// Zones a drag is over right now. Not state: changing it must not redraw.
     @MainActor private static var hovered: Set<String> = []
@@ -919,7 +1119,7 @@ private struct DropSlot: ViewModifier {
         // zone: write only real changes and clear a tick later, unless the
         // zone came back meanwhile, so the mark doesn't flicker.
         let zone = key + (half == .above ? "↑" : "↓")
-        if targeted, let edge = edge(half), BookingDrag.isDragged == takesBookings {
+        if targeted, let edge = edge(half), acceptsDrag {
             Self.hovered.insert(zone)
             let next = DropLine(key: edge == .into ? intoKey ?? key : key, edge: edge, zone: zone)
             if line != next { line = next }
@@ -950,7 +1150,7 @@ private enum SidebarDialog {
     var title: Text {
         switch self {
         case .archiveAccount(let a): Text("Konto „\(a.name)“ archivieren?")
-        case .deleteAccount(let a): Text("Konto „\(a.name)“ löschen?")
+        case .deleteAccount(let a): AccountDeletionPrompt.title(a)
         case .removeConnection: Text("Bankzugang entfernen?")
         case .deleteCategory(let c): Text("Kategorie „\(c.name)“ löschen?")
         }

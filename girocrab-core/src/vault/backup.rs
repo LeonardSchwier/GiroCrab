@@ -7,27 +7,78 @@
 use std::time::Duration;
 
 use rusqlite::backup::Backup;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
 use super::Vault;
 use crate::error::{CoreError, CoreResult};
 use crate::i18n::tr;
+use crate::schema::has_table;
 
 /// Shortest password `write_backup` accepts (the macOS dialog requires the same).
 pub(crate) const MIN_BACKUP_PASSWORD_CHARS: usize = 8;
 
 /// Settings that belong to this device, not to the data: where logins are sent,
-/// stored PINs and the unattended-fetch interval. A restore keeps this device's
-/// values and drops the backup's, so a backup file can never repoint a bank
-/// endpoint that later receives a PIN.
+/// stored PINs, the unattended-fetch interval and the local API share (#136). A
+/// restore keeps this device's values and drops the backup's, so a backup file can
+/// never repoint a bank endpoint that later receives a PIN, nor bring back a local
+/// API key that was revoked or replaced after the backup was written.
 const DEVICE_SETTINGS_WHERE: &str = "key LIKE 'fints.url.%' OR key LIKE 'fints.tan_medium.%' \
-     OR key LIKE 'pin.%' OR key = 'sync.psd2_auto_hours'";
+     OR key LIKE 'pin.%' OR key = 'sync.psd2_auto_hours' OR key = 'local_api.scope'";
+
+#[cfg(test)]
+#[test]
+fn restore_keeps_the_devices_local_api_key() {
+    let dir = std::env::temp_dir().join(format!("gc-restore-api-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let v = Vault::open(dir.join("v.girocrab").display().to_string(), vec![7; 32]).unwrap();
+    v.create_local_api_token().unwrap();
+    let revoked = v.local_api_scope().unwrap().token_sha256;
+    let backup = dir.join("old.backup").display().to_string();
+    v.write_backup(backup.clone(), "password-123".into())
+        .unwrap();
+    v.create_local_api_token().unwrap();
+    let live = v.local_api_scope().unwrap().token_sha256;
+    assert_ne!(revoked, live);
+    v.restore_backup(backup, "password-123".into()).unwrap();
+    let after = v.local_api_scope().unwrap().token_sha256;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        after, live,
+        "an older backup must not bring back a revoked key"
+    );
+}
 
 fn not_a_backup() -> CoreError {
-    CoreError::InvalidInput {
-        message: tr("Falsches Passwort oder keine GiroCrab-Sicherung.").into(),
+    CoreError::invalid(tr("Falsches Passwort oder keine GiroCrab-Sicherung."))
+}
+
+/// The password opened the file, but it is another app's database (which may
+/// also have `accounts` and `transactions` tables).
+fn other_apps_database() -> CoreError {
+    CoreError::invalid(tr(
+        "Diese Datei ist keine GiroCrab-Sicherung, sondern die Datenbank einer anderen App. Zum Übernehmen bitte als Art des Imports diese App wählen.",
+    ))
+}
+
+/// Drops every trigger and view in `schema`. The app defines neither, so any
+/// found came from outside its own code paths (for example a crafted backup) and
+/// could rewrite rows on later writes, such as repointing a FinTS endpoint
+/// after the device-settings carve-out ran.
+pub(crate) fn drop_triggers_and_views(conn: &Connection, schema: &str) -> CoreResult<()> {
+    let objects: Vec<(String, String)> = conn
+        .prepare(&format!(
+            "SELECT type, name FROM {schema}.sqlite_master WHERE type IN ('trigger', 'view')"
+        ))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (kind, name) in objects {
+        let name = name.replace('"', "\"\"");
+        let kind = if kind == "view" { "VIEW" } else { "TRIGGER" };
+        conn.execute_batch(&format!("DROP {kind} IF EXISTS {schema}.\"{name}\""))?;
     }
+    Ok(())
 }
 
 fn remove_with_sidecars(path: &str) {
@@ -43,17 +94,16 @@ impl Vault {
     pub fn write_backup(&self, dest_path: String, password: String) -> CoreResult<()> {
         let password = Zeroizing::new(password);
         if password.is_empty() {
-            return Err(CoreError::InvalidInput {
-                message: tr("Bitte ein Passwort für die Sicherung angeben.").into(),
-            });
+            return Err(CoreError::invalid(tr(
+                "Bitte ein Passwort für die Sicherung angeben.",
+            )));
         }
         // The backup is only as strong as this password (PBKDF2 over a guessable
         // string is cheap to brute-force), so every front end gets the same floor.
         if password.chars().count() < MIN_BACKUP_PASSWORD_CHARS {
-            return Err(CoreError::InvalidInput {
-                message: tr("Das Passwort für die Sicherung muss mindestens 8 Zeichen lang sein.")
-                    .into(),
-            });
+            return Err(CoreError::invalid(tr(
+                "Das Passwort für die Sicherung muss mindestens 8 Zeichen lang sein.",
+            )));
         }
         self.export_to(&dest_path, &password)
     }
@@ -157,22 +207,18 @@ impl Vault {
     /// open vault (SQLite backup API, same key on both sides).
     fn restore_via(&self, staging: &str, backup_path: &str, password: &str) -> CoreResult<()> {
         let tmp = Connection::open(staging)?;
-        Self::apply_key(&tmp, &self.kept_key()?)?;
+        Self::apply_key(&tmp, &self.kept_key())?;
         // wrong password or no database: the attach or the first read fails
         tmp.execute(
             "ATTACH DATABASE ?1 AS bak KEY ?2",
             params![backup_path, password],
         )
         .map_err(|_| not_a_backup())?;
-        let tables: Vec<String> = tmp
-            .prepare("SELECT name FROM bak.sqlite_master WHERE type = 'table'")
-            .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
-            .map_err(|_| not_a_backup())?;
-        if !["accounts", "transactions"]
-            .iter()
-            .all(|t| tables.iter().any(|n| n == t))
-        {
-            return Err(not_a_backup());
+        // every GiroCrab vault since the first release has these tables
+        for table in ["accounts", "transactions", "settings", "bank_connections"] {
+            if !has_table(&tmp, "bak", table).map_err(|_| not_a_backup())? {
+                return Err(other_apps_database());
+            }
         }
         let version: i64 = tmp.query_row("PRAGMA bak.user_version", [], |r| r.get(0))?;
         if version > super::SCHEMA_VERSION {
@@ -182,6 +228,8 @@ impl Vault {
             });
         }
         tmp.query_row("SELECT sqlcipher_export('main', 'bak')", [], |_| Ok(()))?;
+        // The export copies the backup's whole schema; only data may come along.
+        drop_triggers_and_views(&tmp, "main")?;
         // Device-owned settings stay as they are on this device.
         let device: Vec<(String, String, i64)> = {
             let live = self.db()?;
@@ -207,9 +255,53 @@ impl Vault {
         tmp.execute_batch("DETACH DATABASE bak")?;
 
         let mut main = self.db()?;
-        Backup::new(&tmp, &mut main)?.run_to_completion(256, Duration::ZERO, None)?;
+        let copied = Backup::new(&tmp, &mut main)?.run_to_completion(256, Duration::ZERO, None);
+        // the pages changed without moving the change count, also when the copy broke off
+        self.data_replaced();
+        copied?;
         Self::migrate(&mut main)?;
+        Self::restored_life_wins(&main)?;
         Self::repair(&main);
+        Ok(())
+    }
+
+    /// A restore says "this state counts" (#1090): the backup's live bank
+    /// connections and accounts are created again now, so the sync merge
+    /// (`join_life`) keeps them against a deletion another device made after
+    /// the backup and brings them back there too. Their bookings deleted with
+    /// them follow the account (cascade tombstones). Deletions made after the
+    /// restore are newer and win as usual. Individually deleted bookings,
+    /// categories, rules and tags have no creation stamp and stay deleted.
+    ///
+    /// Accounts the backup holds deleted under a live connection must stay
+    /// deleted on the next fetch (`fetch_keeps_account_deleted`: deleted after
+    /// the connection was created), so they and the bookings deleted with them
+    /// move to just after the renewed creation.
+    fn restored_life_wins(conn: &Connection) -> CoreResult<()> {
+        let now = crate::dates::now_ms();
+        let later = now + 1;
+        let deleted_under_live = "SELECT id, deleted_ms FROM accounts
+             WHERE deleted_ms IS NOT NULL AND deleted_ms < ?1
+               AND connection_id IN (SELECT id FROM bank_connections WHERE deleted_ms IS NULL AND IFNULL(created_ms, 0) < accounts.deleted_ms)";
+        // the cascade first: it is found by the account's old deletion stamp
+        conn.execute(
+            &format!(
+                "UPDATE transactions SET deleted_ms = ?1 WHERE (account_id, deleted_ms) IN ({deleted_under_live})"
+            ),
+            [later],
+        )?;
+        conn.execute(
+            &format!("UPDATE accounts SET deleted_ms = ?1 WHERE id IN (SELECT id FROM ({deleted_under_live}))"),
+            [later],
+        )?;
+        conn.execute(
+            "UPDATE bank_connections SET created_ms = ?1 WHERE deleted_ms IS NULL AND created_ms < ?1",
+            [now],
+        )?;
+        conn.execute(
+            "UPDATE accounts SET created_ms = ?1 WHERE deleted_ms IS NULL AND created_ms < ?1",
+            [now],
+        )?;
         Ok(())
     }
 }

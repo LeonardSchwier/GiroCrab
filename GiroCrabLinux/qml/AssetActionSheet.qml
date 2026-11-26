@@ -122,7 +122,7 @@ Sheet {
             spacing: 18
 
             FormSection {
-                FormRow { label: qsTr("Sachwert"); value: sheet.item ? sheet.item.setup.name : "" }
+                FormRow { label: qsTr("Sachwert"); value: sheet.item ? sheet.item.setup.name : ""; personal: true }
                 FormRow {
                     visible: sheet.kind === "sell"
                     label: qsTr("Verkauft am")
@@ -132,13 +132,15 @@ Sheet {
                     visible: sheet.kind === "sell"
                     label: qsTr("Anzahl")
                     TextField { Layout.preferredWidth: 200; placeholderText: NumberText.format(sheet.entryHeld)
-                                text: sheet.entryText; onTextEdited: sheet.entryText = text }
+                                text: sheet.entryText; onTextEdited: sheet.entryText = text
+                                Sensitive { amounts: true } }
                 }
                 FormRow {
                     visible: sheet.kind === "sell" && sheet.manual
                     label: qsTr("Verkaufspreis je Stück")
                     TextField { Layout.preferredWidth: 200; placeholderText: qsTr("optional")
-                                text: sheet.priceText; onTextEdited: sheet.priceText = text }
+                                text: sheet.priceText; onTextEdited: sheet.priceText = text
+                                Sensitive { amounts: true } }
                 }
             }
 
@@ -157,9 +159,9 @@ Sheet {
                         spacing: 8
                         Text { text: Fmt.medium(modelData.date); font.pixelSize: Theme.body; font.features: { "tnum": 1 }; color: Theme.text; Layout.fillWidth: true }
                         // per piece; with several pieces then what they were worth together
-                        Text { text: Fmt.money(modelData.value_cents); font.pixelSize: Theme.body; font.features: { "tnum": 1 }; color: Theme.text }
+                        Text { text: Fmt.money(modelData.value_cents); font.pixelSize: Theme.body; font.features: { "tnum": 1 }; color: Theme.text; Sensitive { amounts: true } }
                         Text { visible: parent.held > 0 && parent.held !== 1; font.pixelSize: Theme.body; font.features: { "tnum": 1 }; color: Theme.secondary
-                               text: qsTr("gesamt %1").arg(Fmt.money(Math.round(modelData.value_cents * parent.held))) }
+                               text: qsTr("gesamt %1").arg(Fmt.money(Math.round(modelData.value_cents * parent.held))); Sensitive { amounts: true } }
                         RemoveButton { visible: modelData.date !== sheet.item.setup.purchase_date
                                        onClicked: sheet.change("delete_asset_value", { item_id: sheet.item.id, date: modelData.date }) }
                     }
@@ -177,14 +179,15 @@ Sheet {
                     AppComboBox {
                         visible: sheet.canTotal
                         flat: true
-                        implicitWidth: 140
+                        implicitWidth: 140 * Theme.textScale   // TangibleAssetsUI.swift: field widths follow the text size (#650)
                         model: [qsTr("Wert gesamt"), qsTr("Wert je Stück")]
                         currentIndex: sheet.entryMode === "total" ? 0 : 1
                         onActivated: i => sheet.setEntryMode(i === 0 ? "total" : "piece")
                     }
                     Text { visible: !sheet.canTotal; text: qsTr("Wert je Stück"); font.pixelSize: Theme.body; color: Theme.text }
-                    TextField { Layout.fillWidth: true; Layout.minimumWidth: 80; placeholderText: qsTr("Wert"); horizontalAlignment: TextInput.AlignRight
-                                text: sheet.entryText; onTextEdited: sheet.entryText = text }
+                    TextField { Layout.fillWidth: true; Layout.minimumWidth: 90 * Theme.textScale; placeholderText: qsTr("Wert"); horizontalAlignment: TextInput.AlignRight
+                                text: sheet.entryText; onTextEdited: sheet.entryText = text
+                                Sensitive { amounts: true } }
                     Button {
                         text: qsTr("Eintragen")
                         enabled: sheet.perPiece !== null
@@ -195,6 +198,7 @@ Sheet {
                     visible: sheet.otherValue !== null
                     label: sheet.entryMode === "total" ? qsTr("Wert je Stück") : qsTr("Wert gesamt")
                     value: sheet.otherValue !== null ? Fmt.money(sheet.otherValue) : ""
+                    amounts: true
                 }
             }
 
@@ -211,7 +215,7 @@ Sheet {
                         spacing: 8
                         Text { text: Fmt.medium(modelData.date); font.pixelSize: Theme.body; font.features: { "tnum": 1 }; color: Theme.text; Layout.fillWidth: true }
                         Text { font.pixelSize: Theme.body; font.features: { "tnum": 1 }; color: Theme.text
-                               text: parent.purchase ? qsTr("Kauf: %1").arg(NumberText.format(modelData.quantity)) : qsTr("ab hier: %1").arg(NumberText.format(modelData.quantity)) }
+                               text: parent.purchase ? qsTr("Kauf: %1").arg(NumberText.format(modelData.quantity)) : qsTr("ab hier: %1").arg(NumberText.format(modelData.quantity)); Sensitive { amounts: true } }
                         RemoveButton { visible: !parent.purchase
                                        onClicked: sheet.change("delete_asset_quantity", { item_id: sheet.item.id, date: modelData.date }) }
                     }
@@ -226,7 +230,7 @@ Sheet {
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 8
-                    TextField { id: newQuantity; Layout.fillWidth: true; Layout.minimumWidth: 80; placeholderText: qsTr("Neue Anzahl") }
+                    TextField { id: newQuantity; Layout.fillWidth: true; Layout.minimumWidth: 90 * Theme.textScale; placeholderText: qsTr("Neue Anzahl") }
                     Button {
                         text: qsTr("Eintragen")
                         enabled: { const q = NumberText.parseNumber(newQuantity.text); return q !== null && q >= 0 }
@@ -240,7 +244,7 @@ Sheet {
                 Layout.fillWidth: true; Layout.leftMargin: 10
                 wrapMode: Text.WordWrap; font.pixelSize: Theme.caption; color: Theme.secondary
                 text: sheet.entryHeld > 0
-                    ? qsTr("Bestand an diesem Tag: %1. Verkaufte Sachwerte stehen danach unter „Ehemalige Positionen“; ihr Wert bis zum Verkauf bleibt im Verlauf.").arg(NumberText.format(sheet.entryHeld))
+                    ? qsTr("Bestand an diesem Tag: %1. Verkaufte Sachwerte stehen danach unter „Ehemalige Positionen“; ihr Wert bis zum Verkauf bleibt im Verlauf.").arg(AppModel.masking(NumberText.format(sheet.entryHeld), AppModel.redactAmounts))
                     : qsTr("An diesem Tag ist kein Bestand vorhanden.")
             }
         }

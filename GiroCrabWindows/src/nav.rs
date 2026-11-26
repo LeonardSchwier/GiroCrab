@@ -3,8 +3,31 @@
 //! Pure functions over core records, unit-tested on every platform; `main.rs` only draws it.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 use girocrab_core::{Account, AccountKind, BookingFilter, Category, UserGroup};
+
+/// Ids of the vault's offline accounts (#679), set by `show` from
+/// `Vault::list_offline_account_ids`. Kept here so every place that builds a `SidebarInput`
+/// gets the marker without carrying the set itself.
+static OFFLINE_ACCOUNTS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+/// Replaces the known offline account ids.
+pub fn set_offline_accounts(ids: impl IntoIterator<Item = i64>) {
+    if let Ok(mut known) = OFFLINE_ACCOUNTS.lock() {
+        *known = ids.into_iter().collect();
+    }
+}
+
+fn offline_accounts() -> HashSet<i64> {
+    OFFLINE_ACCOUNTS
+        .lock()
+        .map(|known| known.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+/// Detail line of an offline account row (instead of the empty bank name).
+pub const OFFLINE_DETAIL: &str = "Offline-Konto";
 
 /// How the "Konten" section groups its accounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -186,6 +209,8 @@ pub fn kind_label(k: AccountKind) -> &'static str {
     match k {
         AccountKind::Checking => "Girokonten",
         AccountKind::Savings => "Sparkonten",
+        AccountKind::TimeDeposit => "Festgeld",
+        AccountKind::BuildingSavings => "Bausparen",
         AccountKind::CreditCard => "Kreditkarten",
         AccountKind::PaymentService => "Zahlungsdienste",
         AccountKind::Brokerage => "Depots",
@@ -195,9 +220,11 @@ pub fn kind_label(k: AccountKind) -> &'static str {
 }
 
 /// Order of the account kinds in "Kontoart" mode.
-const KIND_ORDER: [AccountKind; 7] = [
+const KIND_ORDER: [AccountKind; 9] = [
     AccountKind::Checking,
     AccountKind::Savings,
+    AccountKind::TimeDeposit,
+    AccountKind::BuildingSavings,
     AccountKind::CreditCard,
     AccountKind::PaymentService,
     AccountKind::Brokerage,
@@ -304,7 +331,10 @@ fn grouped<'a>(
 fn account_icon(kind: AccountKind) -> &'static str {
     match kind {
         AccountKind::Checking => "bank",
-        AccountKind::Savings | AccountKind::Cash => "banknote",
+        AccountKind::Savings
+        | AccountKind::TimeDeposit
+        | AccountKind::BuildingSavings
+        | AccountKind::Cash => "banknote",
         AccountKind::CreditCard | AccountKind::PaymentService => "card",
         AccountKind::Brokerage => "chart",
         AccountKind::Loan => "house",
@@ -335,6 +365,16 @@ fn group_icon(label: &str) -> &'static str {
 
 /// Builds the whole sidebar. `money` formats cents with a currency, as everywhere in the app.
 pub fn build(input: &SidebarInput, money: &dyn Fn(i64, &str) -> String) -> Vec<SideRow> {
+    build_with(input, &offline_accounts(), money)
+}
+
+/// `build` with an explicit set of offline account ids: those rows are marked "Offline-Konto"
+/// and, in private mode, show the mask instead of their name (the key stays `acct:<id>`).
+fn build_with(
+    input: &SidebarInput,
+    offline: &HashSet<i64>,
+    money: &dyn Fn(i64, &str) -> String,
+) -> Vec<SideRow> {
     let hide = |text: String| {
         if input.privacy {
             crate::daily::MASK.to_string()
@@ -408,9 +448,11 @@ pub fn build(input: &SidebarInput, money: &dyn Fn(i64, &str) -> String) -> Vec<S
                 1
             };
             let is_folded = head.fold == 2;
+            // group figures are overall money sums (#337): only effectively
+            // included accounts count; every account row stays visible
             let eur: Vec<i64> = members
                 .iter()
-                .filter(|a| a.currency == "EUR")
+                .filter(|a| a.currency == "EUR" && a.in_total)
                 .map(|a| a.balance_cents)
                 .collect();
             if !eur.is_empty() {
@@ -424,9 +466,20 @@ pub fn build(input: &SidebarInput, money: &dyn Fn(i64, &str) -> String) -> Vec<S
                 continue;
             }
             for a in members {
-                let mut r = SideRow::new(kind::ACCOUNT, Target::Account(a.id).key(), &a.name);
+                let is_offline = offline.contains(&a.id);
+                // Offline accounts carry only what the user typed in: mask the name too.
+                let label = if is_offline && input.privacy {
+                    crate::daily::MASK
+                } else {
+                    a.name.as_str()
+                };
+                let mut r = SideRow::new(kind::ACCOUNT, Target::Account(a.id).key(), label);
                 r.depth = 2;
-                r.detail = a.bank_name.clone();
+                r.detail = if is_offline {
+                    OFFLINE_DETAIL.to_string()
+                } else {
+                    a.bank_name.clone()
+                };
                 r.amount = hide(money(a.balance_cents, &a.currency));
                 r.negative = a.balance_cents < 0 && !input.privacy;
                 r.color_hex = a.color_hex.clone();
@@ -434,11 +487,11 @@ pub fn build(input: &SidebarInput, money: &dyn Fn(i64, &str) -> String) -> Vec<S
                 if a.new_count > 0 {
                     r.badge = a.new_count.to_string();
                 }
-                if a.kind == AccountKind::Loan {
-                    if let Some(p) = loan_progress(a.initial_balance_cents, a.balance_cents) {
-                        r.progress = p;
-                        r.detail = progress_label(p);
-                    }
+                if a.kind == AccountKind::Loan
+                    && let Some(p) = loan_progress(a.initial_balance_cents, a.balance_cents)
+                {
+                    r.progress = p;
+                    r.detail = progress_label(p);
                 }
                 rows.push(r);
             }
@@ -468,7 +521,7 @@ pub fn build(input: &SidebarInput, money: &dyn Fn(i64, &str) -> String) -> Vec<S
     // ---- Dokumente
     rows.push(section("documents", "Dokumente"));
     if !folded("documents") {
-        let mut docs = SideRow::new(kind::ITEM, Target::Documents.key(), "Belege & PostBox");
+        let mut docs = SideRow::new(kind::ITEM, Target::Documents.key(), "Belege & Postbox");
         docs.depth = 1;
         docs.icon = "document".into();
         if input.document_count > 0 {
@@ -539,27 +592,29 @@ pub fn category_fold_id(key: &str) -> Option<String> {
     }
 }
 
-/// Moves `target_id` one place up (before its predecessor) or down (after its
-/// successor) in `ids`. Returns `false` when nothing changed (id missing or
-/// already at the edge).
-#[allow(dead_code)] // not wired into the UI yet; covered by tests
-pub fn move_category_in_order(ids: &mut [i64], target_id: i64, move_up: bool) -> bool {
-    let Some(pos) = ids.iter().position(|&id| id == target_id) else {
-        return false;
-    };
-    let other = if move_up {
-        match pos.checked_sub(1) {
-            Some(p) => p,
-            None => return false,
-        }
-    } else {
-        pos + 1
-    };
-    if other >= ids.len() {
-        return false;
+/// Moves category `id` by `delta` places (`-1` up, `+1` down) among its siblings, i.e. the
+/// categories with the same parent. `order` is the tree order as `(id, parent_id)`. Returns the
+/// parent and the complete new sibling order for `reorder_categories`; `None` for an unknown id,
+/// `delta == 0` or a move past the first/last sibling.
+pub fn move_category(
+    order: &[(i64, Option<i64>)],
+    id: i64,
+    delta: i32,
+) -> Option<(Option<i64>, Vec<i64>)> {
+    let parent = order.iter().find(|(c, _)| *c == id)?.1;
+    let mut siblings: Vec<i64> = order
+        .iter()
+        .filter(|(_, p)| *p == parent)
+        .map(|(c, _)| *c)
+        .collect();
+    let from = siblings.iter().position(|c| *c == id)?;
+    let to = from.checked_add_signed(isize::try_from(delta).ok()?)?;
+    if to == from || to >= siblings.len() {
+        return None;
     }
-    ids.swap(pos, other);
-    true
+    let moved = siblings.remove(from);
+    siblings.insert(to, moved);
+    Some((parent, siblings))
 }
 
 /// Sorts `items` by the user-defined order `ordered_ids`. Items whose id is not
@@ -626,6 +681,7 @@ pub(crate) mod testing {
             new_count: 0,
             initial_balance_cents: None,
             user_group_uuid: None,
+            include_in_total: true,
             in_total: true,
             color_hex: String::new(),
             archived_unix: None,
@@ -633,6 +689,9 @@ pub(crate) mod testing {
             opening_balance_cents: None,
             opening_balance_date: String::new(),
             balance_derived: false,
+            note: String::new(),
+            bank_label: None,
+            last_fetch_unix: None,
         }
     }
 }
@@ -950,26 +1009,91 @@ mod tests {
     }
 
     #[test]
+    fn offline_accounts_are_marked_and_masked_in_private_mode() {
+        let accounts = [
+            account(1, "Giro", "Bank A", AccountKind::Checking, 1),
+            account(2, "Haushaltskasse", "", AccountKind::Cash, 2),
+        ];
+        let folded = HashSet::new();
+        let offline: HashSet<i64> = [2].into_iter().collect();
+        let row = |rows: &[SideRow], key: &str| {
+            rows.iter()
+                .find(|r| r.kind == kind::ACCOUNT && r.key == key)
+                .cloned()
+                .unwrap()
+        };
+        let open = build_with(
+            &input(&accounts, &[], &folded, GroupMode::Kind, ""),
+            &offline,
+            &money,
+        );
+        assert_eq!(row(&open, "acct:2").label, "Haushaltskasse");
+        assert_eq!(row(&open, "acct:2").detail, OFFLINE_DETAIL);
+        assert_eq!(row(&open, "acct:1").detail, "Bank A");
+        let mut inp = input(&accounts, &[], &folded, GroupMode::Kind, "");
+        inp.privacy = true;
+        let private = build_with(&inp, &offline, &money);
+        // Offline name masked, key unchanged so the row stays selectable.
+        assert_eq!(row(&private, "acct:2").label, crate::daily::MASK);
+        // Other accounts keep their label (privacy hides amounts only).
+        assert_eq!(row(&private, "acct:1").label, "Giro");
+        // Without known offline accounts nothing is marked.
+        let none = build_with(&inp, &HashSet::new(), &money);
+        assert_eq!(row(&none, "acct:2").label, "Haushaltskasse");
+        assert_eq!(row(&none, "acct:2").detail, "");
+    }
+
+    #[test]
     fn toggle_keys_are_recognised() {
         assert_eq!(toggle_id("toggle:payments"), Some("payments"));
         assert_eq!(toggle_id("acct:1"), None);
         assert_eq!(category_fold_id("acct:1"), None);
     }
 
+    /// Tree order: 1 (2, 3), 4 (5), 6.
+    const TREE: [(i64, Option<i64>); 6] = [
+        (1, None),
+        (2, Some(1)),
+        (3, Some(1)),
+        (4, None),
+        (5, Some(4)),
+        (6, None),
+    ];
+
     #[test]
-    fn test_move_category_in_order() {
-        let mut ids = vec![1, 2, 3];
-        assert!(move_category_in_order(&mut ids, 2, true));
-        assert_eq!(ids, [2, 1, 3]);
-        assert!(move_category_in_order(&mut ids, 2, false));
-        assert_eq!(ids, [1, 2, 3]);
-        // Edges and unknown ids leave the order untouched.
-        assert!(!move_category_in_order(&mut ids, 1, true));
-        assert!(!move_category_in_order(&mut ids, 3, false));
-        assert!(!move_category_in_order(&mut ids, 9, true));
-        assert_eq!(ids, [1, 2, 3]);
-        let mut empty: Vec<i64> = Vec::new();
-        assert!(!move_category_in_order(&mut empty, 1, false));
+    fn move_category_stays_among_siblings() {
+        // Top level: children of 1 and 4 in between do not count as neighbours.
+        assert_eq!(move_category(&TREE, 4, -1), Some((None, vec![4, 1, 6])));
+        assert_eq!(move_category(&TREE, 4, 1), Some((None, vec![1, 6, 4])));
+        // Sub-level: only the children of the same parent are returned.
+        assert_eq!(move_category(&TREE, 3, -1), Some((Some(1), vec![3, 2])));
+        assert_eq!(move_category(&TREE, 2, 1), Some((Some(1), vec![3, 2])));
+    }
+
+    #[test]
+    fn move_category_stops_at_the_edges() {
+        assert_eq!(move_category(&TREE, 1, -1), None);
+        assert_eq!(move_category(&TREE, 6, 1), None);
+        assert_eq!(move_category(&TREE, 2, -1), None);
+        assert_eq!(move_category(&TREE, 3, 1), None);
+        // An only child cannot move at all.
+        assert_eq!(move_category(&TREE, 5, -1), None);
+        assert_eq!(move_category(&TREE, 5, 1), None);
+    }
+
+    #[test]
+    fn move_category_rejects_unknown_ids_and_no_op_steps() {
+        assert_eq!(move_category(&TREE, 9, 1), None);
+        assert_eq!(move_category(&TREE, 1, 0), None);
+        assert_eq!(move_category(&TREE, 1, 3), None);
+        assert_eq!(move_category(&[], 1, 1), None);
+    }
+
+    #[test]
+    fn move_category_handles_wider_steps() {
+        let flat = [(1, None), (2, None), (3, None)];
+        assert_eq!(move_category(&flat, 1, 2), Some((None, vec![2, 3, 1])));
+        assert_eq!(move_category(&flat, 3, -2), Some((None, vec![3, 1, 2])));
     }
 
     #[test]

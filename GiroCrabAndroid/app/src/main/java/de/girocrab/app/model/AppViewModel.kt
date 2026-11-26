@@ -22,6 +22,12 @@ data class AppUiState(
     val vaultMayHoldRealData: Boolean = false,
     val loading: Boolean = false,
     val privacyMode: Boolean = false,
+    /**
+     * #1428 (2.5): the app left the foreground. The vault stays open and the data stays loaded —
+     * only the window has to be unlocked again. Distinct from [VaultState.Locked], which means
+     * there is no vault content at all.
+     */
+    val backgroundLocked: Boolean = false,
     val data: VaultSnapshot = VaultSnapshot(),
     val scope: Scope = Scope.All,
     val search: String = "",
@@ -58,6 +64,8 @@ class AppViewModel(private val core: CoreBridge = DefaultCoreBridge()) : ViewMod
 
     // Own vault snapshot is kept while demo is shown so switching back loses nothing.
     private var ownSnapshot: VaultSnapshot? = null
+    /** A background lock that arrived before the vault did (import still running). */
+    private var pendingBackgroundLock = false
 
     init { bootstrap() }
 
@@ -66,17 +74,25 @@ class AppViewModel(private val core: CoreBridge = DefaultCoreBridge()) : ViewMod
     fun bootstrap() {
         viewModelScope.launch {
             _state.update { it.copy(loading = true) }
-            val own = withContext(Dispatchers.Default) { runCatching { core.openOwnVault() }.getOrNull() }
-            if (own != null) adoptOwn(own) else showDemo()
+            // No vault is opened here anymore: the own vault needs the device key, and that only
+            // comes back from the biometric gate (#1428, 2.2/2.4). Until then the app starts in
+            // demo mode, which is exactly what it did while `openOwnVault()` returned null.
+            showDemo()
         }
     }
 
     private fun adoptOwn(snapshot: VaultSnapshot) {
         ownSnapshot = snapshot
+        // Two ways a lock arrives here: it was waiting for the vault (import in the background) or
+        // it is already set (`showOwnVault` hands back the cached snapshot). Both have to survive —
+        // only a successful prompt clears it.
+        val locked = pendingBackgroundLock
+        pendingBackgroundLock = false
         _state.update {
             it.copy(
                 vaultState = VaultState.Own, vaultMayHoldRealData = true, loading = false,
                 data = snapshot, scope = Scope.All, filter = BookingFilter(), search = "", error = null,
+                backgroundLocked = locked || it.backgroundLocked,
             )
         }
     }
@@ -93,13 +109,45 @@ class AppViewModel(private val core: CoreBridge = DefaultCoreBridge()) : ViewMod
         }
     }
 
+    /**
+     * Adopts a snapshot read from the own vault (#1429, 3.1). The native handle stays with the
+     * caller and is closed there — the ViewModel keeps data, never a handle.
+     */
+    fun adoptOwnVault(snapshot: VaultSnapshot) = adoptOwn(snapshot)
+
     fun showOwnVault() {
         val own = ownSnapshot
-        if (own != null) adoptOwn(own) else bootstrap()
+        if (own != null) {
+            adoptOwn(own)
+        } else {
+            // Nothing read yet: back to the unlock screen. Falling into the demo here looked like
+            // the own vault had been opened, only to reload demo data (#1429).
+            _state.update { it.copy(vaultState = VaultState.Locked, loading = false, error = null) }
+        }
+    }
+
+    /**
+     * #1428 (2.5): leaving the foreground locks the window, not the vault. Dropping the snapshot
+     * here would mean reading the whole vault again on every app switch for nothing.
+     */
+    fun lockForBackground() {
+        if (_state.value.vaultState != VaultState.Own) {
+            // A running import: the vault arrives after the app is gone. Remember the lock, or the
+            // imported data would be readable on return without a new prompt.
+            pendingBackgroundLock = true
+            return
+        }
+        _state.update { it.copy(backgroundLocked = true) }
+    }
+
+    fun clearBackgroundLock() {
+        pendingBackgroundLock = false
+        _state.update { it.copy(backgroundLocked = false) }
     }
 
     fun lock() {
         ownSnapshot = null
+        pendingBackgroundLock = false
         _state.update { AppUiState(privacyMode = it.privacyMode, vaultMayHoldRealData = it.vaultMayHoldRealData) }
     }
 
@@ -202,16 +250,16 @@ class AppViewModel(private val core: CoreBridge = DefaultCoreBridge()) : ViewMod
 
     fun deleteRule(ruleId: String) = editData { d -> d.copy(rules = d.rules.filterNot { it.id == ruleId }) }
 
-    /** Applies enabled rules to uncategorized bookings (never overrides manual categories). Returns count changed. */
+    /**
+     * Applies enabled rules: a category only to uncategorized bookings (never overrides manual
+     * categories), tags from every matching rule. Returns count changed.
+     */
     fun applyRules(): Int {
         var changed = 0
         editData { d ->
             val active = d.rules.filter { it.enabled }
             d.copy(bookings = d.bookings.map { b ->
-                if (b.categoryId != null) return@map b
-                val r = active.firstOrNull { it.matches(b) } ?: return@map b
-                changed++
-                b.copy(categoryId = r.categoryId, categoryByRule = true, tagIds = b.tagIds + r.tagIds)
+                applyRulesTo(active, b).also { if (it !== b) changed++ }
             })
         }
         return changed
@@ -223,9 +271,8 @@ class AppViewModel(private val core: CoreBridge = DefaultCoreBridge()) : ViewMod
         val scoped = _state.value.scopedAccountIds
         editData { d ->
             d.copy(bookings = d.bookings.map { b ->
-                if (b.categoryId != null || b.accountId !in scoped || !rule.matches(b)) return@map b
-                changed++
-                b.copy(categoryId = rule.categoryId, categoryByRule = true, tagIds = b.tagIds + rule.tagIds)
+                if (b.categoryId != null || b.accountId !in scoped) return@map b
+                applyRulesTo(listOf(rule), b).also { if (it !== b) changed++ }
             })
         }
         return changed
@@ -248,13 +295,42 @@ class AppViewModel(private val core: CoreBridge = DefaultCoreBridge()) : ViewMod
             .groupBy { it.categoryId }
             .mapValues { (_, v) -> -v.sumOf { it.amountCents } }
 
-    fun netWorthCents(): Long {
+    /**
+     * Net worth in [currency] — only that currency, because balances of different currencies are
+     * not converted anywhere in the vault. Adding them would produce a number without a unit.
+     */
+    fun netWorthCents(currency: String = _state.value.data.primaryCurrency()): Long {
         val d = _state.value.data
-        return d.accounts.filterNot { it.hidden }.sumOf { it.balanceCents } +
-            d.assets.sumOf { it.valueCents } - d.loans.sumOf { it.remainingCents }
+        val counted = d.accounts.filter {
+            !it.hidden && it.includeInTotal && it.currency.ifBlank { "EUR" } == currency
+        }
+        val countedIds = counted.map { it.id }.toSet()
+        // A tangible asset whose account is counted is already inside that account's balance; only
+        // assets of **uncounted** accounts (excluded, hidden or absent) never were, and only those
+        // without any account at all are added on top (#1429).
+        val allIds = d.accounts.map { it.id }.toSet()
+        val looseAssets = d.assets.filter { it.accountId.isBlank() || it.accountId !in allIds }
+        return counted.sumOf { it.balanceCents } + looseAssets.sumOf { it.valueCents } -
+            d.loans.sumOf { it.remainingCents }
     }
 
     companion object {
+        /**
+         * The core's split (`RuleSet::categorise` / `tags_for`): the category comes from the first
+         * matching rule that sets one, and only for an uncategorized booking; tag-only rules never
+         * categorise. Tags are the union of every matching rule. Returns [b] itself when nothing changes.
+         */
+        fun applyRulesTo(rules: List<Rule>, b: Booking): Booking {
+            val matching = rules.filter { it.matches(b) }
+            val tags = b.tagIds + matching.flatMap { it.tagIds }
+            val category = if (b.categoryId == null) matching.firstOrNull { it.categoryId != null }?.categoryId else null
+            return when {
+                category != null -> b.copy(categoryId = category, categoryByRule = true, tagIds = tags)
+                tags != b.tagIds -> b.copy(tagIds = tags)
+                else -> b
+            }
+        }
+
         fun filterBookings(s: AppUiState): List<Booking> {
             val ids = s.scopedAccountIds
             val f = s.filter

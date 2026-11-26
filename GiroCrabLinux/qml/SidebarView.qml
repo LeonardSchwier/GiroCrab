@@ -44,8 +44,9 @@ Rectangle {
                     const byBank = m.accountView === "byBank"
                     for (const g of (byBank ? m.bankGroups : m.groups)) {
                         const listed = g.accounts.filter(shown)
-                        // while searching, hide empty sections so only hits remain
-                        if (m.isSidebarAccountSearching && !listed.length) continue
+                        // hide sections without a hit while searching, and ones holding only
+                        // archived accounts while those are hidden (#814)
+                        if (!m.isSidebarSectionListed(g.accounts)) continue
                         const open = byBank ? m.isBankGroupOpen(g.id) : m.isKindGroupOpen(g.id)
                         out.push({ type: "kindGroup", group: g, open: open, bank: byBank })
                         if (open) for (const a of listed) out.push({ type: "account", account: a, indent: 0 })
@@ -63,7 +64,7 @@ Rectangle {
         }
         out.push({ type: "caption", key: "documents", title: qsTr("Dokumente"), open: !sm.documentsCollapsed })
         if (!sm.documentsCollapsed)
-            out.push({ type: "nav", key: "documents", symbol: "doc.on.doc", title: qsTr("Belege & PostBox"), badge: 0 })
+            out.push({ type: "nav", key: "documents", symbol: "doc.on.doc", title: qsTr("Belege & Postbox"), badge: sm.unseenDocumentCount })
         const pending = m.connections.filter(c => !m.allAccounts.some(a => a.connection_id === c.id))
         if (pending.length) {
             out.push({ type: "section", title: qsTr("Neue Bankzugänge") })
@@ -71,6 +72,8 @@ Rectangle {
         }
         // caption style like „Konten“, „Zahlungen“ and „Dokumente“ (#676); „+“ lives in the bottom bar
         out.push({ type: "caption", key: "categories", title: qsTr("Kategorien"), open: !m.categoriesCollapsed })
+        // SidebarView.swift › categorySumNote: the sums follow the active filters (#621)
+        if (!m.categoriesCollapsed && m.categorySumNote !== "") out.push({ type: "sumNote", text: m.categorySumNote })
         if (!m.categoriesCollapsed) {
             out.push({ type: "nav", key: "uncategorized", symbol: "questionmark.folder", title: sm.uncategorizedLabel,
                        badge: m.uncategorizedCount, tint: Theme.warning, regular: true, labels: true })
@@ -116,7 +119,7 @@ Rectangle {
         for (i += delta; i >= 0 && i < all.length; i += delta) {
             const key = rowKey(all[i])
             if (key === "") continue
-            AppModel.sidebarSelection = key
+            AppModel.selectFromSidebar(key)
             // a header page or the first row bring the header back into view
             if (i <= top) list.contentY = -list.topMargin
             else list.positionViewAtIndex(i - top, ListView.Contain)
@@ -179,7 +182,23 @@ Rectangle {
             clip: true
             topMargin: accountsHeader.height
             bottomMargin: 10
-            model: sidebar.rows
+            // set by hand, not bound: a new array resets the view to its top, and the sidebar is
+            // rebuilt on every count, balance or fold change – the scroll position stays
+            /// Scrolled to the very top (accounts header in view): stays there when the header grows.
+            property bool pinnedTop: true
+            onContentYChanged: pinnedTop = contentY <= -topMargin + 1
+            onTopMarginChanged: if (pinnedTop) contentY = -topMargin
+            function applyRows() {
+                const y = contentY
+                const atTop = pinnedTop
+                model = sidebar.rows
+                if (atTop) { contentY = -topMargin; return }
+                forceLayout()
+                const max = Math.max(-topMargin, contentHeight - height + bottomMargin)
+                contentY = Math.max(-topMargin, Math.min(y, max))
+            }
+            Component.onCompleted: model = sidebar.rows
+            Connections { target: sidebar; function onRowsChanged() { list.applyRows() } }
             boundsBehavior: Flickable.StopAtBounds
             interactive: false
             WheelHandler { acceptedDevices: PointerDevice.AllDevices; onWheel: e => keyNav.scrollBy(e) }
@@ -214,7 +233,7 @@ Rectangle {
                                    text: Fmt.money(modelData.cents, modelData.currency)
                                    font.pixelSize: Theme.caption; font.weight: Font.DemiBold; font.features: { "tnum": 1 }
                                    color: allRow.selected ? Theme.text : (modelData.cents < 0 ? Theme.negative : Theme.secondary)
-                                   Sensitive {} }
+                                   Sensitive { amounts: true } }
                         }
                     }
                 } }
@@ -226,7 +245,7 @@ Rectangle {
                     selectionKey: "userGroup:" + g.uuid
                     // taller hit area for the drop zones (.padding(.vertical, 3))
                     topGap: g.depth === 0 ? 10 : 4
-                    rowHeight: 30
+                    rowHeight: Math.max(30, Math.ceil(userGroupName.implicitHeight) + 10)   // a second line instead of "…" (#650)
                     TapHandler { acceptedButtons: Qt.RightButton; onTapped: sidebar.openGroupMenu(groupRow.g, groupRow) }
                     RowLayout {
                         anchors.fill: parent; anchors.leftMargin: SidebarModel.rowLeading + g.depth * SidebarModel.iconInset; anchors.rightMargin: SidebarModel.rowTrailing
@@ -236,7 +255,8 @@ Rectangle {
                         // the group's colour, like an account's icon
                         SFIcon { symbol: g.sf_symbol; size: 15; Layout.preferredWidth: 20
                                  color: selected || !g.color_hex ? Theme.secondary : Theme.readable(g.color_hex) }
-                        Text { text: g.name; font.pixelSize: Theme.body; font.weight: Font.DemiBold; color: Theme.secondary; elide: Text.ElideRight; Layout.fillWidth: true
+                        Text { id: userGroupName; text: g.name; font.pixelSize: Theme.body; font.weight: Font.DemiBold; color: Theme.secondary; elide: Text.ElideRight; Layout.fillWidth: true
+                               wrapMode: Text.Wrap; maximumLineCount: 2
                                Sensitive { labels: true } }
                         SFIcon { visible: !g.in_total; symbol: "eye.slash"; size: 10
                                  Accessible.name: qsTr("Nicht in der Gesamtsumme")
@@ -246,7 +266,7 @@ Rectangle {
                         Text { text: Fmt.money(g.balance_cents); font.pixelSize: Theme.caption; font.weight: Font.DemiBold; font.features: { "tnum": 1 }
                                opacity: g.in_total ? 1 : 0.6
                                color: selected ? Theme.text : (g.balance_cents < 0 ? Theme.negative : Theme.secondary)
-                               Sensitive {} }
+                               Sensitive { amounts: true } }
                     }
                     // an account goes to the top of this group; a group above it
                     // (upper half) or into it as a subgroup (lower half)
@@ -272,18 +292,21 @@ Rectangle {
                     readonly property bool isLoanGroup: g.accounts.length > 0 && g.accounts.every(a => a.kind === "Loan")
                     selectionKey: modelData.bank ? "bank:" + g.id : "group:" + g.id
                     topGap: 10
+                    rowHeight: Math.max(30, Math.ceil(kindGroupName.implicitHeight) + 10)   // SectionHeader: .lineLimit(2) (#650)
                     RowLayout {
                         anchors.fill: parent; anchors.leftMargin: SidebarModel.rowLeading; anchors.rightMargin: SidebarModel.rowTrailing
                         spacing: SidebarModel.gap
                         SidebarChevron { open: modelData.open
                                          onToggled: modelData.bank ? AppModel.toggleCollapsedBank(g.id) : AppModel.toggleCollapsedGroup(g.id)
-                                         accessibleName: open ? qsTr("„%1“ einklappen").arg(g.name) : qsTr("„%1“ ausklappen").arg(g.name) }
+                                         readonly property string spokenName: modelData.bank ? g.name : AppModel.masking(g.name, AppModel.redactLabels)
+                                         accessibleName: open ? qsTr("„%1“ einklappen").arg(spokenName) : qsTr("„%1“ ausklappen").arg(spokenName) }
                         SFIcon { symbol: g.sf_symbol; size: 15; Layout.preferredWidth: 20 }
-                        Text { text: g.name; font.pixelSize: Theme.body; font.weight: Font.DemiBold; color: Theme.secondary; elide: Text.ElideRight; Layout.fillWidth: true
+                        Text { id: kindGroupName; text: g.name; font.pixelSize: Theme.body; font.weight: Font.DemiBold; color: Theme.secondary; elide: Text.ElideRight; Layout.fillWidth: true
+                               wrapMode: Text.Wrap; maximumLineCount: 2
                                Sensitive { labels: true; when: !modelData.bank } }   // bank names stay visible
                         Text { text: Fmt.money(g.balance_cents); font.pixelSize: Theme.caption; font.weight: Font.DemiBold; font.features: { "tnum": 1 }
                                color: selected ? Theme.text : (g.balance_cents < 0 && isLoanGroup ? Theme.loan : (g.balance_cents < 0 ? Theme.negative : Theme.secondary))
-                               Sensitive {} }
+                               Sensitive { amounts: true } }
                     }
                 } }
                 DelegateChoice { roleValue: "hint"; delegate: Item {
@@ -355,6 +378,20 @@ Rectangle {
                                elide: Text.ElideRight; Layout.fillWidth: true; Accessible.role: Accessible.Heading }
                     }
                 } }
+                // SidebarView.swift › categorySumNote (#621): caption, secondary, at most two lines,
+                // on the heading's text axis; not selectable
+                DelegateChoice { roleValue: "sumNote"; delegate: Item {
+                    id: sumNoteRow
+                    required property var modelData
+                    width: ListView.view.width; height: sumNoteText.implicitHeight + 4
+                    Text {
+                        id: sumNoteText
+                        x: 8 + SidebarModel.rowLeading + SidebarModel.iconInset; y: 2; width: parent.width - x - 14
+                        text: sumNoteRow.modelData.text
+                        font.pixelSize: Theme.caption; color: Theme.secondary
+                        wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
+                    }
+                } }
                 // SidebarView.swift › categoryRows: one icon axis per level – a leaf reserves the chevron column
                 DelegateChoice { roleValue: "category"; delegate: SidebarRow {
                     id: catRow
@@ -364,11 +401,26 @@ Rectangle {
                     TapHandler { acceptedButtons: Qt.RightButton; onTapped: sidebar.openCategoryMenu(catRow.c, catRow) }
                     // WP3 (#366): bookings dragged from the list onto a category (leaves only)
                     BookingDropTarget { categoryID: catRow.c.id; enabled: !catRow.modelData.hasChildren }
+                    // categoryDropSlot (#977): a dragged category goes above this row (upper half),
+                    // below it or – on a main category or a row with sub-categories – into it as
+                    // its last sub-category (lower half)
+                    DropSlot {
+                        key: "c:" + catRow.c.id
+                        inset: SidebarModel.rowLeading + catRow.modelData.depth * SidebarModel.iconInset
+                        freeLeading: catRow.modelData.hasChildren ? 12 : 0
+                        payload: ({ type: "category", id: catRow.c.id, label: catRow.c.name })
+                        accepts: ["category"]
+                        edgeFor: (half, p) => {
+                            if (!SidebarModel.canDropCategory(p.id, catRow.c.id)) return null
+                            return half === "below" && SidebarModel.categoryTakesDropInto(catRow.c.id) ? "into" : half
+                        }
+                        onPerform: (p, edge) => SidebarModel.placeCategory(p.id, catRow.c.id, edge === "into" ? "into" : edge === "below" ? "after" : "before")
+                    }
                     RowLayout {
                         anchors.fill: parent; anchors.leftMargin: SidebarModel.rowLeading + modelData.depth * SidebarModel.iconInset; anchors.rightMargin: SidebarModel.rowTrailing
                         spacing: SidebarModel.gap
                         SidebarChevron { visible: modelData.hasChildren; open: modelData.open; onToggled: AppModel.toggleExpandedCategory(c.id)
-                                         accessibleName: open ? qsTr("„%1“ einklappen").arg(c.name) : qsTr("„%1“ ausklappen").arg(c.name) }
+                                         accessibleName: open ? qsTr("„%1“ einklappen").arg(AppModel.masking(c.name, AppModel.redactLabels)) : qsTr("„%1“ ausklappen").arg(AppModel.masking(c.name, AppModel.redactLabels)) }
                         Item { visible: !modelData.hasChildren; implicitWidth: SidebarModel.slot }
                         // CategoryRow: HStack(spacing: 8)
                         RowLayout {
@@ -376,7 +428,7 @@ Rectangle {
                             Layout.fillWidth: true
                             SFIcon { symbol: c.sf_symbol; size: 15; color: Theme.withAlpha(Theme.readable(c.color_hex), 0.85); Layout.preferredWidth: 20 }
                             Text { text: c.name; font.pixelSize: Theme.body; color: Theme.text; elide: Text.ElideRight; Layout.fillWidth: true; Sensitive { labels: true } }
-                            Text { visible: c.total_cents !== 0; text: Fmt.money(c.total_cents); font.pixelSize: Theme.caption; font.features: { "tnum": 1 }; color: Theme.secondary; Sensitive {} }
+                            Text { visible: c.total_cents !== 0; text: Fmt.money(c.total_cents); font.pixelSize: Theme.caption; font.features: { "tnum": 1 }; color: Theme.secondary; Sensitive { amounts: true } }
                         }
                     }
                 } }
@@ -426,14 +478,15 @@ Rectangle {
     AppMenu {
         id: addMenu
         AppMenuItem { text: qsTr("Neues Konto …"); icon.name: SF.icon("building.columns"); onTriggered: AppModel.showAddBank = true }
+        AppMenuItem { text: qsTr("Neues Offline-Konto …"); icon.name: SF.icon("banknote"); onTriggered: OfflineAccounts.openNewAccount() }
         AppMenuItem { text: qsTr("Neue Kontengruppe …"); icon.name: SF.icon("folder.badge.plus")
                       onTriggered: AppModel.groupDialog = { kind: "create", movingAccount: null, parent: null } }
         AppMenuSeparator {}
         AppMenuItem { text: qsTr("Neue Kategorie …"); icon.name: SF.icon("tag"); onTriggered: AppModel.newCategoryRequest = { parent: sidebar.selectedCategoryID } }
         AppMenuItem { text: qsTr("Neue Kategoriengruppe …"); icon.name: SF.icon("tag.circle"); onTriggered: AppModel.newCategoryRequest = { parent: null } }
     }
-    function openNavMenu(key) { if (key === "newBookings") allMenu.popup(); else uncategorizedMenu.popup() }
-    /// „Neue Umsätze“, „Vermögen“, „Geplant“, „Lastschriften“, „Belege & PostBox“ and „Ohne Kategorie“:
+    function openNavMenu(key) { if (key === "newBookings") allMenu.popup(); else if (key === "documents") documentsMenu.popup(); else uncategorizedMenu.popup() }
+    /// „Neue Umsätze“, „Vermögen“, „Geplant“, „Lastschriften“, „Belege & Postbox“ and „Ohne Kategorie“:
     /// a page row with the empty chevron column, icon, title and count badge.
     component NavRow: SidebarRow {
         id: navRow
@@ -442,7 +495,7 @@ Rectangle {
         signal menuRequested(string key)
         selectionKey: modelData.key
         TapHandler {
-            enabled: navRow.modelData.key === "newBookings" || navRow.modelData.key === "uncategorized"
+            enabled: navRow.modelData.key === "newBookings" || navRow.modelData.key === "uncategorized" || navRow.modelData.key === "documents"
             acceptedButtons: Qt.RightButton
             onTapped: navRow.menuRequested(navRow.modelData.key)
         }
@@ -487,9 +540,13 @@ Rectangle {
     // look, place – then what only categories have – then delete
     property var menuCategory: null
     property var moveTargets: []
+    property bool menuCanShiftUp: false
+    property bool menuCanShiftDown: false
     function openCategoryMenu(c, row) {
         menuCategory = c
         moveTargets = AppModel.categoryMoveTargets(c.id)
+        menuCanShiftUp = SidebarModel.canShiftCategory(c.id, -1)
+        menuCanShiftDown = SidebarModel.canShiftCategory(c.id, 1)
         iconPopover.y = Math.max(8, Math.min(sidebar.height - 520, row.mapToItem(sidebar, 0, 0).y))
         categoryMenu.popup()
     }
@@ -521,6 +578,13 @@ Rectangle {
                 onObjectRemoved: (index, object) => moveMenu.removeItem(object)
             }
         }
+        // „Nach oben“ / „Nach unten“ (#977): the menu twin of the drag, also for the keyboard
+        AppMenuItem { text: qsTr("Nach oben"); icon.name: "go-up" // arrow.up
+                      enabled: sidebar.menuCategory !== null && sidebar.menuCanShiftUp
+                      onTriggered: SidebarModel.shiftCategory(sidebar.menuCategory.id, -1) }
+        AppMenuItem { text: qsTr("Nach unten"); icon.name: "go-down" // arrow.down (SF maps it to the income icon)
+                      enabled: sidebar.menuCategory !== null && sidebar.menuCanShiftDown
+                      onTriggered: SidebarModel.shiftCategory(sidebar.menuCategory.id, 1) }
         AppMenuItem { text: qsTr("Duplizieren"); icon.name: SF.icon("plus.square.on.square"); onTriggered: SidebarModel.duplicateCategory(sidebar.menuCategory.id) }
         AppMenuSeparator {}
         AppMenuItem { text: qsTr("Neue Unterkategorie …"); icon.name: SF.icon("plus"); onTriggered: AppModel.newCategoryRequest = { parent: sidebar.menuCategory.id } }
@@ -558,42 +622,30 @@ Rectangle {
         AppMenuItem { text: qsTr("Alle Buchungen als gelesen markieren"); icon.name: SF.icon("checkmark.circle"); enabled: AppModel.newCount > 0
                    onTriggered: AppModel.markAllChecked(AppModel.allAccounts.map(a => a.id)) }
     }
+    // „Belege & Postbox“ (#934): the unread documents
+    AppMenu {
+        id: documentsMenu
+        AppMenuItem { text: qsTr("Alle als gelesen markieren"); enabled: SidebarModel.unseenDocumentCount > 0
+                      onTriggered: AppModel.markAllDocumentsSeen() }
+    }
     // pending bank logins ("Neue Bankzugänge")
     AppMenu {
         id: connectionMenu
         AppMenuItem { text: qsTr("Bankzugang entfernen …"); icon.name: SF.icon("trash")
                    onTriggered: AppModel.sidebarDialog = { kind: "removeConnection", id: sidebar.menuConnection.id } }
     }
-    // same order as a group's menu: rename, look, place – then what only
-    // accounts have – then archive / delete
+    // SidebarView.swift › accountMenu (#981): name, symbol & colour, Kontoart, Kontoinhaber,
+    // Startsaldo and the rest of the account's data live in the settings sheet; the menu
+    // keeps the actions
     AppMenu {
         id: accountMenu
         readonly property var a: sidebar.menuAccount
         readonly property bool archived: a !== null && a.archived_unix !== null
-        // „Konto bearbeiten …“ (#639): name, owner, kind and note in one sheet
-        AppMenuItem { text: qsTr("Konto bearbeiten …"); icon.name: SF.icon("square.and.pencil"); onTriggered: accountEditSheet.edit(accountMenu.a.id) }
-        AppMenuItem { text: qsTr("Umbenennen …"); icon.name: SF.icon("pencil"); onTriggered: AppModel.groupDialog = { kind: "renameAccount", account: accountMenu.a } }
-        AppMenuItem { text: qsTr("Symbol && Farbe …"); icon.name: SF.icon("paintpalette"); onTriggered: AppModel.iconColorTarget = { type: "account", id: accountMenu.a.id } }
+        /// takes manual bookings (#679): not archived, no bank connection
+        readonly property bool offline: a !== null && !archived && OfflineAccounts.isOffline(a.id)
+        AppMenuItem { text: qsTr("Einstellungen …"); icon.name: SF.icon("gearshape"); onTriggered: accountSettingsView.edit(accountMenu.a.id) }
         // WP3: CategoryChipToggle (#336, #604) – the tick follows the stored value
         CategoryChipToggle { account: accountMenu.a }
-        AppMenu {
-            id: kindMenu
-            title: qsTr("Kontoart ändern …")
-            icon.name: SF.icon("list.bullet.rectangle")
-            Instantiator {
-                model: AppModel.accountKindChoices
-                delegate: AppMenuItem {
-                    required property var modelData
-                    // the current kind as "✓ Girokonto", like the Mac menu
-                    text: accountMenu.a !== null && accountMenu.a.kind === modelData.id ? "✓ " + modelData.text : modelData.text
-                    onTriggered: AppModel.setAccountKind(accountMenu.a.id, modelData.id)
-                }
-                onObjectAdded: (index, object) => kindMenu.insertItem(index, object)
-                onObjectRemoved: (index, object) => kindMenu.removeItem(object)
-            }
-        }
-        AppMenuItem { text: qsTr("Kontoinhaber …"); icon.name: SF.icon("person.crop.circle")
-                   onTriggered: AppModel.groupDialog = { kind: "editOwner", account: accountMenu.a } }
         // AccountGroupMenu: named like the group menu's entry, so both menus read the same
         AppMenu {
             id: accountMoveMenu
@@ -621,7 +673,7 @@ Rectangle {
         }
         AppMenuSeparator {}
         AppMenuItem { text: qsTr("Alle Buchungen als gelesen markieren"); icon.name: SF.icon("checkmark.circle"); onTriggered: AppModel.markAllChecked([accountMenu.a.id]) }
-        // ManualLoanAccountMenu + OpeningBalanceMenuItem (ManualLoansUI.swift, OpeningBalanceUI.swift)
+        // ManualLoanAccountMenu (ManualLoansUI.swift)
         AppMenuItem { readonly property bool shown: AppModel.isEditableManualLoan(accountMenu.a)
                    visible: shown; height: shown ? implicitHeight : 0
                    text: qsTr("Darlehen bearbeiten …"); icon.name: SF.icon("pencil")
@@ -631,14 +683,19 @@ Rectangle {
                    text: qsTr("Stand neu setzen …"); icon.name: SF.icon("calendar.badge.clock")
                    onTriggered: AppModel.openLoanEditor("anchor", accountMenu.a.id) }
         AppMenuSeparator { visible: AppModel.isEditableManualLoan(accountMenu.a); height: visible ? implicitHeight : 0 }
-        AppMenuItem { readonly property bool shown: AppModel.canSetOpeningBalance(accountMenu.a)
+        // OfflineAccountMenuItems (OfflineAccountsUI.swift, #679)
+        AppMenuItem { readonly property bool shown: accountMenu.offline
                    visible: shown; height: shown ? implicitHeight : 0
-                   text: qsTr("Startsaldo …"); icon.name: SF.icon("clock.arrow.circlepath")
-                   onTriggered: AppModel.openOpeningBalance(accountMenu.a) }
+                   text: qsTr("Neue Buchung …"); icon.name: SF.icon("plus")
+                   onTriggered: OfflineAccounts.openManualBooking(accountMenu.a.id) }
+        AppMenuItem { readonly property bool shown: accountMenu.offline
+                   visible: shown; height: shown ? implicitHeight : 0
+                   text: qsTr("Saldo korrigieren …"); icon.name: SF.icon("equal.circle")
+                   onTriggered: OfflineAccounts.openBalanceCorrection(accountMenu.a.id) }
         AppMenuItem {
             readonly property var conn: sidebar.menuConnectionOfAccount
             visible: conn !== null; height: visible ? implicitHeight : 0
-            text: conn ? qsTr("%1 abrufen").arg(AppModel.menuText(accountMenu.a.name)) : ""
+            text: conn ? qsTr("%1 abrufen").arg(AppModel.menuText(AppModel.masking(accountMenu.a.name))) : ""
             icon.name: SF.icon("arrow.triangle.2.circlepath")
             enabled: conn !== null && AppModel.bankingGate(conn) === null
             onTriggered: AppModel.requestSync(conn)
@@ -723,7 +780,7 @@ Rectangle {
                  && AppModel.groupSyncConnections(group).some(c => AppModel.bankingGate(c) === null)
         onTriggered: AppModel.requestSyncGroup(group)
     }
-    AccountEditSheet { id: accountEditSheet }
+    AccountSettingsView { id: accountSettingsView }
     // the "Symbol & Farbe" popover, anchored next to the category row
     IconColorPopover {
         id: iconPopover

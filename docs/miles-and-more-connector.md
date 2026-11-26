@@ -92,8 +92,9 @@ The SEPA account list (`HKSPA`) is empty ("keine Einträge").
 | TAN medium editable on an existing connection | `ConnectionsUI.swift` |
 | Directory row, search words | `data/fints_directory.tsv`, `bank_directory.rs` |
 | Add-form hints, required TAN medium, colour and monogram | `FinTsAddForm.swift`, `Formatting.swift` |
-| First-fetch period (90 days / 1 year / 2 years) in the settings | `SettingsView.swift` (core setting `sync.days_back`) |
+| First-fetch period (90 days / 1 year / 2 years / Maximum) in the settings | `SettingsView.swift` (core setting `sync.days_back`) |
 | Bank matrix row | `catalog.rs` (`BANK_MATRIX`), README regenerated with `scripts/sync_docs.py` |
+| Database import: card logins filed under a pseudo bank code get this bank code, a FinTS login named after the card, card numbers decide between several cards | `is_deutsche_bank_card_login`, `SrcBank::card_only`, `adopt_account`, `find_existing_accounts` in `importers/moneymoney_db.rs` |
 
 ### `HIKKU` version 1 as parsed
 
@@ -111,9 +112,10 @@ in the live test: every booking group returned was parsed (63 of 63 and 162 of 1
 
 ## Known limitations
 
-- History: at most what the bank keeps (775 days). GiroCrab only goes back further than
-  the default 90 days on the **first** fetch of an account, according to the setting
-  "Zeitraum beim ersten Abruf".
+- History: at most what the bank keeps (775 days; the card request is cut to that period).
+  A new login fetches the period of the setting "Zeitraum beim ersten Abruf" once (default
+  "Maximum", beyond 90 days with an approval in the app), also for accounts that already
+  have bookings; later fetches go on from each account's newest booking.
 - Statement PDFs and the mailbox are not available over FinTS for this bank code. They
   would need a separate web-portal connector; its feasibility has not been looked at.
 - The booking reference of `HIKKU` is not used as de-duplication key yet; bookings are
@@ -134,3 +136,7 @@ in the live test: every booking group returned was parsed (63 of 63 and 162 of 1
 
 - 2026-11-15 – First live test and implementation: TAN medium handling, `HKKKU`
   support, directory entry and UI hints, first-fetch period setting, approval wait fix.
+- 2026-11-18 – Database import (#1017): card logins stored under the pseudo bank code
+  "Miles & More Credit Card" are connected through this bank code; logins of the former
+  issuer keep no connector. Several cards on one login are matched by card number on
+  the first fetch.

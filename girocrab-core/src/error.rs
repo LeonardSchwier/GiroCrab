@@ -58,14 +58,20 @@ impl CoreError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn protocol(message: impl Into<String>) -> Self {
+        CoreError::Protocol {
+            message: message.into(),
+        }
+    }
 }
 
 impl From<rusqlite::Error> for CoreError {
     fn from(e: rusqlite::Error) -> Self {
-        if let rusqlite::Error::SqliteFailure(err, _) = &e {
-            if err.code == rusqlite::ErrorCode::NotADatabase {
-                return CoreError::WrongKey;
-            }
+        if let rusqlite::Error::SqliteFailure(err, _) = &e
+            && err.code == rusqlite::ErrorCode::NotADatabase
+        {
+            return CoreError::WrongKey;
         }
         CoreError::Database {
             message: e.to_string(),
@@ -75,17 +81,17 @@ impl From<rusqlite::Error> for CoreError {
 
 impl From<reqwest::Error> for CoreError {
     fn from(e: reqwest::Error) -> Self {
+        // The URL of a failed request can carry session paths or query
+        // strings (FNZ): it never ends up in the error text, only the cause.
         CoreError::Network {
-            message: e.to_string(),
+            message: e.without_url().to_string(),
         }
     }
 }
 
 impl From<serde_json::Error> for CoreError {
     fn from(e: serde_json::Error) -> Self {
-        CoreError::Protocol {
-            message: format!("JSON: {e}"),
-        }
+        CoreError::protocol(format!("JSON: {e}"))
     }
 }
 

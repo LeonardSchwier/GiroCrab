@@ -9,8 +9,11 @@ mod bridge;
 mod bug_report;
 mod dispatch;
 mod i18n;
+mod local_api;
 mod ocr;
 mod qr_scan;
+mod refunds;
+mod search_terms;
 mod sessions;
 mod vault_key;
 mod web_login;
@@ -21,7 +24,7 @@ use std::os::unix::ffi::OsStrExt;
 
 use cxx_qt_lib::{QQmlApplicationEngine, QQuickStyle, QString, QUrl};
 
-extern "C" {
+unsafe extern "C" {
     fn girocrab_prepare_qt();
     fn girocrab_create_app(argc: c_int, argv: *mut *mut c_char, version: *const c_char);
     fn girocrab_exec_app() -> c_int;
@@ -62,6 +65,9 @@ fn main() {
     }
     // SAFETY: the application object exists (created above).
     let code = unsafe { girocrab_exec_app() };
+    // Einstellungen › Analyse (#136): the socket file goes before `_exit` (a file left by a
+    // crash is replaced on the next start, see the core's lock file).
+    local_api::stop();
     // Normal quit: the decrypted QuickLook copies go too (start-up cleans up after a crash).
     dispatch::remove_quicklook_files();
     bug_report::clear_temp_dir();
@@ -69,10 +75,10 @@ fn main() {
     // SAFETY: the engine is dropped; nothing uses the application any more.
     unsafe { girocrab_destroy_app() };
     // „App zurücksetzen“: QML `Settings` may have written values back while closing.
-    if dispatch::app_was_reset() {
-        if let Err(e) = dispatch::remove_settings_file() {
-            eprintln!("GiroCrab: {e}");
-        }
+    if dispatch::app_was_reset()
+        && let Err(e) = dispatch::remove_settings_file()
+    {
+        eprintln!("GiroCrab: {e}");
     }
     // "Neu starten" (Settings › Allgemein › Sprache): the settings are written, start anew.
     i18n::relaunch_if_requested();

@@ -4,14 +4,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::bpd::is_segment_code;
 use super::syntax::{Segment, SegmentBuilder};
-use super::{sepa, BankReply, FinTsConnector, PreparedOrder, Vop};
+use super::{BankReply, FinTsConnector, PreparedOrder, SepaAccount, Vop, sepa};
 use crate::connectors::{
     BatchTransferJob, ConnectContext, PayeeCheck, PayeeMatch, Phase, TransferJob, TransferResult,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::i18n::{tr, trf};
-use crate::iban::normalize_iban;
 
 /// What the bank allows for batch transfers (BPD HICCMS).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,10 +150,8 @@ pub(super) fn vop_parameters(seg: &Segment) -> (String, Vec<String>) {
             let t = v.text();
             if format.is_empty() && t.contains("pain.002") {
                 format = t.to_string();
-            } else if t.len() == 5
-                && t.starts_with("HK")
-                && t[2..].chars().all(|c| c.is_ascii_uppercase())
-            {
+            } else if t.starts_with("HK") && is_segment_code(t) {
+                // The name check covers HK orders only, never DK ones.
                 orders.push(t.to_string());
             }
         }
@@ -189,6 +187,14 @@ pub(super) fn worst_vop_code(candidates: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+/// FinTS VOP 1.02, E.8.1: the flow is steered by return codes, not by the
+/// result in HIVPP. A name deviation (also "not applicable") always comes with
+/// 3945 and 3090; 3091 tells the client that no HKVPA is needed. 3091 without
+/// 3945 and 3090 therefore reports no deviation, even if HIVPP has no result.
+pub(super) fn reports_no_deviation(reply: &BankReply) -> bool {
+    reply.has("3091") && !reply.has("3945") && !reply.has("3090")
+}
+
 /// VOP result code from HIVPP: the single-transaction result (EVPE) and the
 /// codes in the payment status report; the worst one wins.
 pub(super) fn vop_result_code(h: &Segment) -> String {
@@ -207,9 +213,17 @@ impl BankReply {
         let Some(first) = errs.first() else {
             return Ok(());
         };
+        // Name the rejected segment ("[HKCCS #4]"): it tells a refused order
+        // from a refused name-check approval.
         let msg = errs
             .iter()
-            .map(|e| explain_transfer_code(e))
+            .map(|e| {
+                let text = explain_transfer_code(e);
+                match e.1.and_then(|n| self.sent.get(&n).map(|seg| (n, seg))) {
+                    Some((n, seg)) => format!("{text} [{seg} #{n}]"),
+                    None => text,
+                }
+            })
             .collect::<Vec<_>>()
             .join(" / ");
         Err(CoreError::Bank {
@@ -255,8 +269,92 @@ fn explain_transfer_code(c: &(String, Option<u32>, String, Vec<String>)) -> Stri
     }
 }
 
+/// The single transfer (HKCCS, HKCSE or HKIPZ) as it is sent: the pain.001 from
+/// the job and the source account. Pure, so `invariant_tests` can follow the
+/// values from the job to the segment bytes.
+pub(super) fn transfer_order(
+    job: &TransferJob,
+    acc: &SepaAccount,
+    seg_id: &'static str,
+    version: sepa::PainVersion,
+) -> CoreResult<PreparedOrder> {
+    let header = sepa::PainHeader::new(&job.source_owner);
+    let exec = job
+        .execution_date
+        .as_deref()
+        .unwrap_or(sepa::IMMEDIATE_EXECUTION_DATE);
+    let xml = sepa::build_pain001(&sepa::Pain001 {
+        message_id: &header.message_id,
+        created: &header.created,
+        execution_date: exec,
+        debtor_name: header.owner,
+        debtor_iban: &acc.iban,
+        debtor_bic: &acc.bic,
+        creditor_name: &job.recipient_name,
+        creditor_iban: &job.recipient_iban,
+        creditor_bic: job.recipient_bic.as_deref(),
+        amount_cents: job.amount_cents,
+        purpose: &job.purpose,
+        version,
+        end_to_end_id: &job.end_to_end_id,
+        instant: job.instant,
+    })?;
+    Ok(PreparedOrder {
+        seg_id,
+        kti: FinTsConnector::kti(acc),
+        descriptor: version.descriptor(),
+        xml,
+        instant: job.instant,
+        recipient_name: job.recipient_name.clone(),
+        recipient_iban: job.recipient_iban.clone(),
+        batch: None,
+        debit_layout: None,
+        standing: None,
+    })
+}
+
+/// The batch transfer (HKCCM) as it is sent, see [`transfer_order`].
+pub(super) fn batch_order(
+    job: &BatchTransferJob,
+    acc: &SepaAccount,
+    version: sepa::PainVersion,
+) -> CoreResult<PreparedOrder> {
+    let header = sepa::PainHeader::new(&job.source_owner);
+    let exec = job
+        .execution_date
+        .as_deref()
+        .unwrap_or(sepa::IMMEDIATE_EXECUTION_DATE);
+    let xml = sepa::build_pain001_batch(&sepa::Pain001Batch {
+        message_id: &header.message_id,
+        created: &header.created,
+        execution_date: exec,
+        debtor_name: header.owner,
+        debtor_iban: &acc.iban,
+        debtor_bic: &acc.bic,
+        payments: &job.payments,
+        version,
+        batch_booking: job.batch_booking,
+    })?;
+    let total = sepa::batch_total_cents(&job.payments).ok_or_else(|| CoreError::InvalidInput {
+        message: tr("Die Summe der Sammelüberweisung ist zu groß.").into(),
+    })?;
+    Ok(PreparedOrder {
+        seg_id: "HKCCM",
+        kti: FinTsConnector::kti(acc),
+        descriptor: version.descriptor(),
+        xml,
+        instant: false,
+        recipient_name: String::new(),
+        recipient_iban: String::new(),
+        batch: Some((total, !job.batch_booking)),
+        debit_layout: None,
+        standing: None,
+    })
+}
+
 impl FinTsConnector {
-    /// Sends HKCCS (regular), HKCSE (scheduled) or HKIPZ (instant) + HKTAN
+    /// Sends HKCCS (regular), HKCUM (to an own account when the UPD allows only
+    /// that, #1513), HKCSE (scheduled) or HKIPZ (instant) + HKTAN
     /// process 4. An instant order the bank does not offer ends as
     /// `TransferResult::InstantDeclined` without sending anything. There is
     /// never an automatic second order.
@@ -270,6 +368,10 @@ impl FinTsConnector {
             "HKIPZ"
         } else if job.execution_date.is_some() {
             "HKCSE"
+        } else if self.bank_supports("HKCUM")
+            && self.is_upd_internal_transfer(&job.source_iban, &job.recipient_iban)
+        {
+            "HKCUM"
         } else {
             "HKCCS"
         };
@@ -292,42 +394,15 @@ impl FinTsConnector {
             }
             return Err(not_allowed());
         }
-        let sec = self.sec();
-        if sec == "999" {
-            return Err(CoreError::Bank {
-                code: "HKTAN".into(),
-                message: tr("Für Überweisungen ist ein TAN-Verfahren nötig; es wurde keines gefunden. Bitte zuerst eine Synchronisation mit TAN-Verfahren durchführen.").into(),
-            });
-        }
-        let mut errors = Vec::new();
-        let accounts = self.account_list(ctx, &mut errors).await;
-        let want = normalize_iban(&job.source_iban);
-        let (acc, upd) = accounts
-            .into_iter()
-            .find(|(a, _)| normalize_iban(&a.iban) == want)
-            .ok_or_else(|| CoreError::NotFound {
-                what: trf(
-                    "Konto {0} bei der Bank{1}",
-                    &[
-                        &job.source_iban,
-                        &if errors.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", errors.join(" / "))
-                        },
-                    ],
-                ),
-            })?;
-        if let Some(u) = &upd {
-            if !u.allowed.is_empty() && !u.allowed.contains(seg_id) {
-                if instant {
-                    return Ok(self.decline_instant(tr(
-                        "Für dieses Konto ist die Echtzeitüberweisung per FinTS nicht freigeschaltet.",
-                    )));
-                }
-                return Err(not_allowed());
+        self.require_tan_method(tr("Für Überweisungen ist ein TAN-Verfahren nötig; es wurde keines gefunden. Bitte zuerst eine Synchronisation mit TAN-Verfahren durchführen."))?;
+        let Some(acc) = self.source_account(ctx, &job.source_iban, seg_id).await? else {
+            if instant {
+                return Ok(self.decline_instant(tr(
+                    "Für dieses Konto ist die Echtzeitüberweisung per FinTS nicht freigeschaltet.",
+                )));
             }
-        }
+            return Err(not_allowed());
+        };
         let version = match self.pain_version(seg_id) {
             Some(v) => v,
             None => {
@@ -336,57 +411,7 @@ impl FinTsConnector {
                 )))
             }
         };
-        let (date, time) = Self::now();
-        let created = format!(
-            "{}-{}-{}T{}:{}:{}",
-            &date[..4],
-            &date[4..6],
-            &date[6..],
-            &time[..2],
-            &time[2..4],
-            &time[4..]
-        );
-        let exec = job
-            .execution_date
-            .clone()
-            .unwrap_or_else(|| format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]));
-        let msg_id = format!("GC{date}{time}{:08X}", rand::random::<u32>());
-        let owner = if job.source_owner.trim().is_empty() {
-            "Kontoinhaber"
-        } else {
-            job.source_owner.trim()
-        };
-        let xml = sepa::build_pain001(&sepa::Pain001 {
-            message_id: &msg_id,
-            created: &created,
-            execution_date: &exec,
-            debtor_name: owner,
-            debtor_iban: &acc.iban,
-            debtor_bic: &acc.bic,
-            creditor_name: &job.recipient_name,
-            creditor_iban: &job.recipient_iban,
-            creditor_bic: job.recipient_bic.as_deref(),
-            amount_cents: job.amount_cents,
-            purpose: &job.purpose,
-            version,
-            end_to_end_id: &job.end_to_end_id,
-            instant,
-        })?;
-        self.order = Some(PreparedOrder {
-            seg_id,
-            kti: Self::kti(&acc),
-            descriptor: version.descriptor(),
-            xml,
-            instant,
-            recipient_name: job.recipient_name.clone(),
-            recipient_iban: job.recipient_iban.clone(),
-            batch: None,
-            debit_layout: None,
-            standing: None,
-        });
-        self.vop_id = None;
-        self.vop_with_tan = false;
-        self.vop_pending = None;
+        self.order = Some(transfer_order(job, &acc, seg_id, version)?);
         let needs_vop =
             !self.st.vop_format.is_empty() && self.st.vop_orders.iter().any(|o| o == seg_id);
         if !needs_vop {
@@ -408,6 +433,7 @@ impl FinTsConnector {
             }
             return self.finish_submit(&reply);
         };
+        self.keep_challenge_on_3091(&reply, polled)?;
         // Anything but a clean match: nothing more is sent until the user
         // confirms (`confirm_payee`); cancelling ends the dialog instead.
         self.vop_pending = Some(check.result);
@@ -449,82 +475,37 @@ impl FinTsConnector {
                 message: tr("Die Bank bucht Sammelüberweisungen nur als Sammelbuchung.").into(),
             });
         }
-        if self.sec() == "999" {
-            return Err(CoreError::Bank {
-                code: "HKTAN".into(),
-                message: tr("Für Überweisungen ist ein TAN-Verfahren nötig; es wurde keines gefunden. Bitte zuerst eine Synchronisation mit TAN-Verfahren durchführen.").into(),
-            });
-        }
-        let mut errors = Vec::new();
-        let accounts = self.account_list(ctx, &mut errors).await;
-        let want = normalize_iban(&job.source_iban);
-        let (acc, upd) = accounts
-            .into_iter()
-            .find(|(a, _)| normalize_iban(&a.iban) == want)
-            .ok_or_else(|| CoreError::NotFound {
-                what: trf(
-                    "Konto {0} bei der Bank{1}",
-                    &[&job.source_iban, &String::new()],
-                ),
-            })?;
-        if let Some(u) = &upd {
-            if !u.allowed.is_empty() && !u.allowed.contains(seg_id) {
-                return Err(not_allowed());
-            }
-        }
-        let version = self.pain_version(seg_id).unwrap_or(sepa::PainVersion::V03);
-        let (date, time) = Self::now();
-        let created = format!(
-            "{}-{}-{}T{}:{}:{}",
-            &date[..4],
-            &date[4..6],
-            &date[6..],
-            &time[..2],
-            &time[2..4],
-            &time[4..]
-        );
-        let exec = job
-            .execution_date
-            .clone()
-            .unwrap_or_else(|| format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]));
-        let msg_id = format!("GC{date}{time}{:08X}", rand::random::<u32>());
-        let owner = if job.source_owner.trim().is_empty() {
-            "Kontoinhaber"
-        } else {
-            job.source_owner.trim()
+        self.require_tan_method(tr("Für Überweisungen ist ein TAN-Verfahren nötig; es wurde keines gefunden. Bitte zuerst eine Synchronisation mit TAN-Verfahren durchführen."))?;
+        let Some(acc) = self.source_account(ctx, &job.source_iban, seg_id).await? else {
+            return Err(not_allowed());
         };
-        let xml = sepa::build_pain001_batch(&sepa::Pain001Batch {
-            message_id: &msg_id,
-            created: &created,
-            execution_date: &exec,
-            debtor_name: owner,
-            debtor_iban: &acc.iban,
-            debtor_bic: &acc.bic,
-            payments: &job.payments,
-            version,
-            batch_booking: job.batch_booking,
-        })?;
-        let total =
-            sepa::batch_total_cents(&job.payments).ok_or_else(|| CoreError::InvalidInput {
-                message: tr("Die Summe der Sammelüberweisung ist zu groß.").into(),
-            })?;
-        self.order = Some(PreparedOrder {
-            seg_id,
-            kti: Self::kti(&acc),
-            descriptor: version.descriptor(),
-            xml,
-            instant: false,
-            recipient_name: String::new(),
-            recipient_iban: String::new(),
-            batch: Some((total, !job.batch_booking)),
-            debit_layout: None,
-            standing: None,
-        });
+        let version = self.pain_version(seg_id).unwrap_or(sepa::PainVersion::V03);
+        self.order = Some(batch_order(job, &acc, version)?);
+        let reply = self.send_order(ctx, Vop::None).await?;
+        self.finish_submit(&reply)
+    }
+
+    /// Starts a new order: nothing of the previous one, its name check included, carries over.
+    pub(super) fn begin_order(&mut self) {
+        self.transferring = true;
+        self.result = TransferResult::default();
+        self.order_submitted = false;
+        self.order = None;
         self.vop_id = None;
         self.vop_with_tan = false;
         self.vop_pending = None;
-        let reply = self.send_order(ctx, Vop::None).await?;
-        self.finish_submit(&reply)
+        self.vop_resume = None;
+    }
+
+    /// Orders need a two-step TAN method; `sec()` is 999 (one-step) while none is known.
+    pub(super) fn require_tan_method(&self, refusal: &'static str) -> CoreResult<()> {
+        if self.sec() == "999" {
+            return Err(CoreError::Bank {
+                code: "HKTAN".into(),
+                message: refusal.into(),
+            });
+        }
+        Ok(())
     }
 
     /// Instant not possible before anything was sent: nothing to approve.
@@ -667,8 +648,9 @@ impl FinTsConnector {
         Ok((reply, polled))
     }
 
-    /// Reads HIVPP. `None` = go on to the approval (match, or the bank did
-    /// not report a result); `Some` = the user has to confirm.
+    /// Reads HIVPP. `None` = go on to the approval (match, no HIVPP, or 3091
+    /// without a result and without 3945/3090, see `reports_no_deviation`);
+    /// `Some` = the user has to confirm.
     pub(super) fn evaluate_payee(&mut self, reply: &BankReply) -> Option<PayeeCheck> {
         let h = reply.first("HIVPP")?;
         self.vop_id = h.binary(1).map(|b| b.to_vec()).filter(|b| !b.is_empty());
@@ -682,7 +664,15 @@ impl FinTsConnector {
             _ => PayeeMatch::NotPossible,
         };
         if result == PayeeMatch::Match && !reply.has("3945") {
-            self.vop_with_tan = self.vop_id.is_some();
+            // 3091: the bank needs no HKVPA; the challenge is simply answered.
+            self.vop_with_tan = self.vop_id.is_some() && !reply.has("3091");
+            return None;
+        }
+        if code.is_empty() && reports_no_deviation(reply) {
+            // The bank sent no result (allowed, FinTS VOP 1.02 C.10.7.1.1) but
+            // said by return code that none is needed: no name-check dialog.
+            // The order is already with the bank, its challenge is answered.
+            self.vop_with_tan = false;
             return None;
         }
         Some(PayeeCheck {
@@ -696,6 +686,29 @@ impl FinTsConnector {
             }),
             notice: opt(h.get(7, 0), VOP_TEXT_MAX),
         })
+    }
+
+    /// 3091 ("VOP-Ausführungsauftrag nicht benötigt"): the bank needs no HKVPA
+    /// and has accepted the order already; its challenge (e.g. the app
+    /// approval, 3955) is in this reply. Keeps it for the user's confirmation:
+    /// HKVPA + the order sent again would be a second order in the same dialog,
+    /// which banks reject (9010 on the order). Not after polling, where the
+    /// last reply answers a bare HKVPP and carries no challenge.
+    pub(super) fn keep_challenge_on_3091(
+        &mut self,
+        reply: &BankReply,
+        polled: bool,
+    ) -> CoreResult<()> {
+        if polled || !reply.has("3091") || reply.has("3945") {
+            return Ok(());
+        }
+        self.vop_with_tan = false;
+        self.vop_resume = match self.challenge_from(reply)? {
+            Some(Phase::Challenge(c)) => Some((c, false)),
+            Some(Phase::Pending(c)) => Some((c, true)),
+            _ => None,
+        };
+        Ok(())
     }
 
     /// A clear rejection: the bank did not execute the order, so the session
@@ -748,6 +761,15 @@ impl FinTsConnector {
         if self.vop_pending.take().is_none() {
             return Err(CoreError::InvalidInput {
                 message: "no name check awaiting confirmation".into(),
+            });
+        }
+        // The bank asked for no HKVPA (3091) and already issued the challenge
+        // for the order it holds: carry on with that, send nothing.
+        if let Some((challenge, pending)) = self.vop_resume.take() {
+            return Ok(if pending {
+                Phase::Pending(challenge)
+            } else {
+                Phase::Challenge(challenge)
             });
         }
         let reply = self.send_order(ctx, Vop::Execute).await?;

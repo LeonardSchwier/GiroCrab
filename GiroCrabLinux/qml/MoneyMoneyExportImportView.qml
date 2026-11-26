@@ -37,8 +37,8 @@ ColumnLayout {
         preview = null; error = ""; loading = false; importing = false; keepCategories = true; keepNotes = true
         if (AppModel.demoImportPreview) {
             preview = AppModel.demoImportPreview
-            fileName = "MoneyMoney-Umsaetze.xml"
-            filePath = "MoneyMoney-Umsaetze.xml"
+            fileName = "Umsaetze.xml"
+            filePath = "Umsaetze.xml"
             // `--demo-sheet moneymoney` shows the "Übernahme" step (preview + target account)
             step = "options"
         }
@@ -46,8 +46,10 @@ ColumnLayout {
 
     readonly property string subtitle: {
         if (step === "file") return qsTr("Wählen Sie, woher die Daten kommen. Die Originaldaten bleiben unverändert.")
-        if (!preview) return fileName
-        return [fileName, qsTr("%1 neue Buchungen").arg(Fmt.count(preview.new_bookings)), Fmt.yearSpan(preview)]
+        // file names often carry a name
+        const name = AppModel.masking(fileName)
+        if (!preview) return name
+        return [name, qsTr("%1 neue Buchungen").arg(Fmt.count(preview.new_bookings)), Fmt.yearSpan(preview)]
             .filter(x => !!x).join(" · ")
     }
 
@@ -111,8 +113,8 @@ ColumnLayout {
 
     FileDialog {
         id: picker
-        title: qsTr("MoneyMoney-Export auswählen")
-        nameFilters: [qsTr("MoneyMoney-Export (*.csv *.xml *.sta *.mt940 *.txt)"), qsTr("Alle Dateien (*)")]
+        title: qsTr("Exportdatei auswählen")
+        nameFilters: [qsTr("Exportdatei (*.csv *.xml *.sta *.mt940 *.txt)"), qsTr("Alle Dateien (*)")]
         onAccepted: v.load(selectedFile)
     }
 
@@ -138,7 +140,7 @@ ColumnLayout {
                 }
                 FormSection {
                     title: qsTr("Datei")
-                    footers: [qsTr("In MoneyMoney ein einzelnes Konto wählen, alle Umsätze markieren (⌘A) und „Umsätze exportieren …“, dann die Datei auf diesen Rechner kopieren. Nur CSV enthält auch die Kategorien. Sie können die Datei auch hierher ziehen.")]
+                    footers: [qsTr("Erwartet wird eine Exportdatei mit den Umsätzen eines Kontos (CSV, XML, camt.053 oder MT940). Kategorien werden übernommen, sofern die Datei sie enthält. Sie können die Datei auch hierher ziehen.")]
                     ImportFileRow {
                         label: qsTr("Exportdatei")
                         path: v.filePath
@@ -172,7 +174,7 @@ ColumnLayout {
                 spacing: 18
                 FormSection {
                     footers: [v.target === null && v.preview
-                              ? qsTr("Neues Archivkonto „%1“ – der Saldo ist die Summe der Umsätze.").arg(v.preview.suggested_account_name)
+                              ? qsTr("Neues Archivkonto „%1“ – der Saldo ist die Summe der Umsätze.").arg(AppModel.masking(v.preview.suggested_account_name))
                               : (v.preview && v.target !== null && v.target === v.preview.suggested_account_id
                                  ? qsTr("Vorgewählt, weil die Datei zu diesem Konto passt. Bereits vorhandene Buchungen werden nicht doppelt übernommen.") : "")]
                     FormRow {
@@ -182,7 +184,7 @@ ColumnLayout {
                             Layout.preferredWidth: 320
                             textRole: "text"
                             model: [{ id: null, text: qsTr("Neues Konto aus der Datei") }]
-                                .concat(AppModel.allAccounts.map(a => ({ id: a.id, text: a.name + " · " + a.bank_name })))
+                                .concat(AppModel.allAccounts.map(a => ({ id: a.id, text: AppModel.masking(a.name) + " · " + a.bank_name })))
                             currentIndex: Math.max(0, model.findIndex(o => o.id === v.target))
                             onActivated: i => { v.target = model[i].id; v.refreshPreview() }
                         }
@@ -207,6 +209,7 @@ ColumnLayout {
                             horizontalAlignment: Text.AlignRight; wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
                             color: Theme.secondary; font.pixelSize: Theme.body
                             text: v.preview ? v.preview.detected_categories.slice(0, 6).join(", ") + (v.preview.detected_categories.length > 6 ? " …" : "") : ""
+                            Sensitive { labels: true }
                         }
                     }
                 }

@@ -26,7 +26,7 @@ Sheet {
         width: sheet.availableWidth
         spacing: 14
         Text { text: qsTr("Monatsbudget"); font.pixelSize: Theme.title3 + 1; font.weight: Font.Bold; color: Theme.text }
-        Text { text: sheet.category ? sheet.category.path : ""; font.pixelSize: Theme.body; color: Theme.secondary }
+        Text { text: sheet.category ? sheet.category.path : ""; font.pixelSize: Theme.body; color: Theme.secondary; Sensitive { labels: true } }
         RowLayout {
             TextField {
                 id: field
@@ -35,6 +35,7 @@ Sheet {
                 horizontalAlignment: TextInput.AlignRight
                 font.features: { "tnum": 1 }
                 onAccepted: sheet.save()
+                Sensitive { amounts: true; when: parent.text !== "" }
             }
             Text { text: qsTr("€ pro Monat"); font.pixelSize: Theme.body; color: Theme.secondary }
         }

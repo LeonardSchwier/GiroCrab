@@ -8,12 +8,16 @@ use crate::iban::{normalize_iban, validate_iban};
 
 pub const PAIN_DESCRIPTOR: &str = "urn:iso:std:iso:20022:tech:xsd:pain.001.001.03";
 pub const PAIN_09_DESCRIPTOR: &str = "urn:iso:std:iso:20022:tech:xsd:pain.001.001.09";
+/// The German DK profile of `.03`: same layout, own namespace (#1792).
+pub const PAIN_DK_03_DESCRIPTOR: &str = "urn:iso:std:iso:20022:tech:xsd:pain.001.003.03";
 
 /// pain.001 schema version. `.09` is the current format and preferred whenever
 /// a bank offers it; `.03` only for banks that offer nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PainVersion {
     V03,
+    /// `pain.001.003.03`: laid out like `V03`, only the namespace differs.
+    V03Dk,
     V09,
 }
 
@@ -21,6 +25,7 @@ impl PainVersion {
     pub fn descriptor(self) -> &'static str {
         match self {
             PainVersion::V03 => PAIN_DESCRIPTOR,
+            PainVersion::V03Dk => PAIN_DK_03_DESCRIPTOR,
             PainVersion::V09 => PAIN_09_DESCRIPTOR,
         }
     }
@@ -138,6 +143,41 @@ pub fn format_amount(cents: i64) -> String {
     format!("{}.{:02}", cents / 100, cents % 100)
 }
 
+/// `ReqdExctnDt` of a transfer that names no date (HKCCS, HKIPZ, HKCCM). The field is mandatory
+/// in the schema, but these orders run at once and some banks (Postbank, error 9150 "Ausführungsdatum
+/// darf nicht belegt werden") reject today's date there. `1999-01-01` is the FinTS convention for
+/// "no date"; only a scheduled transfer (HKCSE) carries a real one.
+pub(crate) const IMMEDIATE_EXECUTION_DATE: &str = "1999-01-01";
+
+/// Group header fields of every pain.001 and pain.008 message GiroCrab builds.
+pub(crate) struct PainHeader<'a> {
+    pub(crate) message_id: String,
+    /// Local time, `YYYY-MM-DDTHH:MM:SS`.
+    pub(crate) created: String,
+    /// The schema requires a name, so an empty one gets a placeholder.
+    pub(crate) owner: &'a str,
+}
+
+impl<'a> PainHeader<'a> {
+    pub(crate) fn new(owner: &'a str) -> Self {
+        let now = jiff::ZonedDateTime::now();
+        let owner = owner.trim();
+        Self {
+            message_id: format!(
+                "GC{}{:08X}",
+                now.strftime("%Y%m%d%H%M%S"),
+                rand::random::<u32>()
+            ),
+            created: now.strftime("%Y-%m-%dT%H:%M:%S").to_string(),
+            owner: if owner.is_empty() {
+                "Kontoinhaber"
+            } else {
+                owner
+            },
+        }
+    }
+}
+
 pub struct Pain001<'a> {
     pub message_id: &'a str,
     /// ISO date-time, e.g. 2026-11-09T10:15:00
@@ -162,19 +202,18 @@ pub struct Pain001<'a> {
 /// Builds a single-transfer `pain.001` document (UTF-8).
 pub fn build_pain001(p: &Pain001) -> CoreResult<String> {
     if p.amount_cents <= 0 {
-        return Err(CoreError::InvalidInput {
-            message: tr("Der Betrag muss größer als 0 sein.").into(),
-        });
+        return Err(CoreError::invalid(tr("Der Betrag muss größer als 0 sein.")));
+    }
+    if p.amount_cents > MAX_AMOUNT_CENTS {
+        return Err(CoreError::invalid(tr(
+            "Der Betrag ist größer als SEPA erlaubt (999.999.999,99 €).",
+        )));
     }
     if !validate_iban(p.creditor_iban) {
-        return Err(CoreError::InvalidInput {
-            message: tr("Die Empfänger-IBAN ist ungültig.").into(),
-        });
+        return Err(CoreError::invalid(tr("Die Empfänger-IBAN ist ungültig.")));
     }
     if p.creditor_name.trim().is_empty() {
-        return Err(CoreError::InvalidInput {
-            message: tr("Der Empfängername fehlt.").into(),
-        });
+        return Err(CoreError::invalid(tr("Der Empfängername fehlt.")));
     }
     let amount = format_amount(p.amount_cents);
     let msg_id = xml_escape(&clip(p.message_id, 35));
@@ -185,7 +224,7 @@ pub fn build_pain001(p: &Pain001) -> CoreResult<String> {
     let c_iban = normalize_iban(p.creditor_iban);
     // pain.001.001.09 renamed <BIC> to <BICFI> and wraps the execution date.
     let bic_tag = match p.version {
-        PainVersion::V03 => "BIC",
+        PainVersion::V03 | PainVersion::V03Dk => "BIC",
         PainVersion::V09 => "BICFI",
     };
     let d_agent = if validate_bic(p.debtor_bic) {
@@ -207,7 +246,7 @@ pub fn build_pain001(p: &Pain001) -> CoreResult<String> {
     };
     let exec = xml_escape(p.execution_date);
     let exec = match p.version {
-        PainVersion::V03 => exec,
+        PainVersion::V03 | PainVersion::V03Dk => exec,
         PainVersion::V09 => format!("<Dt>{exec}</Dt>"),
     };
     let local_instrument = if p.instant {
@@ -279,9 +318,8 @@ pub fn batch_total_cents(payments: &[BatchPayment]) -> Option<i64> {
 
 /// Checks one payment; the message names the 1-based position.
 pub fn validate_batch_payment(position: usize, p: &BatchPayment) -> CoreResult<()> {
-    let fail = |msg: &str| CoreError::InvalidInput {
-        message: crate::i18n::trf("Zahlung {0}: {1}", &[&position, &msg]),
-    };
+    let fail =
+        |msg: &str| CoreError::invalid(crate::i18n::trf("Zahlung {0}: {1}", &[&position, &msg]));
     if p.name.trim().is_empty() {
         return Err(fail(tr("Der Empfängername fehlt.")));
     }
@@ -303,23 +341,22 @@ pub fn validate_batch_payment(position: usize, p: &BatchPayment) -> CoreResult<(
 /// `CdtTrfTxInf` per payment, `NbOfTxs` and `CtrlSum` in header and block.
 pub fn build_pain001_batch(p: &Pain001Batch) -> CoreResult<String> {
     if p.payments.is_empty() {
-        return Err(CoreError::InvalidInput {
-            message: tr("Die Sammelüberweisung enthält keine Zahlung.").into(),
-        });
+        return Err(CoreError::invalid(tr(
+            "Die Sammelüberweisung enthält keine Zahlung.",
+        )));
     }
     for (i, pay) in p.payments.iter().enumerate() {
         validate_batch_payment(i + 1, pay)?;
     }
-    let total = batch_total_cents(p.payments).ok_or_else(|| CoreError::InvalidInput {
-        message: tr("Die Summe der Sammelüberweisung ist zu groß.").into(),
-    })?;
+    let total = batch_total_cents(p.payments)
+        .ok_or_else(|| CoreError::invalid(tr("Die Summe der Sammelüberweisung ist zu groß.")))?;
     let sum = format_amount(total);
     let count = p.payments.len();
     let msg_id = xml_escape(&clip(p.message_id, 35));
     let debtor = xml_escape(&clip(p.debtor_name, 70));
     let d_iban = normalize_iban(p.debtor_iban);
     let bic_tag = match p.version {
-        PainVersion::V03 => "BIC",
+        PainVersion::V03 | PainVersion::V03Dk => "BIC",
         PainVersion::V09 => "BICFI",
     };
     let d_agent = if validate_bic(p.debtor_bic) {
@@ -329,7 +366,7 @@ pub fn build_pain001_batch(p: &Pain001Batch) -> CoreResult<String> {
     };
     let exec = xml_escape(p.execution_date);
     let exec = match p.version {
-        PainVersion::V03 => exec,
+        PainVersion::V03 | PainVersion::V03Dk => exec,
         PainVersion::V09 => format!("<Dt>{exec}</Dt>"),
     };
     let mut txs = String::new();
@@ -411,6 +448,19 @@ mod tests {
     }
 
     #[test]
+    fn pain001_rejects_amounts_above_the_sepa_limit() {
+        let mut p = sample("A", "x");
+        p.amount_cents = MAX_AMOUNT_CENTS;
+        let xml = build_pain001(&p).unwrap();
+        assert!(xml.contains("<InstdAmt Ccy=\"EUR\">999999999.99</InstdAmt>"));
+        p.amount_cents = MAX_AMOUNT_CENTS + 1;
+        assert!(matches!(
+            build_pain001(&p),
+            Err(CoreError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
     fn pain001_scheduled_date_and_instant_variant() {
         let mut p = sample("A", "x");
         p.execution_date = "2027-01-15";
@@ -441,6 +491,20 @@ mod tests {
         assert!(xml.contains("<BICFI>BYLADEM1001</BICFI>"));
         assert!(xml.contains("<BICFI>COBADEFFXXX</BICFI>"));
         assert!(!xml.contains("<BIC>"));
+    }
+
+    #[test]
+    fn immediate_orders_carry_the_placeholder_date() {
+        assert!(jiff::civil::Date::strptime("%Y-%m-%d", IMMEDIATE_EXECUTION_DATE).is_ok());
+        let mut p = sample("Max Muster", "Miete");
+        p.execution_date = IMMEDIATE_EXECUTION_DATE;
+        let xml = build_pain001(&p).unwrap();
+        assert!(xml.contains("<ReqdExctnDt>1999-01-01</ReqdExctnDt>"));
+        p.version = PainVersion::V09;
+        p.instant = true;
+        let xml = build_pain001(&p).unwrap();
+        assert!(xml.contains("<ReqdExctnDt><Dt>1999-01-01</Dt></ReqdExctnDt>"));
+        assert!(!xml.contains("2026-11-09</Dt>"));
     }
 
     #[test]
@@ -599,6 +663,36 @@ mod tests {
         let xml = build_pain001_batch(&b).unwrap();
         assert!(xml.contains("<ReqdExctnDt><Dt>2026-11-09</Dt></ReqdExctnDt>"));
         assert!(xml.contains("<CdtrAgt><FinInstnId><BICFI>COBADEFFXXX</BICFI>"));
+    }
+
+    #[test]
+    fn batch_without_a_date_carries_the_placeholder_and_a_dated_one_keeps_its_date() {
+        let pays = [pay("A", "DE89370400440532013000", 100, "E1")];
+        let mut b = batch(&pays, true);
+        b.execution_date = IMMEDIATE_EXECUTION_DATE;
+        let xml = build_pain001_batch(&b).unwrap();
+        assert!(xml.contains("<ReqdExctnDt>1999-01-01</ReqdExctnDt>"));
+        b.execution_date = "2027-01-15";
+        let xml = build_pain001_batch(&b).unwrap();
+        assert!(xml.contains("<ReqdExctnDt>2027-01-15</ReqdExctnDt>"));
+        assert!(!xml.contains("1999-01-01"));
+        b.version = PainVersion::V09;
+        let xml = build_pain001_batch(&b).unwrap();
+        assert!(xml.contains("<ReqdExctnDt><Dt>2027-01-15</Dt></ReqdExctnDt>"));
+    }
+
+    #[test]
+    fn a_scheduled_transfer_keeps_its_real_date() {
+        // HKCSE: the job names a date, so the 1999-01-01 placeholder must not appear.
+        let mut p = sample("Max Muster", "Miete");
+        p.execution_date = "2027-01-15";
+        let xml = build_pain001(&p).unwrap();
+        assert!(xml.contains("<ReqdExctnDt>2027-01-15</ReqdExctnDt>"));
+        assert!(!xml.contains("1999-01-01"));
+        p.version = PainVersion::V09;
+        let xml = build_pain001(&p).unwrap();
+        assert!(xml.contains("<ReqdExctnDt><Dt>2027-01-15</Dt></ReqdExctnDt>"));
+        assert!(!xml.contains("1999-01-01"));
     }
 
     #[test]

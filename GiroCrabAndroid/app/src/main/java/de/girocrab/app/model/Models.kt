@@ -25,6 +25,8 @@ data class Account(
     val balanceCents: Long,
     val currency: String = "EUR",
     val hidden: Boolean = false,
+    /** The core's `inTotal`: false = the account is excluded from overall sums. */
+    val includeInTotal: Boolean = true,
     /** Account holder (#587). */
     val holder: String = "",
 )
@@ -55,6 +57,8 @@ data class Booking(
     val isTransfer: Boolean = false,
     val transferReason: String = "",
     val counterpartyIban: String = "",
+    /** Separate from [purpose] in the core; rules can match it on its own. */
+    val bookingText: String = "",
 ) {
     val isIncome get() = amountCents > 0
 }
@@ -70,9 +74,14 @@ data class Category(
 
 data class Tag(val id: String, val name: String, val colorHex: Long = 0xFF1976D2)
 
-enum class RuleField { Counterparty, Purpose, Iban, Amount, Any }
+enum class RuleField { Counterparty, Purpose, BookingText, Iban, Amount, Any }
 
-enum class MatchKind { Contains, Equals, StartsWith, Regex }
+/**
+ * Match kinds of a rule. [Keyword] is the core's keyword list ("REWE|EDEKA|ALDI", also comma or one
+ * per line), [Expression] its own search language — the app evaluates every kind except
+ * [Expression], which only the core can evaluate.
+ */
+enum class MatchKind { Contains, Equals, StartsWith, Regex, Keyword, Expression }
 
 data class Rule(
     val id: String,
@@ -82,30 +91,84 @@ data class Rule(
     val categoryId: String?,
     val tagIds: Set<String> = emptySet(),
     val enabled: Boolean = true,
-    /** Optional range on |amount| in cents (#759). */
+    /** Range on the signed amount in cents, like the core: expenses are negative. */
     val minCents: Long? = null,
     val maxCents: Long? = null,
+    /** The core's `case_sensitive`; its default is case-insensitive. */
+    val caseSensitive: Boolean = false,
+    /** Empty means every account, as in the core. */
+    val accountIds: Set<String> = emptySet(),
 ) {
+    private fun haystacks(b: Booking): List<String> = when (field) {
+        RuleField.Counterparty -> listOf(b.counterparty)
+        RuleField.Purpose -> listOf(b.purpose)
+        RuleField.BookingText -> listOf(b.bookingText)
+        RuleField.Amount -> listOf((b.amountCents / 100.0).toString())
+        // The core matches counterparty, purpose and booking text separately.
+        RuleField.Any -> listOf(b.counterparty, b.purpose, b.bookingText)
+        RuleField.Iban -> listOf(b.counterpartyIban.filterNot { it.isWhitespace() })
+    }
+
+    /**
+     * No pattern at all. A regex keeps its whitespace like the core (`" "` matches a literal
+     * space); only the string match kinds treat a blank pattern as missing.
+     */
+    private val hasNoPattern: Boolean
+        get() = if (matchKind == MatchKind.Regex) pattern.isEmpty() else pattern.isBlank()
+
+    /**
+     * The pattern compiled once per rule. The core uses Rust's regex syntax; its named groups
+     * `(?P<name>…)` are written `(?<name>…)` in Java. Null when Java still rejects the pattern.
+     */
+    private val compiledRegex: kotlin.text.Regex? by lazy {
+        if (matchKind != MatchKind.Regex || pattern.isEmpty()) return@lazy null
+        runCatching {
+            Regex(
+                pattern.replace("(?P<", "(?<"),
+                if (caseSensitive) emptySet() else setOf(RegexOption.IGNORE_CASE),
+            )
+        }.getOrNull()
+    }
+
+    /**
+     * False when the app cannot evaluate this rule (an [MatchKind.Expression] or a regex Java does
+     * not accept). Its non-matches here say nothing about the core, so the UI has to say so.
+     */
+    val evaluableHere: Boolean
+        get() = when (matchKind) {
+            MatchKind.Expression -> false
+            MatchKind.Regex -> pattern.isEmpty() || compiledRegex != null
+            else -> true
+        }
+
     fun matches(b: Booking): Boolean {
         val hasRange = minCents != null || maxCents != null
-        if (!enabled || (pattern.isBlank() && !hasRange)) return false
-        val abs = kotlin.math.abs(b.amountCents)
-        if (minCents != null && abs < minCents) return false
-        if (maxCents != null && abs > maxCents) return false
-        if (pattern.isBlank()) return true
-        val haystack = when (field) {
-            RuleField.Counterparty -> b.counterparty
-            RuleField.Purpose -> b.purpose
-            RuleField.Iban -> b.reference.orEmpty()
-            RuleField.Amount -> (b.amountCents / 100.0).toString()
-            RuleField.Any -> "${b.counterparty} ${b.purpose}"
-        }
+        if (!enabled || (hasNoPattern && !hasRange)) return false
+        if (accountIds.isNotEmpty() && b.accountId !in accountIds) return false
+        // Signed, not |amount|: a core rule with a negative range has to match here too.
+        if (minCents != null && b.amountCents < minCents) return false
+        if (maxCents != null && b.amountCents > maxCents) return false
+        // An empty keyword list never matches in the core ("$^"), not even with an amount range.
+        if (hasNoPattern) return matchKind != MatchKind.Keyword && matchKind != MatchKind.Expression
+        val fields = haystacks(b)
         return when (matchKind) {
-            MatchKind.Contains -> haystack.contains(pattern, ignoreCase = true)
-            MatchKind.Equals -> haystack.equals(pattern, ignoreCase = true)
-            MatchKind.StartsWith -> haystack.startsWith(pattern, ignoreCase = true)
-            MatchKind.Regex -> runCatching { Regex(pattern, RegexOption.IGNORE_CASE).containsMatchIn(haystack) }
-                .getOrDefault(false)
+            MatchKind.Contains -> fields.any { it.contains(pattern, ignoreCase = !caseSensitive) }
+            MatchKind.Equals -> fields.any { it.equals(pattern, ignoreCase = !caseSensitive) }
+            MatchKind.StartsWith -> fields.any { it.startsWith(pattern, ignoreCase = !caseSensitive) }
+            // Unsupported patterns are reported through [evaluableHere], not hidden here.
+            MatchKind.Regex -> compiledRegex?.let { r -> fields.any { r.containsMatchIn(it) } } ?: false
+            // One keyword per line or separated by | or ,; empty terms are dropped, as in the core.
+            MatchKind.Keyword -> {
+                val words = pattern.split('|', ',', '\n', '\r')
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                words.isNotEmpty() &&
+                    fields.any { f -> words.any { w -> f.contains(w, ignoreCase = !caseSensitive) } }
+            }
+            // The core's search language (AND/OR/NOT, field prefixes, amount comparisons). The app
+            // cannot evaluate it; the editor does not offer it either, so this only guards rules
+            // that came from a vault.
+            MatchKind.Expression -> false
         }
     }
 }
@@ -143,18 +206,29 @@ data class Holding(
     /** Total purchase cost in EUR cents. */
     val costBasisCents: Long,
     val wkn: String = "",
-    /** Native holding currency (#625); [priceCents] is quoted in it. */
-    val currency: String = "EUR",
-    /** EUR per one unit of [currency]. */
+    /**
+     * Currency of [priceCents] and [costBasisCents]. The core reports holdings in the currency of
+     * their account, never in the position's own one (#625) — so a EUR amount must not be labelled
+     * with the share's native code.
+     */
+    val quoteCurrency: String = "EUR",
+    /** Native currency of the position; "" = same as [quoteCurrency]. */
+    val currency: String = "",
+    /** Price per unit in [currency]; null when the core has no native figure. */
+    val nativePriceCents: Long? = null,
+    /** Purchase price per unit in [currency]; null when the core has no native figure. */
+    val nativePurchasePriceCents: Long? = null,
+    /** Factor from the position's own currency to [quoteCurrency]. */
     val fxRateToEur: Double = 1.0,
 ) {
-    /** Current value in EUR cents. */
-    val valueCents get() = (quantity * priceCents * fxRateToEur).toLong()
+    /** Current value in cents of [quoteCurrency]. */
+    // Rounded, not truncated: a derived rate (see the mapper) lands on x.9999… often enough that
+    // truncating would lose a cent per position (#1429).
+    val valueCents get() = kotlin.math.round(quantity * priceCents * fxRateToEur).toLong()
     val gainCents get() = valueCents - costBasisCents
     val gainPct get() = if (costBasisCents > 0) gainCents * 100.0 / costBasisCents else 0.0
-    /** Average purchase price per unit in the native currency (cents). */
-    val purchasePriceNativeCents get() =
-        if (quantity > 0 && fxRateToEur > 0) (costBasisCents / quantity / fxRateToEur).toLong() else 0L
+    /** Currency to print the native figures in; the account currency when the core has none. */
+    val nativeCurrency get() = currency.ifEmpty { quoteCurrency }
 }
 
 data class ManualLoan(
@@ -167,12 +241,29 @@ data class ManualLoan(
     val startDate: LocalDate,
 )
 
+/**
+ * The currency most of the money sits in — the one the app adds up in.
+ *
+ * Account balances arrive in their own currencies and the vault carries no exchange rates for
+ * whole accounts, so a total across currencies would be a number without a unit. Everything that
+ * sums money uses this currency and reports the rest as not converted instead.
+ */
+fun VaultSnapshot.primaryCurrency(): String =
+    accounts
+        .groupBy { it.currency.ifBlank { "EUR" } }
+        .mapValues { (_, rows) -> rows.sumOf { kotlin.math.abs(it.balanceCents) } }
+        .maxByOrNull { it.value }
+        ?.key
+        ?: "EUR"
+
 data class TangibleAsset(
     val id: String,
     val name: String,
     val valueCents: Long,
     val acquiredDate: LocalDate,
     val note: String = "",
+    /** The account the asset sits in — its balance already contains the value. */
+    val accountId: String = "",
 )
 
 data class Announcement(
@@ -208,6 +299,8 @@ data class BookingFilter(
 /** Everything a vault (demo or own) provides. */
 data class VaultSnapshot(
     val groups: List<AccountGroup> = emptyList(),
+    /** How many bookings the core holds in total; more than [bookings] means a truncated page. */
+    val bookingsTotal: Int = 0,
     val accounts: List<Account> = emptyList(),
     val bookings: List<Booking> = emptyList(),
     val categories: List<Category> = emptyList(),

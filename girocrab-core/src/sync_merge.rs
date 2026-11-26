@@ -21,7 +21,7 @@
 //! `rules`, `bookings`. Each step translates the other vault's ids with the
 //! maps the earlier steps returned.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -480,8 +480,8 @@ pub(crate) fn fetch_keeps_account_deleted(
 
 /// A deleted account the bank (or an import) delivers again comes back with a
 /// new `created_ms`, together with the bookings deleted in the same cascade;
-/// individually deleted bookings stay deleted.
-pub(crate) fn revive_account_if_deleted(conn: &Connection, id: i64) -> CoreResult<()> {
+/// individually deleted bookings stay deleted. `true` if it was deleted.
+pub(crate) fn revive_account_if_deleted(conn: &Connection, id: i64) -> CoreResult<bool> {
     let stamp: Option<i64> = conn
         // includes soft-deleted rows
         .query_row("SELECT deleted_ms FROM accounts WHERE id = ?1", [id], |r| {
@@ -489,7 +489,9 @@ pub(crate) fn revive_account_if_deleted(conn: &Connection, id: i64) -> CoreResul
         })
         .optional()?
         .flatten();
-    let Some(stamp) = stamp else { return Ok(()) };
+    let Some(stamp) = stamp else {
+        return Ok(false);
+    };
     // unarchiving is stamped, so the merge carries it to the other devices
     // (otherwise they keep the revived account archived and out of totals)
     conn.execute(
@@ -503,7 +505,7 @@ pub(crate) fn revive_account_if_deleted(conn: &Connection, id: i64) -> CoreResul
         "UPDATE transactions SET deleted_ms = NULL WHERE account_id = ?1 AND deleted_ms = ?2",
         params![id, stamp],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn connection_key(conn: &Connection, id: i64) -> CoreResult<String> {
@@ -579,8 +581,7 @@ pub(crate) fn accounts_key(conn: &Connection, ids: &[i64]) -> CoreResult<Option<
 }
 
 /// `<account key>|external_id`
-#[cfg(test)]
-fn booking_key(conn: &Connection, id: i64) -> CoreResult<String> {
+pub(crate) fn booking_key(conn: &Connection, id: i64) -> CoreResult<String> {
     let (account, external_id): (i64, String) = conn
         .query_row(
             // includes soft-deleted rows
@@ -596,7 +597,7 @@ fn booking_key(conn: &Connection, id: i64) -> CoreResult<String> {
 // ------------------------------------------------------------------ merge
 
 /// Newest stamp wins; equal stamps with different values: the larger value.
-fn take_newer<T: PartialOrd>(val: &mut T, ms: &mut i64, other: T, other_ms: i64) {
+pub(crate) fn take_newer<T: PartialOrd>(val: &mut T, ms: &mut i64, other: T, other_ms: i64) {
     if other_ms > *ms || (other_ms == *ms && other > *val) {
         *val = other;
         *ms = other_ms;

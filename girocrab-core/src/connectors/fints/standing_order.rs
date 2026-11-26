@@ -13,11 +13,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::syntax::{Segment, SegmentBuilder};
-use super::{sepa, FinTsConnector, PreparedOrder, Vop};
+use super::{FinTsConnector, PreparedOrder, SepaAccount, Vop, sepa};
 use crate::connectors::{ConnectContext, Phase, StandingOrderJob};
 use crate::error::{CoreError, CoreResult};
 use crate::i18n::{tr, trf};
-use crate::iban::normalize_iban;
 use crate::models::StandingOrderAction;
 
 /// Execution date in the pain.001 of a standing order: the schedule carries the real ones.
@@ -110,10 +109,10 @@ impl StandingRules {
 /// The limits stored in a FinTS connection's state for creating or changing
 /// (`None` = the bank stated none, or the state is not FinTS).
 pub(crate) fn limits_from_state(
-    state: &serde_json::Value,
+    state: &crate::secret::SecretJson,
     action: StandingOrderAction,
 ) -> Option<crate::models::StandingOrderLimits> {
-    let st: super::FinTsState = serde_json::from_value(state.clone()).ok()?;
+    let st: super::FinTsState = state.decode().ok()?;
     let rules = match action {
         StandingOrderAction::Create => st.standing_params.create,
         StandingOrderAction::Change => st.standing_params.change,
@@ -126,15 +125,15 @@ pub(crate) fn limits_from_state(
 pub(super) fn check_schedule(
     rules: &StandingRules,
     job: &StandingOrderJob,
-    today: chrono::NaiveDate,
+    today: jiff::civil::Date,
 ) -> CoreResult<()> {
     let invalid = |m: String| Err(CoreError::InvalidInput { message: m });
-    let first = chrono::NaiveDate::parse_from_str(&job.first_date, "%Y-%m-%d").map_err(|_| {
+    let first = jiff::civil::Date::strptime("%Y-%m-%d", &job.first_date).map_err(|_| {
         CoreError::InvalidInput {
             message: tr("Der erste Termin ist ungültig (JJJJ-MM-TT).").into(),
         }
     })?;
-    let ahead = (first - today).num_days();
+    let ahead = crate::dates::days_between(today, first);
     if ahead < i64::from(rules.min_pretime) {
         return invalid(trf(
             "Der erste Termin muss mindestens {0} Tage in der Zukunft liegen.",
@@ -219,14 +218,12 @@ impl FinTsConnector {
             StandingOrderAction::Change => "HKCDN",
             StandingOrderAction::Delete => "HKCDL",
         };
-        let not_allowed = || {
-            CoreError::Bank {
+        let not_allowed = || CoreError::Bank {
             code: seg_id.into(),
             message: trf(
                 "Dieses Konto oder diese Bank erlaubt diese Änderung am Dauerauftrag per FinTS ({0}) nicht. Bitte in der Banking-App ändern.",
                 &[&seg_id],
             ),
-        }
         };
         if !self.bank_supports(seg_id) {
             return Err(not_allowed());
@@ -236,36 +233,10 @@ impl FinTsConnector {
                 message: tr("Die Bank hat für diesen Dauerauftrag keine Auftragsnummer gemeldet. Bitte in der Banking-App ändern.").into(),
             });
         }
-        if self.sec() == "999" {
-            return Err(CoreError::Bank {
-                code: "HKTAN".into(),
-                message: tr("Für Überweisungen ist ein TAN-Verfahren nötig; es wurde keines gefunden. Bitte zuerst eine Synchronisation mit TAN-Verfahren durchführen.").into(),
-            });
-        }
-        let mut errors = Vec::new();
-        let accounts = self.account_list(ctx, &mut errors).await;
-        let want = normalize_iban(&job.source_iban);
-        let (acc, upd) = accounts
-            .into_iter()
-            .find(|(a, _)| normalize_iban(&a.iban) == want)
-            .ok_or_else(|| CoreError::NotFound {
-                what: trf(
-                    "Konto {0} bei der Bank{1}",
-                    &[
-                        &job.source_iban,
-                        &if errors.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", errors.join(" / "))
-                        },
-                    ],
-                ),
-            })?;
-        if let Some(u) = &upd {
-            if !u.allowed.is_empty() && !u.allowed.contains(seg_id) {
-                return Err(not_allowed());
-            }
-        }
+        self.require_tan_method(tr("Für Überweisungen ist ein TAN-Verfahren nötig; es wurde keines gefunden. Bitte zuerst eine Synchronisation mit TAN-Verfahren durchführen."))?;
+        let Some(acc) = self.source_account(ctx, &job.source_iban, seg_id).await? else {
+            return Err(not_allowed());
+        };
         // The bank's limits, when it stated them (a delete has none to check).
         let rules = match job.action {
             StandingOrderAction::Create => self.st.standing_params.create.clone(),
@@ -273,64 +244,59 @@ impl FinTsConnector {
             StandingOrderAction::Delete => None,
         };
         if let Some(rules) = rules {
-            check_schedule(&rules, job, chrono::Local::now().date_naive())?;
+            check_schedule(&rules, job, crate::dates::today())?;
         }
         let version = self.pain_version(seg_id).unwrap_or(sepa::PainVersion::V03);
-        let (date, time) = Self::now();
-        let created = format!(
-            "{}-{}-{}T{}:{}:{}",
-            &date[..4],
-            &date[4..6],
-            &date[6..],
-            &time[..2],
-            &time[2..4],
-            &time[4..]
-        );
-        let msg_id = format!("GC{date}{time}{:08X}", rand::random::<u32>());
-        let owner = if job.source_owner.trim().is_empty() {
-            "Kontoinhaber"
-        } else {
-            job.source_owner.trim()
-        };
-        let xml = sepa::build_pain001(&sepa::Pain001 {
-            message_id: &msg_id,
-            created: &created,
-            execution_date: PAIN_PLACEHOLDER_DATE,
-            debtor_name: owner,
-            debtor_iban: &acc.iban,
-            debtor_bic: &acc.bic,
-            creditor_name: &job.recipient_name,
-            creditor_iban: &job.recipient_iban,
-            creditor_bic: job.recipient_bic.as_deref(),
-            amount_cents: job.amount_cents,
-            purpose: &job.purpose,
-            version,
-            end_to_end_id: "",
-            instant: false,
-        })?;
         let with_time = seg_id == "HKCDL" && self.version(seg_id) >= 2;
-        self.order = Some(PreparedOrder {
-            seg_id,
-            kti: Self::kti(&acc),
-            descriptor: version.descriptor(),
-            xml,
-            instant: false,
-            recipient_name: job.recipient_name.clone(),
-            recipient_iban: job.recipient_iban.clone(),
-            batch: None,
-            debit_layout: None,
-            standing: Some(StandingTail {
-                order_id: (job.action != StandingOrderAction::Create)
-                    .then(|| job.order_id.trim().to_string()),
-                schedule: schedule_components(job, with_time),
-            }),
-        });
-        self.vop_id = None;
-        self.vop_with_tan = false;
-        self.vop_pending = None;
+        self.order = Some(standing_order(job, &acc, seg_id, version, with_time)?);
         let reply = self.send_order(ctx, Vop::None).await?;
         self.finish_submit(&reply)
     }
+}
+
+/// The standing order (HKCDE/HKCDN/HKCDL) as it is sent: the pain.001 from the
+/// job and the source account, then order id and schedule. Pure, so
+/// `invariant_tests` can follow the values from the job to the segment bytes.
+pub(super) fn standing_order(
+    job: &StandingOrderJob,
+    acc: &SepaAccount,
+    seg_id: &'static str,
+    version: sepa::PainVersion,
+    with_time: bool,
+) -> CoreResult<PreparedOrder> {
+    let header = sepa::PainHeader::new(&job.source_owner);
+    let xml = sepa::build_pain001(&sepa::Pain001 {
+        message_id: &header.message_id,
+        created: &header.created,
+        execution_date: PAIN_PLACEHOLDER_DATE,
+        debtor_name: header.owner,
+        debtor_iban: &acc.iban,
+        debtor_bic: &acc.bic,
+        creditor_name: &job.recipient_name,
+        creditor_iban: &job.recipient_iban,
+        creditor_bic: job.recipient_bic.as_deref(),
+        amount_cents: job.amount_cents,
+        purpose: &job.purpose,
+        version,
+        end_to_end_id: "",
+        instant: false,
+    })?;
+    Ok(PreparedOrder {
+        seg_id,
+        kti: FinTsConnector::kti(acc),
+        descriptor: version.descriptor(),
+        xml,
+        instant: false,
+        recipient_name: job.recipient_name.clone(),
+        recipient_iban: job.recipient_iban.clone(),
+        batch: None,
+        debit_layout: None,
+        standing: Some(StandingTail {
+            order_id: (job.action != StandingOrderAction::Create)
+                .then(|| job.order_id.trim().to_string()),
+            schedule: schedule_components(job, with_time),
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -357,8 +323,8 @@ mod tests {
         }
     }
 
-    fn day(s: &str) -> chrono::NaiveDate {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    fn day(s: &str) -> jiff::civil::Date {
+        jiff::civil::Date::strptime("%Y-%m-%d", s).unwrap()
     }
 
     #[test]

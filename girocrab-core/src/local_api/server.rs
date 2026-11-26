@@ -1,4 +1,4 @@
-//! Local socket for the read-only interface (#136): a Unix domain socket, no
+//! Local socket for the analysis interface (#136): a Unix domain socket, no
 //! network port. One JSON request per line, one JSON response per line.
 //!
 //! - The socket lives in a directory only the user can enter (0700: created so
@@ -17,21 +17,23 @@
 //!   out at once), so the app gets the vault at least half the time.
 //! - No polling: threads sleep in `poll(2)` on their socket and a stop pipe.
 //!   `stop()` never waits: it wakes them, removes the socket file and returns.
+//! - A request that changed bookings (`set_category`, `set_tags`) is reported to
+//!   the app's [`LocalApiListener`] after its answer went out, so the app reloads.
 //! - Several instances (a debug build next to the app): a lock file next to the
 //!   socket (`<socket>.lock`, `flock`) decides who serves, and a server only removes the socket
 //!   file it created itself.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, PipeReader, PipeWriter, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use super::{response, ApiError, ApiErrorCode};
+use super::{ApiError, ApiErrorCode, response};
 use crate::error::CoreError;
 use crate::i18n::{tr, trf};
 use crate::vault::Vault;
@@ -52,9 +54,20 @@ const MAX_PAUSE: Duration = Duration::from_millis(250);
 /// After a failed `accept()` (e.g. no descriptors left).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// Told on a server thread when a request changed bookings (their category
+/// or tags), after the answer went out. The app reloads on its main thread.
+#[uniffi::export(with_foreign)]
+pub trait LocalApiListener: Send + Sync {
+    fn bookings_changed(&self);
+}
+
+/// The listener the threads report to; set and cleared by the app.
+type ListenerSlot = Arc<Mutex<Option<Arc<dyn LocalApiListener>>>>;
+
 /// The running socket; `stop()` (or dropping it) closes it and removes the file.
 #[derive(uniffi::Object)]
 pub struct LocalApiServer {
+    listener: ListenerSlot,
     path: PathBuf,
     /// (device, inode) of the socket file this server created.
     file_id: (u64, u64),
@@ -70,28 +83,42 @@ impl LocalApiServer {
     /// chmod-ed). Another live server on the same path is an error, a stale
     /// socket there is replaced, any other file is an error.
     /// Errors are `InvalidInput` with a localized message for the status line.
+    /// `on_change` is in place before the first request is accepted, so no edit
+    /// goes unreported; `set_listener` replaces it later.
     #[uniffi::constructor]
-    pub fn start(vault: Arc<Vault>, socket_path: String) -> Result<Arc<Self>, CoreError> {
+    pub fn start(
+        vault: Arc<Vault>,
+        socket_path: String,
+        on_change: Option<Arc<dyn LocalApiListener>>,
+    ) -> Result<Arc<Self>, CoreError> {
         let path = PathBuf::from(&socket_path);
         let stopper = Stopper::new().map_err(io_error)?;
         let (listener, file_id, lock) = bind(&path)?;
         let vault = Arc::downgrade(&vault);
+        let changes: ListenerSlot = Arc::new(Mutex::new(on_change));
         {
             let stopper = stopper.clone();
+            let changes = changes.clone();
             if let Err(e) = std::thread::Builder::new()
                 .name("girocrab-local-api".into())
-                .spawn(move || accept_loop(listener, vault, stopper))
+                .spawn(move || accept_loop(listener, vault, stopper, changes))
             {
                 remove_own_socket(&path, file_id);
                 return Err(io_error(e));
             }
         }
         Ok(Arc::new(Self {
+            listener: changes,
             path,
             file_id,
             stopper,
             lock: Mutex::new(Some(lock)),
         }))
+    }
+
+    /// Who is told when a request changed bookings; `None` = nobody.
+    pub fn set_listener(&self, listener: Option<Arc<dyn LocalApiListener>>) {
+        *self.listener.lock().unwrap_or_else(|e| e.into_inner()) = listener;
     }
 
     /// Wakes the threads (they end at once, a request still being written
@@ -121,8 +148,8 @@ impl Drop for LocalApiServer {
 /// turns (and stays) readable once `stop()` wrote to it.
 struct Stopper {
     stopped: AtomicBool,
-    read_fd: RawFd,
-    write_fd: RawFd,
+    wake_rx: PipeReader,
+    wake_tx: PipeWriter,
 }
 
 enum Wait {
@@ -133,34 +160,24 @@ enum Wait {
 
 impl Stopper {
     fn new() -> std::io::Result<Arc<Self>> {
-        let mut fds = [0 as RawFd; 2];
-        // SAFETY: `fds` is a valid buffer for two descriptors.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        for fd in fds {
-            // SAFETY: fd was just returned by pipe(2); F_SETFD/F_SETFL take an int.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-            }
-        }
+        // Close-on-exec like every descriptor std opens; closed on drop.
+        let (wake_rx, wake_tx) = std::io::pipe()?;
         Ok(Arc::new(Self {
             stopped: AtomicBool::new(false),
-            read_fd: fds[0],
-            write_fd: fds[1],
+            wake_rx,
+            wake_tx,
         }))
     }
 
     fn stop(&self) {
         if !self.stopped.swap(true, Ordering::SeqCst) {
-            // SAFETY: write_fd is open until drop; one byte from a valid buffer.
-            unsafe { libc::write(self.write_fd, [1u8].as_ptr().cast(), 1) };
+            // The only write, into an empty pipe: it cannot block.
+            let _ = (&self.wake_tx).write(&[1]);
         }
     }
 
     /// Sleeps until `fd` is readable, `stop()` or `timeout` (None = no limit).
-    fn wait_readable(&self, fd: RawFd, timeout: Option<Duration>) -> Wait {
+    fn wait_readable(&self, fd: BorrowedFd<'_>, timeout: Option<Duration>) -> Wait {
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             if self.stopped.load(Ordering::SeqCst) {
@@ -173,45 +190,15 @@ impl Stopper {
                     if left.is_zero() {
                         return Wait::TimedOut;
                     }
-                    left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int
+                    left.as_millis().clamp(1, i32::MAX as u128) as i32
                 }
             };
-            let mut fds = [
-                libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: self.read_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            // SAFETY: `fds` is a valid array of two pollfd structs.
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
-            if n < 0 {
-                if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
-                    continue;
-                }
-                return Wait::Stopped;
+            match crate::sys::poll_readable(fd, self.wake_rx.as_fd(), ms) {
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) | Ok((_, true)) => return Wait::Stopped,
+                Ok((true, false)) => return Wait::Ready,
+                Ok((false, false)) => {}
             }
-            if fds[1].revents != 0 {
-                return Wait::Stopped;
-            }
-            if fds[0].revents != 0 {
-                return Wait::Ready;
-            }
-        }
-    }
-}
-
-impl Drop for Stopper {
-    fn drop(&mut self) {
-        // SAFETY: both descriptors belong to this Stopper and are closed once.
-        unsafe {
-            libc::close(self.read_fd);
-            libc::close(self.write_fd);
         }
     }
 }
@@ -246,9 +233,7 @@ fn bind(path: &Path) -> Result<(UnixListener, (u64, u64), File), CoreError> {
         _ => false,
     };
     let meta = std::fs::symlink_metadata(dir).map_err(io_error)?;
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    if !meta.is_dir() || meta.uid() != uid {
+    if !meta.is_dir() || meta.uid() != crate::sys::getuid() {
         return Err(CoreError::invalid(tr(
             "Der Socket-Ordner gehört nicht diesem Benutzer.",
         )));
@@ -271,22 +256,22 @@ fn bind(path: &Path) -> Result<(UnixListener, (u64, u64), File), CoreError> {
         .mode(0o600)
         .open(lock_path(path))
         .map_err(io_error)?;
-    // SAFETY: the descriptor belongs to `lock`, which outlives the call.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == ErrorKind::WouldBlock {
+    // flock(2) on Unix, held until `lock` closes.
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(CoreError::invalid(tr(
                 "Eine andere GiroCrab-Instanz verwendet diesen Socket bereits.",
             )));
         }
-        return Err(io_error(e));
+        Err(std::fs::TryLockError::Error(e)) => return Err(io_error(e)),
     }
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_socket() => std::fs::remove_file(path).map_err(io_error)?,
         Ok(_) => {
             return Err(CoreError::invalid(tr(
                 "Am Socket-Pfad liegt bereits eine andere Datei.",
-            )))
+            )));
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(io_error(e)),
@@ -341,13 +326,18 @@ impl Drop for ClientSlot {
     }
 }
 
-fn accept_loop(listener: UnixListener, vault: Weak<Vault>, stopper: Arc<Stopper>) {
+fn accept_loop(
+    listener: UnixListener,
+    vault: Weak<Vault>,
+    stopper: Arc<Stopper>,
+    changes: ListenerSlot,
+) {
     let clients = Arc::new(AtomicUsize::new(0));
     // One request at a time across all connections, and when the next may start (see `serve`).
     let turn = Arc::new(Mutex::new(Instant::now()));
     loop {
         // No time limit: only `stop()` ends the wait other than a connection.
-        let Wait::Ready = stopper.wait_readable(listener.as_raw_fd(), None) else {
+        let Wait::Ready = stopper.wait_readable(listener.as_fd(), None) else {
             return;
         };
         let Ok((mut stream, _)) = listener.accept() else {
@@ -374,77 +364,50 @@ fn accept_loop(listener: UnixListener, vault: Weak<Vault>, stopper: Arc<Stopper>
             continue;
         }
         let slot = ClientSlot::take(&clients);
-        let (vault, stopper, turn) = (vault.clone(), stopper.clone(), turn.clone());
+        let (vault, stopper, turn, changes) = (
+            vault.clone(),
+            stopper.clone(),
+            turn.clone(),
+            changes.clone(),
+        );
         // On a spawn error the closure (and with it `slot`) is dropped.
         let _ = std::thread::Builder::new()
             .name("girocrab-local-api-client".into())
             .spawn(move || {
                 let _slot = slot;
-                serve(stream, &vault, &stopper, &turn);
+                serve(stream, &vault, &stopper, &turn, &changes);
             });
     }
 }
 
 /// The peer runs as this user (the socket's mode already keeps others out).
 fn same_user(stream: &UnixStream) -> bool {
-    let fd = stream.as_raw_fd();
-    // SAFETY: getuid has no preconditions.
-    let me = unsafe { libc::getuid() };
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    {
-        let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
-        // SAFETY: fd is a connected Unix socket owned by `stream`; uid/gid are valid out pointers.
-        let ok = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == 0;
-        ok && uid == me
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut cred = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: fd is a connected Unix socket; `cred`/`len` describe a valid buffer.
-        let ok = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                &mut cred as *mut libc::ucred as *mut libc::c_void,
-                &mut len,
-            )
-        } == 0;
-        ok && cred.uid == me
-    }
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "linux"
-    )))]
-    {
-        let _ = (fd, me);
-        false
-    }
+    // Unknown (unsupported platform, failed call) counts as someone else.
+    crate::sys::peer_uid(stream).is_ok_and(|uid| uid == crate::sys::getuid())
 }
 
 /// Answers the requests of one connection until EOF, an error, a request over
 /// `MAX_LINE` or slower than `REQUEST_DEADLINE`, `IDLE` without a request or `stop`.
-fn serve(stream: UnixStream, vault: &Weak<Vault>, stopper: &Stopper, turn: &Mutex<Instant>) {
+fn serve(
+    stream: UnixStream,
+    vault: &Weak<Vault>,
+    stopper: &Stopper,
+    turn: &Mutex<Instant>,
+    changes: &ListenerSlot,
+) {
     let Ok(mut out) = stream.try_clone() else {
         return;
     };
-    let fd = stream.as_raw_fd();
     let mut reader = BufReader::new(stream);
     let mut line: Vec<u8> = Vec::new();
     // `IDLE` after an answer, `REQUEST_DEADLINE` from a request's first byte.
     let mut deadline = Instant::now() + IDLE;
     loop {
         if reader.buffer().is_empty() {
-            match stopper
-                .wait_readable(fd, Some(deadline.saturating_duration_since(Instant::now())))
-            {
+            match stopper.wait_readable(
+                reader.get_ref().as_fd(),
+                Some(deadline.saturating_duration_since(Instant::now())),
+            ) {
                 Wait::Ready => {}
                 Wait::Stopped => return,
                 Wait::TimedOut => {
@@ -493,43 +456,76 @@ fn serve(stream: UnixStream, vault: &Weak<Vault>, stopper: &Stopper, turn: &Mute
             *next = Instant::now() + started.elapsed().min(MAX_PAUSE);
             answer
         };
-        // Stopped (locked) meanwhile: nothing more goes out.
-        let Some(answer) = answer else { return };
-        line.clear();
-        deadline = Instant::now() + IDLE;
-        if writeln!(out, "{answer}").is_err() {
+        let (answer, changed) = answer;
+        // Stopped meanwhile (locked, access switched off, key revoked): nothing more
+        // goes out, but a committed edit is still reported (the app ignores it for a
+        // vault it no longer shows).
+        let written = match answer {
+            Some(answer) => {
+                line.clear();
+                deadline = Instant::now() + IDLE;
+                writeln!(out, "{answer}").is_ok()
+            }
+            None => false,
+        };
+        // Committed either way: the app reloads even if the client went away.
+        if changed {
+            let listener = changes.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(listener) = listener {
+                listener.bookings_changed();
+            }
+        }
+        if !written {
             return;
         }
     }
 }
 
-/// None once `stop()` ran: checked after taking the vault and again after the
-/// request, so an answer computed while the app locked is never sent.
-fn answer(vault: &Weak<Vault>, stopper: &Stopper, line: &[u8]) -> Option<String> {
+/// The answer is None once `stop()` ran: checked before taking the vault and again
+/// after the request, so an answer computed while the app locked is never sent.
+/// The flag tells whether the request changed bookings; it stays set when the
+/// answer is withheld, because the change is committed.
+fn answer(vault: &Weak<Vault>, stopper: &Stopper, line: &[u8]) -> (Option<String>, bool) {
     let stopped = || stopper.stopped.load(Ordering::SeqCst);
     if stopped() {
-        return None;
+        return (None, false);
     }
     // The vault is held only for this one request.
     let Some(vault) = vault.upgrade() else {
-        return Some(response(Err(ApiError::new(
-            ApiErrorCode::Locked,
-            "GiroCrab is locked",
-        ))));
+        return (
+            Some(response(Err(ApiError::new(
+                ApiErrorCode::Locked,
+                "GiroCrab is locked",
+            )))),
+            false,
+        );
     };
     let answer = match std::str::from_utf8(line) {
         Ok(text) => vault.local_api_socket_request(text.trim_end_matches('\r')),
-        Err(_) => response(Err(ApiError::invalid("request is not UTF-8"))),
+        Err(_) => (
+            response(Err(ApiError::invalid("request is not UTF-8"))),
+            false,
+        ),
     };
-    (!stopped()).then_some(answer)
+    let (text, changed) = answer;
+    if stopped() {
+        return (None, changed);
+    }
+    (Some(text), changed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::local_api::ShareScope;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::io::{BufRead, BufReader, Write};
+
+    /// Upper bound for "`stop()` returns at once". `stop()` takes no lock a
+    /// worker holds, but on a busy CI runner the test thread itself can lose
+    /// the CPU for tens of milliseconds (a 50 ms bound failed at 62 ms). A
+    /// `stop()` that waited for a worker would take `WRITE_TIMEOUT` or `IDLE`.
+    const STOP_AT_ONCE: Duration = Duration::from_secs(1);
 
     /// A short directory: `sun_path` holds only 104 bytes on macOS, the usual
     /// temp directory is too deep for it.
@@ -554,7 +550,7 @@ mod tests {
     }
 
     fn start(d: &ShortDir, vault: &Arc<Vault>) -> Arc<LocalApiServer> {
-        LocalApiServer::start(vault.clone(), d.socket().to_string_lossy().into()).unwrap()
+        LocalApiServer::start(vault.clone(), d.socket().to_string_lossy().into(), None).unwrap()
     }
 
     impl Drop for ShortDir {
@@ -670,7 +666,7 @@ mod tests {
         let d = ShortDir::new();
         let (_v, vault, _) = vault();
         let path = d.socket();
-        let server = LocalApiServer::start(vault, path.to_string_lossy().into()).unwrap();
+        let server = LocalApiServer::start(vault, path.to_string_lossy().into(), None).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
@@ -685,7 +681,7 @@ mod tests {
         let (_v, vault, _) = vault();
         let path = d.make_dir(0o700);
         std::fs::write(&path, b"keep me").unwrap();
-        assert!(LocalApiServer::start(vault, path.to_string_lossy().into()).is_err());
+        assert!(LocalApiServer::start(vault, path.to_string_lossy().into(), None).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
     }
 
@@ -734,7 +730,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let t = std::time::Instant::now();
         server.stop();
-        assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+        assert!(t.elapsed() < STOP_AT_ONCE, "{:?}", t.elapsed());
         assert!(!d.socket().exists());
         drop(s);
     }
@@ -744,14 +740,14 @@ mod tests {
         let d = ShortDir::new();
         let (_v, vault, _) = vault();
         let path: String = d.socket().to_string_lossy().into();
-        let first = LocalApiServer::start(vault.clone(), path.clone()).unwrap();
-        assert!(LocalApiServer::start(vault.clone(), path.clone()).is_err());
+        let first = LocalApiServer::start(vault.clone(), path.clone(), None).unwrap();
+        assert!(LocalApiServer::start(vault.clone(), path.clone(), None).is_err());
         assert!(
             UnixStream::connect(&path).is_ok(),
             "first one still reachable"
         );
         first.stop();
-        let second = LocalApiServer::start(vault.clone(), path.clone()).unwrap();
+        let second = LocalApiServer::start(vault.clone(), path.clone(), None).unwrap();
         // The first one stopping (again) or going away must not take the second's file.
         first.stop();
         drop(first);
@@ -765,9 +761,9 @@ mod tests {
             let d = ShortDir::new();
             let (_v, vault, _) = vault();
             let path: String = d.socket().to_string_lossy().into();
-            let mut first = LocalApiServer::start(vault.clone(), path.clone()).unwrap();
+            let mut first = LocalApiServer::start(vault.clone(), path.clone(), None).unwrap();
             first.stop();
-            let second = LocalApiServer::start(vault.clone(), path.clone()).unwrap();
+            let second = LocalApiServer::start(vault.clone(), path.clone(), None).unwrap();
             // Model inode reuse deterministically, independent of the host
             // filesystem's allocation policy. The old server no longer owns
             // this path even when the replacement has the same file identity.
@@ -829,7 +825,7 @@ mod tests {
         let d = ShortDir::new();
         let (_v, vault, _) = vault();
         let path = d.make_dir(0o755);
-        assert!(LocalApiServer::start(vault, path.to_string_lossy().into()).is_err());
+        assert!(LocalApiServer::start(vault, path.to_string_lossy().into(), None).is_err());
         let mode = std::fs::metadata(path.parent().unwrap())
             .unwrap()
             .permissions()
@@ -861,7 +857,7 @@ mod tests {
         let t = std::time::Instant::now();
         server.stop();
         c.assert_closed();
-        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(t.elapsed() < STOP_AT_ONCE, "{:?}", t.elapsed());
     }
 
     #[test]
@@ -898,6 +894,72 @@ mod tests {
         assert_eq!(mode(&d.0), 0o700, "a created parent too");
         assert_eq!(mode(d.socket().parent().unwrap()), 0o700);
         assert!(lock_path(&d.socket()).ends_with("s.sock.lock"));
+        server.stop();
+    }
+
+    /// Counts `bookings_changed` calls.
+    #[derive(Default)]
+    struct Changes(AtomicUsize);
+
+    impl LocalApiListener for Changes {
+        fn bookings_changed(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_app_is_told_about_edits_only() {
+        let d = ShortDir::new();
+        let (_v, vault, token) = vault();
+        let scope = vault.local_api_scope().unwrap();
+        vault
+            .set_local_api_scope(ShareScope {
+                allow_edits: true,
+                ..scope
+            })
+            .unwrap();
+        // given at the start: in place before the first request
+        let changes = Arc::new(Changes::default());
+        let server = LocalApiServer::start(
+            vault.clone(),
+            d.socket().to_string_lossy().into(),
+            Some(changes.clone()),
+        )
+        .unwrap();
+        let mut c = Client::connect(&d.socket());
+        let page = c.send_raw(
+            &json!({ "v": 1, "token": token, "method": "transactions",
+                     "params": { "uncategorized_only": true, "limit": 1 } })
+            .to_string(),
+        );
+        let id = page["result"]["transactions"][0]["id"].as_i64().unwrap();
+        let tag = |c: &mut Client, add: &str| {
+            c.send_raw(
+                &json!({ "v": 1, "token": token, "method": "set_tags",
+                         "params": { "transaction_ids": [id], "add": [add] } })
+                .to_string(),
+            )
+        };
+        assert_eq!(
+            tag(&mut c, "Probe")["result"]["results"][0]["status"],
+            "changed"
+        );
+        // The listener is told after the answer went out: wait for it, bounded.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while changes.0.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(changes.0.load(Ordering::SeqCst), 1);
+        // reads and edits that change nothing are not reported
+        assert_eq!(
+            tag(&mut c, "Probe")["result"]["results"][0]["status"],
+            "unchanged"
+        );
+        assert!(c.call(&token, "info")["result"].is_object());
+        assert_eq!(changes.0.load(Ordering::SeqCst), 1);
+        server.set_listener(None);
+        assert_eq!(tag(&mut c, "Andere")["result"]["created_tags"][0], "Andere");
+        assert_eq!(changes.0.load(Ordering::SeqCst), 1);
         server.stop();
     }
 }

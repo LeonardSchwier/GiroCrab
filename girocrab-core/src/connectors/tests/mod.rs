@@ -8,8 +8,44 @@ use crate::models::{AccountKind, BookingFilter, BookingScope, ConnectorKind, Sep
 use crate::vault::Vault;
 
 #[test]
+fn dkb_offers_fints_and_one_psd2_access_with_or_without_live_catalog() {
+    use super::bank_directory::{BankAccessMode, Psd2Bank, search_banks};
+
+    let live_dkb = Psd2Bank {
+        name: "DKB".into(),
+        country: "DE".into(),
+        aspsp: "DKB".into(),
+        connector: None,
+        live: true,
+        tested: String::new(),
+    };
+    for live_catalog in [vec![], vec![live_dkb]] {
+        let banks = search_banks("DKB".into(), live_catalog, 10);
+        let fints = banks
+            .iter()
+            .find(|bank| bank.mode == BankAccessMode::FinTs && bank.blz == "12030000")
+            .expect("existing DKB FinTS access");
+        let psd2: Vec<_> = banks
+            .iter()
+            .filter(|bank| bank.mode == BankAccessMode::Psd2)
+            .collect();
+        assert_eq!(psd2.len(), 1);
+        let bank = psd2[0];
+        assert_eq!(bank.name, fints.name);
+        assert_eq!(bank.id, "psd2:DE:DKB");
+        assert_eq!(bank.aspsp, "DKB");
+        assert_eq!(bank.country, "DE");
+        assert_eq!(bank.connector, None);
+        assert!(bank.tested.is_empty());
+    }
+    // The assistant searches again using the selected FinTS entry's full name.
+    let banks = search_banks("DKB (Deutsche Kreditbank)".into(), vec![], 10);
+    assert!(banks.iter().any(|bank| bank.id == "psd2:DE:DKB"));
+}
+
+#[test]
 fn errors_after_submit_leave_outcome_unknown() {
-    use super::{error_leaves_outcome_unknown as unknown, CoreError};
+    use super::{CoreError, error_leaves_outcome_unknown as unknown};
     assert!(unknown(&CoreError::Network {
         message: "x".into()
     }));
@@ -66,6 +102,196 @@ fn store_fetch_matches_depot_holdings_without_iban() {
         let acc = v.list_accounts().unwrap().pop().unwrap();
         assert_eq!(v.list_holdings(acc.id).unwrap().len(), 1, "ref {r}");
     }
+}
+
+#[test]
+fn history_bookings_arrive_checked_and_stored_documents_get_linked() {
+    let p_dir = crate::test_support::TempDir::new("girocrab-history-docs");
+    let p = p_dir.join("v.db");
+    let v = Vault::open(p.to_string_lossy().to_string(), vec![3u8; 32]).unwrap();
+    let conn = v
+        .add_bank_connection(
+            ConnectorKind::TradeRepublic,
+            String::new(),
+            "+491701234567".into(),
+        )
+        .unwrap();
+    let account = RemoteAccount {
+        external_ref: "tr:cash".into(),
+        name: "Verrechnungskonto".into(),
+        owner: String::new(),
+        iban: String::new(),
+        account_number: String::new(),
+        currency: "EUR".into(),
+        kind: AccountKind::Checking,
+        balance_cents: 1000,
+        balance_date: "2026-11-10".into(),
+    };
+    let doc = |bytes: &[u8], booking: Option<&str>| crate::documents::RemoteDocument {
+        account_ref: "tr:cash".into(),
+        booking_external_id: booking.map(str::to_string),
+        title: "Abrechnung – Beispiel".into(),
+        doc_type: "abrechnung".into(),
+        mime_type: "application/pdf".into(),
+        file_name: "a.pdf".into(),
+        bytes: bytes.to_vec(),
+        source_url: "https://example.invalid/doc/1".into(),
+        date: "2024-05-02".into(),
+    };
+    // first the PDF alone (its booking is older than the sync window of that time)
+    let first = FetchResult {
+        accounts: vec![account.clone()],
+        documents: vec![doc(b"%PDF-1.4 test", None)],
+        ..Default::default()
+    };
+    let s = store_fetch(&v, ConnectorKind::TradeRepublic, conn, first).unwrap();
+    assert_eq!(s.documents_imported, 1);
+    let docs = v.list_all_documents(Default::default()).unwrap();
+    assert!(docs.iter().all(|d| d.booking_id.is_none()));
+
+    // later the history pass brings the booking (as checked) and the link-only document
+    let booking = RemoteTransaction {
+        account_ref: "tr:cash".into(),
+        external_id: "item-1".into(),
+        booking_date: "2024-05-02".into(),
+        value_date: "2024-05-02".into(),
+        amount_cents: -7500,
+        currency: "EUR".into(),
+        counterparty: "Beispiel".into(),
+        checked: true,
+        ..Default::default()
+    };
+    let second = || FetchResult {
+        accounts: vec![account.clone()],
+        transactions: vec![booking.clone()],
+        documents: vec![doc(&[], Some("item-1"))],
+        ..Default::default()
+    };
+    let s = store_fetch(&v, ConnectorKind::TradeRepublic, conn, second()).unwrap();
+    assert_eq!(
+        s.documents_imported, 0,
+        "a link-only document is no new document"
+    );
+    assert_eq!(
+        v.list_accounts().unwrap().pop().unwrap().new_count,
+        0,
+        "history is not new"
+    );
+    let docs = v.list_all_documents(Default::default()).unwrap();
+    assert_eq!(docs.len(), 1);
+    let doc_id = docs[0].id;
+    assert!(
+        docs[0].booking_id.is_some(),
+        "the stored document is linked now"
+    );
+    v.link_document(doc_id, None).unwrap();
+    store_fetch(&v, ConnectorKind::TradeRepublic, conn, second()).unwrap();
+    assert_eq!(
+        v.list_all_documents(Default::default()).unwrap()[0].booking_id,
+        None,
+        "replaying an already stored booking does not restore a manual unlink"
+    );
+}
+
+/// The document pass can reach a known receipt only in a later sync than its booking (#1660).
+#[test]
+fn a_known_receipt_reached_later_links_to_its_booking_unless_unlinked() {
+    let p_dir = crate::test_support::TempDir::new("girocrab-history-docs-later");
+    let v = Vault::open(
+        p_dir.join("v.db").to_string_lossy().into_owned(),
+        vec![3u8; 32],
+    )
+    .unwrap();
+    let conn = v
+        .add_bank_connection(ConnectorKind::TradeRepublic, String::new(), "login".into())
+        .unwrap();
+    let mut base = fetch_with_document();
+    let account = base.accounts.remove(0);
+    let doc = |bytes: &[u8], booking: Option<&str>, url: &str| crate::documents::RemoteDocument {
+        booking_external_id: booking.map(str::to_string),
+        bytes: bytes.to_vec(),
+        source_url: url.into(),
+        ..base.documents[0].clone()
+    };
+    let booking = |id: &str| RemoteTransaction {
+        account_ref: "tr:cash".into(),
+        external_id: id.into(),
+        booking_date: "2024-05-02".into(),
+        value_date: "2024-05-02".into(),
+        amount_cents: -7500,
+        currency: "EUR".into(),
+        counterparty: "Beispiel".into(),
+        checked: true,
+        ..Default::default()
+    };
+    let store = |transactions: Vec<RemoteTransaction>, documents| {
+        let fetched = FetchResult {
+            accounts: vec![account.clone()],
+            transactions,
+            documents,
+            ..Default::default()
+        };
+        store_fetch(&v, ConnectorKind::TradeRepublic, conn, fetched).unwrap();
+    };
+    // both receipts stored without a booking, then both bookings arrive while the pass is full
+    store(
+        vec![],
+        vec![
+            doc(b"%PDF-1.4 a", None, "tr:doc:a"),
+            doc(b"%PDF-1.4 b", None, "tr:doc:b"),
+            doc(b"%PDF-1.4 c", None, "tr:doc:c"),
+        ],
+    );
+    store(
+        vec![booking("item-a"), booking("item-b"), booking("item-c")],
+        vec![],
+    );
+    let docs = v.list_all_documents(Default::default()).unwrap();
+    let id_of = |url: &str| docs.iter().find(|d| d.source_url == url).unwrap().id;
+    let (a, b) = (id_of("tr:doc:a"), id_of("tr:doc:b"));
+    let booking_a = v
+        .list_all_documents(Default::default())
+        .unwrap()
+        .iter()
+        .find(|d| d.id == a)
+        .and_then(|d| d.booking_id);
+    assert_eq!(booking_a, None, "no link without the receipt in the fetch");
+    // the user unlinks receipt b from a booking it was put to by hand
+    let other = v.list_accounts().unwrap()[0].id;
+    let any_booking: i64 = v
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM transactions WHERE account_id = ?1 ORDER BY id LIMIT 1",
+            [other],
+            |r| r.get(0),
+        )
+        .unwrap();
+    v.link_document(b, Some(any_booking)).unwrap();
+    v.link_document(b, None).unwrap();
+    // a later pass reaches the known receipts (link-only, no bytes); c is no longer remembered
+    // as known and comes downloaded again
+    store(
+        vec![],
+        vec![
+            doc(&[], Some("item-a"), "tr:doc:a"),
+            doc(&[], Some("item-b"), "tr:doc:b"),
+            doc(b"%PDF-1.4 c", Some("item-c"), "tr:doc:c"),
+        ],
+    );
+    let docs = v.list_all_documents(Default::default()).unwrap();
+    let linked = |id: i64| docs.iter().find(|d| d.id == id).unwrap().booking_id;
+    assert!(
+        linked(a).is_some(),
+        "the booking of an earlier sync gets its receipt"
+    );
+    assert_eq!(linked(b), None, "a manual unlink stays");
+    let c = id_of("tr:doc:c");
+    assert!(
+        linked(c).is_some(),
+        "a receipt downloaded again gets its link"
+    );
+    assert_eq!(docs.len(), 3, "the copy is not stored twice");
 }
 
 #[test]
@@ -128,6 +354,118 @@ fn unread_depot_keeps_its_positions_and_value() {
     let acc = v.list_accounts().unwrap().pop().unwrap();
     assert_eq!(acc.balance_cents, 0);
     assert!(v.list_holdings(acc.id).unwrap().is_empty());
+}
+
+#[test]
+fn fetch_warnings_name_accounts_by_their_stored_name() {
+    // #1083: a FinTS failure names the account by its IBAN; the summary uses
+    // the name the account carries here (renamed by the user), never the IBAN.
+    let p_dir = crate::test_support::TempDir::new("girocrab-fetch-warnings");
+    let p = p_dir.join("v.db");
+    let v = Vault::open(p.to_string_lossy().to_string(), vec![3u8; 32]).unwrap();
+    let conn = v
+        .add_bank_connection(
+            ConnectorKind::FinTsGeneric,
+            "fints:50010517".into(),
+            "login".into(),
+        )
+        .unwrap();
+    let iban = "DE02120300000000202051";
+    let account = |balance_cents: i64| RemoteAccount {
+        external_ref: iban.into(),
+        name: "Verrechnungskonto".into(),
+        owner: String::new(),
+        iban: iban.into(),
+        account_number: String::new(),
+        currency: "EUR".into(),
+        kind: AccountKind::Checking,
+        balance_cents,
+        balance_date: "2026-11-10".into(),
+    };
+    let first = FetchResult {
+        accounts: vec![account(250_00)],
+        ..Default::default()
+    };
+    let s = store_fetch(&v, ConnectorKind::FinTsGeneric, conn, first).unwrap();
+    assert!(s.warnings.is_empty());
+    assert!(s.hints.is_empty());
+    let id = v.list_accounts().unwrap().pop().unwrap().id;
+    v.rename_account(id, "Cash".into()).unwrap();
+
+    let failed = FetchResult {
+        accounts: vec![account(0)],
+        balances_unknown: vec![iban.into()],
+        warnings: vec![
+            format!("{iban}: Umsätze (HKCAZ/camt.052) – TAN verlangt"),
+            "Kontenliste (HKSPA) – abgelehnt".into(),
+        ],
+        hints: vec!["Zeitraum auf 90 Tage stellen".into()],
+        ..Default::default()
+    };
+    let s = store_fetch(&v, ConnectorKind::FinTsGeneric, conn, failed).unwrap();
+    assert_eq!(s.hints, vec!["Zeitraum auf 90 Tage stellen".to_string()]);
+    assert_eq!(
+        s.warnings,
+        vec![
+            "Cash: Umsätze (HKCAZ/camt.052) – TAN verlangt".to_string(),
+            "Kontenliste (HKSPA) – abgelehnt".to_string(),
+        ]
+    );
+    // the balance that was not read stays
+    assert_eq!(
+        v.list_accounts().unwrap().pop().unwrap().balance_cents,
+        250_00
+    );
+}
+
+#[test]
+fn fetch_hints_name_accounts_by_their_stored_name_without_any_warning() {
+    // #1743: "Depotbestand (HKWPD) – von der Bank nicht angeboten" is a hint, not a warning.
+    // With no warning in the fetch, the IBAN must still become the stored name.
+    let p_dir = crate::test_support::TempDir::new("girocrab-fetch-hints");
+    let p = p_dir.join("v.db");
+    let v = Vault::open(p.to_string_lossy().to_string(), vec![3u8; 32]).unwrap();
+    let conn = v
+        .add_bank_connection(
+            ConnectorKind::FinTsGeneric,
+            "fints:50010517".into(),
+            "login".into(),
+        )
+        .unwrap();
+    let iban = "DE02120300000000202051";
+    let depot = RemoteAccount {
+        external_ref: iban.into(),
+        name: "Direkt-Depot".into(),
+        owner: String::new(),
+        iban: iban.into(),
+        account_number: String::new(),
+        currency: "EUR".into(),
+        kind: AccountKind::Brokerage,
+        balance_cents: 0,
+        balance_date: "2026-11-10".into(),
+    };
+    let first = FetchResult {
+        accounts: vec![depot.clone()],
+        ..Default::default()
+    };
+    store_fetch(&v, ConnectorKind::FinTsGeneric, conn, first).unwrap();
+    let id = v.list_accounts().unwrap().pop().unwrap().id;
+    v.rename_account(id, "Mein Depot".into()).unwrap();
+
+    let hinted = FetchResult {
+        accounts: vec![depot],
+        balances_unknown: vec![iban.into()],
+        hints: vec![format!(
+            "{iban}: Depotbestand (HKWPD) – von der Bank nicht angeboten"
+        )],
+        ..Default::default()
+    };
+    let s = store_fetch(&v, ConnectorKind::FinTsGeneric, conn, hinted).unwrap();
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    assert_eq!(
+        s.hints,
+        vec!["Mein Depot: Depotbestand (HKWPD) – von der Bank nicht angeboten".to_string()]
+    );
 }
 
 #[test]
@@ -393,6 +731,16 @@ fn card_open_balance_since_settlement() {
         r("2026-11-05", -1000, "Cafe"),
     ];
     assert_eq!(open_card_balance(&with_refund), Some(-137371));
+    // Amex: the statement paid by direct debit, nothing charged since
+    let paid = vec![
+        r("2026-10-20", -12345, "Shop"),
+        r(
+            "2026-11-12",
+            12345,
+            "Zahlung/Überweisung Erhalten Besten Dank",
+        ),
+    ];
+    assert_eq!(open_card_balance(&paid), Some(0));
     assert_eq!(open_card_balance(&[]), None);
 }
 
@@ -464,6 +812,82 @@ fn card_holds_are_replaced_on_each_sync() {
     std::fs::remove_file(path).ok();
 }
 
+/// A FinTS fetch whose hold list is incomplete (camt failed or was cut at its page
+/// limit, #1043) leaves the stored holds alone, also older ones; optimistic transfer
+/// bookings still go after 14 days.
+#[test]
+fn incomplete_fints_hold_list_keeps_old_holds() {
+    let (v, path) = demo_vault();
+    let conn = v
+        .add_bank_connection(ConnectorKind::FinTsGeneric, String::new(), "u".into())
+        .unwrap();
+    let acc = RemoteAccount {
+        external_ref: "f:1".into(),
+        name: "Giro".into(),
+        owner: String::new(),
+        iban: "DE02120300000000202051".into(),
+        account_number: String::new(),
+        currency: "EUR".into(),
+        kind: AccountKind::Checking,
+        balance_cents: 0,
+        balance_date: "2026-11-10".into(),
+    };
+    let pending = |id: &str| RemoteTransaction {
+        account_ref: "f:1".into(),
+        external_id: id.into(),
+        booking_date: "2026-10-01".into(),
+        value_date: "2026-10-01".into(),
+        amount_cents: -12_00,
+        currency: "EUR".into(),
+        counterparty: "Hotel".into(),
+        ..Default::default()
+    };
+    let hold = format!("{}1", crate::connectors::fints::camt::HOLD_PREFIX);
+    store_fetch(
+        &v,
+        ConnectorKind::FinTsGeneric,
+        conn,
+        FetchResult {
+            accounts: vec![acc.clone()],
+            transactions: vec![pending(&hold), pending("pending-transfer-1")],
+            hold_prefix: Some(crate::connectors::fints::camt::HOLD_PREFIX.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    v.db()
+        .unwrap()
+        .execute(
+            "UPDATE transactions SET imported_unix = strftime('%s','now') - 30*86400
+              WHERE external_id LIKE 'pending-%'",
+            [],
+        )
+        .unwrap();
+    // no `hold_prefix`: the list of open holds is not complete
+    store_fetch(
+        &v,
+        ConnectorKind::FinTsGeneric,
+        conn,
+        FetchResult {
+            accounts: vec![acc],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let open: Vec<String> = {
+        let db = v.db().unwrap();
+        let mut q = db
+            .prepare("SELECT external_id FROM transactions WHERE external_id LIKE 'pending-%' AND deleted_ms IS NULL")
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(open, vec![hold]);
+    std::fs::remove_file(path).ok();
+}
+
 #[test]
 fn pending_batch_booking_is_replaced_by_the_banks_booking_whatever_its_iban() {
     let (v, path) = demo_vault();
@@ -532,7 +956,7 @@ fn pending_batch_booking_is_replaced_by_the_banks_booking_whatever_its_iban() {
     };
     assert_eq!(pending(), 2);
     // A single payment of the same size is no batch booking: both stay pending.
-    let today = chrono::Local::now().date_naive().to_string();
+    let today = crate::dates::today().to_string();
     let other = RemoteTransaction {
         account_ref: "f:1".into(),
         external_id: "bank-0".into(),
@@ -551,8 +975,8 @@ fn pending_batch_booking_is_replaced_by_the_banks_booking_whatever_its_iban() {
     let booked = RemoteTransaction {
         account_ref: "f:1".into(),
         external_id: "bank-1".into(),
-        booking_date: chrono::Local::now().date_naive().to_string(),
-        value_date: chrono::Local::now().date_naive().to_string(),
+        booking_date: crate::dates::today().to_string(),
+        value_date: crate::dates::today().to_string(),
         amount_cents: -3_550,
         currency: "EUR".into(),
         counterparty: "A".into(),
@@ -731,9 +1155,10 @@ fn revoked_accounts_are_marked_and_new_ones_named() {
         ]
     );
     let accs = v.list_accounts().unwrap();
-    assert!(accs
-        .iter()
-        .any(|a| a.name == "Gemeinschaftskonto" && a.access_revoked));
+    assert!(
+        accs.iter()
+            .any(|a| a.name == "Gemeinschaftskonto" && a.access_revoked)
+    );
     std::fs::remove_file(path).ok();
 }
 
@@ -823,6 +1248,269 @@ fn automatic_names_and_bank_name_are_updated_user_names_kept() {
                 "Jay Licina".into()
             ),
         ]
+    );
+    std::fs::remove_file(path).ok();
+}
+
+/// #1002: a stored Festgeld stays one when a later retrieval reports the account as Savings.
+#[test]
+fn stored_time_deposit_is_not_turned_back_into_savings() {
+    let (v, path) = demo_vault();
+    let conn = v
+        .add_bank_connection(ConnectorKind::EnableBanking, String::new(), "Bank".into())
+        .unwrap();
+    let acc = |kind| RemoteAccount {
+        external_ref: "F".into(),
+        name: "Festgeld".into(),
+        owner: String::new(),
+        iban: String::new(),
+        account_number: String::new(),
+        currency: "EUR".into(),
+        kind,
+        balance_cents: 0,
+        balance_date: "2026-11-11".into(),
+    };
+    let fetch = |kind| {
+        store_fetch(
+            &v,
+            ConnectorKind::EnableBanking,
+            conn,
+            FetchResult {
+                accounts: vec![acc(kind)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+    let kind = || -> String {
+        v.db()
+            .unwrap()
+            .query_row(
+                "SELECT kind FROM accounts WHERE external_ref = 'F'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    fetch(AccountKind::TimeDeposit);
+    assert_eq!(kind(), "time_deposit");
+    fetch(AccountKind::Savings);
+    assert_eq!(kind(), "time_deposit");
+    std::fs::remove_file(path).ok();
+}
+
+/// #1630: a Bausparvertrag stored as savings before becomes "building_savings" (kind, symbol and
+/// section) with the next retrieval; set by hand, it stays one when a bank reports Savings.
+#[test]
+fn stored_savings_becomes_building_savings_and_stays_one() {
+    let (v, path) = demo_vault();
+    let conn = v
+        .add_bank_connection(ConnectorKind::Bhw, String::new(), "Bausparer".into())
+        .unwrap();
+    let fetch = |kind| {
+        store_fetch(
+            &v,
+            ConnectorKind::Bhw,
+            conn,
+            FetchResult {
+                accounts: vec![RemoteAccount {
+                    external_ref: "B".into(),
+                    name: "Bausparvertrag".into(),
+                    owner: String::new(),
+                    iban: String::new(),
+                    account_number: String::new(),
+                    currency: "EUR".into(),
+                    kind,
+                    balance_cents: 1_000_00,
+                    balance_date: "2026-11-11".into(),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+    let stored = || -> (String, String, String) {
+        v.db()
+            .unwrap()
+            .query_row(
+                "SELECT a.kind, a.sf_symbol, g.builtin_role FROM accounts a
+                   JOIN account_groups g ON g.id = a.group_id WHERE a.external_ref = 'B'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    };
+    // stored by a build before #1630
+    fetch(AccountKind::Savings);
+    assert_eq!(stored().0, "savings");
+    fetch(AccountKind::BuildingSavings);
+    assert_eq!(
+        stored(),
+        (
+            "building_savings".to_string(),
+            AccountKind::BuildingSavings.sf_symbol().to_string(),
+            "Bausparen".to_string()
+        )
+    );
+    // a bank that still says Savings does not turn it back
+    fetch(AccountKind::Savings);
+    assert_eq!(stored().0, "building_savings");
+    std::fs::remove_file(path).ok();
+}
+
+/// #1630, review of #1650: an unlinked account that a fetch adopts by IBAN takes a new kind
+/// with its symbol and section; one set to Bausparen by hand stays Bausparen on a Savings fetch.
+#[test]
+fn unlinked_account_adopted_as_building_savings_gets_its_section() {
+    let (v, path) = demo_vault();
+    let conn = v
+        .add_bank_connection(ConnectorKind::Bhw, String::new(), "Bausparer".into())
+        .unwrap();
+    let unlinked = |name: &str, iban: &str| -> i64 {
+        let id = v
+            .create_offline_account(name.into(), AccountKind::Savings, "EUR".into(), 0)
+            .unwrap();
+        v.db()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET iban = ?1 WHERE id = ?2",
+                rusqlite::params![iban, id],
+            )
+            .unwrap();
+        id
+    };
+    let fetched = |name: &str, iban: &str, kind| RemoteAccount {
+        external_ref: iban.into(),
+        name: name.into(),
+        owner: String::new(),
+        iban: iban.into(),
+        account_number: String::new(),
+        currency: "EUR".into(),
+        kind,
+        balance_cents: 0,
+        balance_date: "2026-11-11".into(),
+    };
+    let state = |id: i64| -> (Option<i64>, String, String, String) {
+        v.db()
+            .unwrap()
+            .query_row(
+                "SELECT a.connection_id, a.kind, a.sf_symbol, g.builtin_role FROM accounts a
+                   JOIN account_groups g ON g.id = a.group_id WHERE a.id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    };
+    let converted = unlinked("Vertrag A", "DE02120300000000202051");
+    let by_hand = unlinked("Vertrag B", "DE12500105170648489890");
+    v.set_account_kind(by_hand, AccountKind::BuildingSavings)
+        .unwrap();
+    store_fetch(
+        &v,
+        ConnectorKind::Bhw,
+        conn,
+        FetchResult {
+            accounts: vec![
+                fetched(
+                    "Vertrag A",
+                    "DE02120300000000202051",
+                    AccountKind::BuildingSavings,
+                ),
+                fetched("Vertrag B", "DE12500105170648489890", AccountKind::Savings),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let bausparen = (
+        Some(conn),
+        "building_savings".to_string(),
+        AccountKind::BuildingSavings.sf_symbol().to_string(),
+        "Bausparen".to_string(),
+    );
+    assert_eq!(
+        state(converted),
+        bausparen,
+        "kind, symbol and section move together"
+    );
+    assert_eq!(
+        state(by_hand).1,
+        "building_savings",
+        "a Savings report keeps it"
+    );
+    std::fs::remove_file(path).ok();
+}
+
+/// #1002: an unlinked Festgeld that a Savings fetch adopts by IBAN is linked,
+/// but keeps its kind, symbol and group.
+#[test]
+fn unlinked_time_deposit_adopted_by_savings_fetch_keeps_kind() {
+    let (v, path) = demo_vault();
+    let iban = "DE02120300000000202051";
+    let id = v
+        .create_offline_account("Festgeld".into(), AccountKind::TimeDeposit, "EUR".into(), 0)
+        .unwrap();
+    v.db()
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET iban = ?1 WHERE id = ?2",
+            rusqlite::params![iban, id],
+        )
+        .unwrap();
+    let state = || -> (Option<i64>, String, Option<String>, Option<i64>) {
+        v.db()
+            .unwrap()
+            .query_row(
+                "SELECT connection_id, kind, sf_symbol, group_id FROM accounts WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    };
+    let (linked, kind, symbol, group) = state();
+    assert_eq!(linked, None);
+    assert_eq!(kind, "time_deposit");
+
+    let conn = v
+        .add_bank_connection(ConnectorKind::EnableBanking, String::new(), "Bank".into())
+        .unwrap();
+    store_fetch(
+        &v,
+        ConnectorKind::EnableBanking,
+        conn,
+        FetchResult {
+            accounts: vec![RemoteAccount {
+                external_ref: "FG-1".into(),
+                name: "Festgeld".into(),
+                owner: String::new(),
+                iban: iban.into(),
+                account_number: String::new(),
+                currency: "EUR".into(),
+                kind: AccountKind::Savings,
+                balance_cents: 0,
+                balance_date: "2026-11-11".into(),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let live: i64 = v
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM accounts WHERE iban = ?1 AND deleted_ms IS NULL",
+            [iban],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        live, 1,
+        "the stored account is adopted, no second one created"
+    );
+    assert_eq!(
+        state(),
+        (Some(conn), "time_deposit".to_string(), symbol, group)
     );
     std::fs::remove_file(path).ok();
 }
@@ -1054,11 +1742,12 @@ async fn magic_demo_login_syncs_without_network_or_product_id() {
         SyncStep::Finished { .. } => {}
         other => panic!("expected finish, got {other:?}"),
     }
-    assert!(v
-        .list_accounts()
-        .unwrap()
-        .iter()
-        .any(|a| a.connection_id == Some(id)));
+    assert!(
+        v.list_accounts()
+            .unwrap()
+            .iter()
+            .any(|a| a.connection_id == Some(id))
+    );
     // Any other login still needs the product ID.
     let other = v
         .add_fints_connection(
@@ -1126,6 +1815,208 @@ async fn demo_push_tan_flow_imports_and_categorises() {
     let _ = std::fs::remove_file(path);
 }
 
+/// "<Konto> abrufen" (#1124): only that account of the login is stored.
+#[tokio::test]
+async fn account_sync_stores_only_that_account() {
+    let (v, path) = demo_vault();
+    let conn = v
+        .list_bank_connections()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.connector == ConnectorKind::VolksbankKasselGoettingen)
+        .unwrap();
+    let accounts: Vec<_> = v
+        .list_accounts()
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.connection_id == Some(conn.id))
+        .collect();
+    assert!(accounts.len() > 1, "the demo login has several accounts");
+    let giro = accounts
+        .iter()
+        .find(|a| a.name == "Musterbank Girokonto")
+        .unwrap();
+    let other = accounts.iter().find(|a| a.id != giro.id).unwrap();
+    let last_sync = |v: &Arc<Vault>| {
+        v.list_bank_connections()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == conn.id)
+            .unwrap()
+            .last_sync_unix
+    };
+    let synced_before = last_sync(&v);
+    async fn run(s: &SyncSession) -> SyncSummary {
+        let mut step = s.start().await.unwrap();
+        loop {
+            match step {
+                SyncStep::Finished { summary } => return summary,
+                _ => step = s.poll().await.unwrap(),
+            }
+        }
+    }
+    // The demo bank books its new entry on the giro account: syncing
+    // another account of the login leaves it out.
+    let s = v
+        .clone()
+        .begin_account_sync(other.id, "pin".into(), true)
+        .unwrap();
+    assert_eq!(run(&s).await.transactions_imported, 0);
+    let stored = |id: i64| {
+        v.list_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == id)
+            .unwrap()
+    };
+    assert_eq!(stored(giro.id).balance_cents, giro.balance_cents);
+    assert!(accounts.iter().all(|a| !stored(a.id).access_revoked));
+    // the login counts as synced only after a full sync (automatic sync)
+    assert_eq!(last_sync(&v), synced_before);
+    // the fetched account notes its own time (#1716), the others keep theirs
+    let now = crate::dates::now_ms() / 1000;
+    let fetched = stored(other.id)
+        .last_fetch_unix
+        .expect("fetch time of the account");
+    assert!(
+        (now - 10..=now + 10).contains(&fetched),
+        "{fetched} vs {now}"
+    );
+    for a in accounts.iter().filter(|a| a.id != other.id) {
+        assert_eq!(
+            stored(a.id).last_fetch_unix,
+            a.last_fetch_unix,
+            "{}",
+            a.name
+        );
+    }
+    let s = v
+        .clone()
+        .begin_account_sync(giro.id, "pin".into(), true)
+        .unwrap();
+    assert_eq!(run(&s).await.transactions_imported, 1);
+    assert_eq!(stored(giro.id).balance_cents, giro.balance_cents - 27_65);
+    // an archived account is not synced at all: everything would be dropped
+    v.set_account_archived(other.id, true).unwrap();
+    assert!(matches!(
+        v.clone().begin_account_sync(other.id, "pin".into(), true),
+        Err(CoreError::InvalidInput { .. })
+    ));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn single_account_sync_of_a_moneymoney_ref_syncs_the_whole_login() {
+    use super::persist::single_account_ref;
+    let none = || -> CoreResult<Vec<String>> { Ok(vec![]) };
+    assert_eq!(
+        single_account_ref("DE02120300000000202051".into(), none).unwrap(),
+        Some("DE02120300000000202051".into())
+    );
+    // marked by "Abrufweg umstellen", or imported and not yet taken over (#1417)
+    for r in [
+        "moneymoney-db:switch:DE02120300000000202051",
+        "moneymoney-db:A1B2C3",
+    ] {
+        assert_eq!(single_account_ref(r.into(), none).unwrap(), None, "{r}");
+        let skipped = || -> CoreResult<Vec<String>> { Ok(vec![r.to_string()]) };
+        assert!(matches!(
+            single_account_ref(r.into(), skipped),
+            Err(CoreError::InvalidInput { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn account_sync_after_switching_takes_the_account_over() {
+    let (v, path) = demo_vault();
+    let conn = v
+        .list_bank_connections()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.connector == ConnectorKind::VolksbankKasselGoettingen)
+        .unwrap();
+    let giro = v
+        .list_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.connection_id == Some(conn.id) && a.name == "Musterbank Girokonto")
+        .unwrap();
+    let ext = |v: &Arc<Vault>| -> String {
+        v.db()
+            .unwrap()
+            .query_row(
+                "SELECT external_ref FROM accounts WHERE id = ?1",
+                [giro.id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let old = ext(&v);
+    // as "Abrufweg umstellen" leaves it: the account under the marked ref
+    v.db()
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET external_ref = ?1 WHERE id = ?2",
+            params![format!("moneymoney-db:switch:{old}"), giro.id],
+        )
+        .unwrap();
+    let s = v
+        .clone()
+        .begin_account_sync(giro.id, "pin".into(), true)
+        .unwrap();
+    let mut step = s.start().await.unwrap();
+    let summary = loop {
+        match step {
+            SyncStep::Finished { summary } => break summary,
+            _ => step = s.poll().await.unwrap(),
+        }
+    };
+    // the whole login was synced: the account is taken over and gets its booking
+    assert_eq!(ext(&v), old);
+    assert_eq!(summary.transactions_imported, 1);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn only_among_names_the_account_of_a_single_account_sync() {
+    let refs = vec!["a".to_string(), "b".to_string()];
+    let mut ctx = ConnectContext::default();
+    assert_eq!(ctx.only_among(&refs), None);
+    ctx.only_account = Some("b".into());
+    assert_eq!(ctx.only_among(&refs), Some("b"));
+    // not among the bank's accounts under its stored ref: all, cut down later
+    ctx.only_account = Some("old-b".into());
+    assert_eq!(ctx.only_among(&refs), None);
+}
+
+#[test]
+fn keep_only_follows_a_renamed_ref_and_keeps_revocations() {
+    let account = |r: &str| RemoteAccount {
+        external_ref: r.into(),
+        name: String::new(),
+        owner: String::new(),
+        iban: String::new(),
+        account_number: String::new(),
+        currency: "EUR".into(),
+        kind: AccountKind::Checking,
+        balance_cents: 0,
+        balance_date: String::new(),
+    };
+    let mut data = FetchResult {
+        accounts: vec![account("new-a"), account("b")],
+        renamed_refs: vec![("a".into(), "new-a".into())],
+        revoked_refs: vec!["c".into()],
+        accounts_complete: true,
+        ..Default::default()
+    };
+    data.keep_only("a");
+    assert_eq!(data.accounts.len(), 1);
+    assert_eq!(data.accounts[0].external_ref, "new-a");
+    assert_eq!(data.revoked_refs, ["c"]);
+    assert!(!data.accounts_complete && data.single_account);
+}
+
 #[tokio::test]
 async fn demo_code_and_redirect_flows() {
     let (v, path) = demo_vault();
@@ -1182,6 +2073,79 @@ async fn demo_code_and_redirect_flows() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn amounts_above_the_sepa_limit_are_rejected_before_the_tan() {
+    use crate::connectors::fints::sepa::MAX_AMOUNT_CENTS;
+    use crate::models::{StandingOrderAction, StandingOrderRequest};
+    let (v, path) = demo_vault();
+    let acc = v
+        .list_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "Musterbank Girokonto" && a.connection_id.is_some())
+        .unwrap();
+    let transfer =
+        |amount: i64, instant: bool, execution_date: Option<String>| SepaTransferRequest {
+            account_id: acc.id,
+            recipient_name: "Müller GmbH".into(),
+            recipient_iban: "DE89370400440532013000".into(),
+            recipient_bic: None,
+            amount_cents: amount,
+            purpose: "Rechnung 42".into(),
+            instant,
+            execution_date,
+        };
+    let later = crate::dates::iso(crate::dates::today() + crate::dates::days(10));
+    for (instant, date) in [(false, None), (true, None), (false, Some(later.clone()))] {
+        assert!(
+            v.clone()
+                .begin_transfer(
+                    transfer(MAX_AMOUNT_CENTS, instant, date.clone()),
+                    "pin".into(),
+                    true
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            v.clone().begin_transfer(
+                transfer(MAX_AMOUNT_CENTS + 1, instant, date),
+                "pin".into(),
+                true
+            ),
+            Err(CoreError::InvalidInput { .. })
+        ));
+    }
+    // A valid monthly schedule (first date on the execution day), so only the
+    // amount decides.
+    let first_of_month = (crate::dates::today() + crate::dates::days(40)).first_of_month();
+    let order = |amount: i64| StandingOrderRequest {
+        account_id: acc.id,
+        action: StandingOrderAction::Create,
+        order_row_id: None,
+        recipient_name: "Vermieter".into(),
+        recipient_iban: "DE89370400440532013000".into(),
+        recipient_bic: None,
+        amount_cents: amount,
+        purpose: "Miete".into(),
+        first_date: crate::dates::iso(first_of_month),
+        last_date: None,
+        time_unit: "M".into(),
+        interval: 1,
+        exec_day: 1,
+    };
+    assert!(
+        v.clone()
+            .begin_standing_order(order(MAX_AMOUNT_CENTS), "pin".into(), true)
+            .is_ok()
+    );
+    assert!(matches!(
+        v.clone()
+            .begin_standing_order(order(MAX_AMOUNT_CENTS + 1), "pin".into(), true),
+        Err(CoreError::InvalidInput { .. })
+    ));
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test(start_paused = true)]
 async fn demo_transfer_flow_adds_pending_booking_and_suggests_recipient() {
     let (v, path) = demo_vault();
@@ -1201,14 +2165,16 @@ async fn demo_transfer_flow_adds_pending_booking_and_suggests_recipient() {
         instant: true,
         execution_date: None,
     };
-    assert!(v
-        .clone()
-        .begin_transfer(req("DE89370400440532013001", 100), "pin".into(), true)
-        .is_err());
-    assert!(v
-        .clone()
-        .begin_transfer(req("DE89370400440532013000", 0), "pin".into(), true)
-        .is_err());
+    assert!(
+        v.clone()
+            .begin_transfer(req("DE89370400440532013001", 100), "pin".into(), true)
+            .is_err()
+    );
+    assert!(
+        v.clone()
+            .begin_transfer(req("DE89370400440532013000", 0), "pin".into(), true)
+            .is_err()
+    );
     let s = v
         .clone()
         .begin_transfer(req("DE89 3704 0044 0532 0130 00", 1250), "pin".into(), true)
@@ -1403,6 +2369,42 @@ async fn demo_transfer_flow_adds_pending_booking_and_suggests_recipient() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Order accounts (Amazon) are proof accounts: they start outside the overall
+/// money totals (#337), only on creation — a re-fetch keeps the user's choice.
+#[test]
+fn amazon_accounts_start_outside_the_totals_only_on_creation() {
+    let p_dir = crate::test_support::TempDir::new("girocrab-amz-total");
+    let p = p_dir.join("v.db");
+    let v = Vault::open(p.to_string_lossy().to_string(), vec![3u8; 32]).unwrap();
+    let conn = v
+        .add_bank_connection(ConnectorKind::AmazonOrders, String::new(), "login".into())
+        .unwrap();
+    let mk = || FetchResult {
+        accounts: vec![RemoteAccount {
+            external_ref: "orders".into(),
+            name: "Amazon Bestellungen".into(),
+            owner: String::new(),
+            iban: String::new(),
+            account_number: String::new(),
+            currency: "EUR".into(),
+            kind: AccountKind::PaymentService,
+            balance_cents: 0,
+            balance_date: "2026-11-16".into(),
+        }],
+        ..Default::default()
+    };
+    store_fetch(&v, ConnectorKind::AmazonOrders, conn, mk()).unwrap();
+    let acc = v.list_accounts().unwrap().pop().unwrap();
+    assert!(!acc.include_in_total, "new order account starts excluded");
+    assert!(!acc.in_total, "effective flag follows");
+    // the user switches it back on; the next fetch keeps that choice
+    v.set_account_include_in_total(acc.id, true).unwrap();
+    store_fetch(&v, ConnectorKind::AmazonOrders, conn, mk()).unwrap();
+    let acc = v.list_accounts().unwrap().pop().unwrap();
+    assert!(acc.include_in_total, "re-fetch keeps the user's choice");
+    assert!(acc.in_total);
+}
+
 mod account_selection;
 mod bank_name;
 mod banking_gate;
@@ -1410,8 +2412,13 @@ mod batch_transfer;
 mod body_limit;
 mod content_id;
 mod direct_debit;
+mod document_matching;
+mod fetch_prompt;
+mod history;
+mod import_takeover;
 mod payment_method;
 mod postbox;
+pub(crate) mod redirects;
 mod standing_order;
 mod statements_auto;
 mod transfer_cancel;
@@ -1500,6 +2507,51 @@ fn fetch_with_document() -> FetchResult {
         }],
         ..Default::default()
     }
+}
+
+#[test]
+fn comdirect_keeps_an_ambiguous_postbox_document_without_an_account() {
+    let dir = crate::test_support::TempDir::new("girocrab-comdirect-ambiguous-postbox");
+    let v = Vault::open(
+        dir.join("v.db").to_string_lossy().into_owned(),
+        vec![3u8; 32],
+    )
+    .unwrap();
+    let kind = ConnectorKind::Comdirect;
+    let conn = v
+        .add_bank_connection(kind, String::new(), "login".into())
+        .unwrap();
+    let mut fetched = fetch_with_document();
+    let first = &mut fetched.accounts[0];
+    first.external_ref = "giro-1".into();
+    first.name = "Girokonto 1".into();
+    first.iban = "DE75200411550765432100".into();
+    fetched.accounts.push(RemoteAccount {
+        external_ref: "giro-2".into(),
+        name: "Girokonto 2".into(),
+        iban: "DE61200411550876543210".into(),
+        ..fetched.accounts[0].clone()
+    });
+    let notice = &mut fetched.documents[0];
+    notice.account_ref.clear();
+    notice.title = "Kundeninformation".into();
+    notice.source_url = "comdirect:postbox:ambiguous".into();
+    comdirect_postbox::assign_documents(
+        &mut fetched.documents,
+        &fetched.accounts.iter().collect::<Vec<_>>(),
+    );
+    assert!(fetched.documents[0].account_ref.is_empty());
+    store_fetch(&v, kind, conn, fetched).unwrap();
+    let account_id: Option<i64> = v
+        .db()
+        .unwrap()
+        .query_row(
+            "SELECT account_id FROM booking_documents WHERE source_url = ?1",
+            ["comdirect:postbox:ambiguous"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(account_id, None);
 }
 
 #[test]
@@ -1658,26 +2710,30 @@ fn a_fetch_stores_no_documents_while_retrieval_is_off() {
         .add_bank_connection(ConnectorKind::TradeRepublic, String::new(), "login".into())
         .unwrap();
     v.set_documents_fetch(conn, false).unwrap();
-    store_fetch(
+    let summary = store_fetch(
         &v,
         ConnectorKind::TradeRepublic,
         conn,
         fetch_with_document(),
     )
     .unwrap();
-    assert!(v
-        .list_all_documents(crate::documents::DocumentFilter::default())
-        .unwrap()
-        .is_empty());
+    // the log can say why no document came
+    assert!(summary.documents_off);
+    assert!(
+        v.list_all_documents(crate::documents::DocumentFilter::default())
+            .unwrap()
+            .is_empty()
+    );
     // on again: the same delivery is stored
     v.set_documents_fetch(conn, true).unwrap();
-    store_fetch(
+    let on = store_fetch(
         &v,
         ConnectorKind::TradeRepublic,
         conn,
         fetch_with_document(),
     )
     .unwrap();
+    assert!(!on.documents_off);
     assert_eq!(
         v.list_all_documents(crate::documents::DocumentFilter::default())
             .unwrap()
@@ -1699,9 +2755,118 @@ fn portal_connections_list_nothing_to_download_while_retrieval_is_off() {
         .unwrap();
     v.set_documents_fetch(conn, false).unwrap();
     // not even a list that would be invalid is looked at
-    assert!(v
-        .clone()
-        .pending_fnz_documents(conn, "kein json".into())
-        .unwrap()
-        .is_empty());
+    assert!(
+        v.clone()
+            .pending_fnz_documents(conn, "kein json".into())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn managed_hold_prefix_survives_same_amount_payment_until_removed_from_list() {
+    let _p_dir = crate::test_support::TempDir::new("girocrab-hold-1111");
+    let v = Vault::open(
+        _p_dir.join("v.db").to_string_lossy().to_string(),
+        vec![3u8; 32],
+    )
+    .unwrap();
+    let conn = v
+        .add_bank_connection(
+            ConnectorKind::PayPal,
+            String::new(),
+            "user@example.com".into(),
+        )
+        .unwrap();
+    let mut f1 = FetchResult::default();
+    f1.accounts.push(RemoteAccount {
+        external_ref: "paypal:EUR".into(),
+        name: "PayPal".into(),
+        owner: "user@example.com".into(),
+        iban: String::new(),
+        account_number: "user@example.com".into(),
+        currency: "EUR".into(),
+        kind: AccountKind::PaymentService,
+        balance_cents: 100_00,
+        balance_date: "2026-11-18".into(),
+    });
+    f1.hold_prefix = Some("pending-hold-paypal-".into());
+    f1.transactions.push(RemoteTransaction {
+        account_ref: "paypal:EUR".into(),
+        external_id: "pending-hold-paypal-H1".into(),
+        booking_date: "2026-11-18".into(),
+        value_date: "2026-11-18".into(),
+        amount_cents: -30_00,
+        currency: "EUR".into(),
+        counterparty: "Hotel".into(),
+        ..Default::default()
+    });
+    // Gleich hoher anderer Kauf am Folgetag ohne Gegen-IBAN
+    f1.transactions.push(RemoteTransaction {
+        account_ref: "paypal:EUR".into(),
+        external_id: "TX-OTHER-30".into(),
+        booking_date: "2026-11-19".into(),
+        value_date: "2026-11-19".into(),
+        amount_cents: -30_00,
+        currency: "EUR".into(),
+        counterparty: "Shop".into(),
+        ..Default::default()
+    });
+    let saved_accounts = f1.accounts.clone();
+    store_fetch(&v, ConnectorKind::PayPal, conn, f1).unwrap();
+
+    let active_holds = || -> Vec<String> {
+        let db = v.db().unwrap();
+        let mut q = db
+            .prepare("SELECT external_id FROM transactions WHERE external_id LIKE 'pending-hold-paypal-%' AND deleted_ms IS NULL")
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(active_holds(), vec!["pending-hold-paypal-H1"]);
+
+    // Erst wenn die Reservierung nicht mehr in der offenen Liste steht, wird sie gelöscht
+    let f2 = FetchResult {
+        accounts: saved_accounts,
+        hold_prefix: Some("pending-hold-paypal-".into()),
+        ..Default::default()
+    };
+    store_fetch(&v, ConnectorKind::PayPal, conn, f2).unwrap();
+    assert!(active_holds().is_empty());
+}
+
+#[test]
+fn sync_moves_a_retired_fints_url_to_the_current_endpoint() {
+    let (v, _path) = demo_vault();
+    let id = v
+        .add_fints_connection(
+            "30060601".into(),
+            "https://fints1.atruvia.de/cgi-bin/hbciservlet".into(),
+            "apoBank".into(),
+            "nutzer".into(),
+            String::new(),
+        )
+        .unwrap();
+    let _ = v.clone().begin_sync(id, "12345".into(), true);
+    assert_eq!(
+        v.get_setting("fints.url.30060601".into()).unwrap(),
+        Some("https://fints.apobank.de/FinTs30PinTanHttpGate".into())
+    );
+}
+
+#[test]
+fn single_account_ref_refuses_switched_account_excluded_in_selection() {
+    let res = crate::connectors::persist::single_account_ref(
+        "moneymoney-db:switch:DE89370400440532013000".into(),
+        || Ok(vec!["DE89370400440532013000".into()]),
+    );
+    assert!(res.is_err());
+    let ok = crate::connectors::persist::single_account_ref(
+        "moneymoney-db:switch:DE89370400440532013000".into(),
+        || Ok(vec!["OTHER".into()]),
+    )
+    .unwrap();
+    assert_eq!(ok, None);
 }

@@ -48,7 +48,8 @@ ColumnLayout {
     onStepChanged: if (host) host.importRunning = step === "importing"
 
     readonly property var kindChoices: [
-        { id: "Checking", text: qsTr("Girokonto") }, { id: "Savings", text: qsTr("Tagesgeld / Sparen") },
+        { id: "Checking", text: qsTr("Girokonto") }, { id: "Savings", text: qsTr("Tagesgeld / Sparen") }, { id: "TimeDeposit", text: qsTr("Festgeld") },
+        { id: "BuildingSavings", text: qsTr("Bausparen") },
         { id: "CreditCard", text: qsTr("Kreditkarte") }, { id: "PaymentService", text: qsTr("Zahlungsdienst") },
         { id: "Brokerage", text: qsTr("Depot") }, { id: "Cash", text: qsTr("Bargeld") }, { id: "Loan", text: qsTr("Darlehen") }
     ]
@@ -60,7 +61,7 @@ ColumnLayout {
         progress = null; cancelling = false; error = ""; result = null; checksExpanded = false
         tableSelection = ({}); tableAnchor = -1
         if (AppModel.demoDbPreview) {
-            filePath = "/home/max/MoneyMoney"
+            filePath = "/home/max/Finanzdaten"
             fileIsFolder = true
             password = "demo-passwort"
             apply(AppModel.demoDbPreview)
@@ -211,11 +212,42 @@ ColumnLayout {
     /// The bank's connection options (the core's catalogue; the live Enable
     /// Banking list of the Mac app is not loaded here).
     function connectionOptions(b) { return b.connection_options }
+    /// The accounts the import links to login `b`, the core's rule (#1437): chosen for import and
+    /// going into a new account or one an earlier import owns. One merged into a bank-synced
+    /// account still brings its bookings, but no connection for its login. "Neues Konto" goes
+    /// where the core sends it: an earlier import or the bank account that one was folded into.
+    function linkedAccounts(b) {
+        if (!preview) return []
+        const owned = preview.owned_account_ids || []
+        const connected = preview.connected_account_ids || []
+        // One already under a login is moved only by its own MoneyMoney account.
+        const planned = []
+        for (const a of preview.accounts) {
+            const c = choice(a)
+            const t = c.target === null || c.target === undefined ? a.reused_account_id : c.target
+            const isNew = t === null || t === undefined
+            if (!c.selected || a.mm_bank_id === null || a.mm_bank_id === undefined || !(isNew || owned.includes(t))) continue
+            planned.push({ a: a, t: isNew ? null : t, moves: isNew || !connected.includes(t) || t === a.reused_account_id })
+        }
+        // an account several sources go into links the login of the first one that may move
+        // it (import order); the other sources of that login count too, moving it or not
+        const loginOf = new Map()
+        for (const p of planned) {
+            if (p.moves && p.t !== null && !loginOf.has(p.t)) loginOf.set(p.t, p.a.mm_bank_id)
+        }
+        return planned.filter(p => p.a.mm_bank_id === b.mm_id && (p.t === null || loginOf.get(p.t) === b.mm_id))
+                      .map(p => p.a)
+    }
+    /// Every account linked to the login is closed in MoneyMoney (#1437).
+    function allClosed(b) { const a = linkedAccounts(b); return a.length > 0 && a.every(x => x.closed) }
+    /// Preselected: the best connection, none for a login whose linked
+    /// accounts are all closed; none at all without a linked account (#1437).
     function chosenKey(b) {
+        if (linkedAccounts(b).length === 0) return ""
         const k = bankChoice[b.mm_id]
         if (k !== undefined) return k
         const o = connectionOptions(b)
-        return o.length ? o[0].key : ""
+        return o.length && !allClosed(b) ? o[0].key : ""
     }
     function chosenOption(b) { const k = chosenKey(b); return connectionOptions(b).find(o => o.key === k) || null }
     function setBankChoice(b, key) { const c = Object.assign({}, bankChoice); c[b.mm_id] = key; bankChoice = c }
@@ -236,12 +268,12 @@ ColumnLayout {
     }
     readonly property bool needsEnableBankingSetup: createConnections && chosenEnableBanking && !enableBankingReady
     readonly property string ebBankNames: preview ? andList(preview.banks.filter(b => { const o = chosenOption(b); return o !== null && o.via === "EnableBanking" }).map(b => b.name)) : ""
-    /// The Enable Banking banks of this import with their selected accounts.
+    /// The Enable Banking banks of this import with their linked accounts.
     readonly property var plannedPsd2Links: {
         if (!preview) return []
         return preview.banks.filter(b => { const o = chosenOption(b); return o !== null && o.via === "EnableBanking" }).map(b => ({
             connection_id: -b.mm_id, bank_name: b.name, created: true,
-            accounts: preview.accounts.filter(a => a.mm_bank_id === b.mm_id && choice(a).selected)
+            accounts: linkedAccounts(b)
                 .map(a => ({ name: a.name, iban: a.iban, account_number: a.account_number }))
         }))
     }
@@ -256,13 +288,13 @@ ColumnLayout {
 
     FileDialog {
         id: filePicker
-        title: qsTr("MoneyMoney-Datenbank auswählen (MoneyMoney.sqlite)")
-        nameFilters: [qsTr("MoneyMoney-Datenbank (*.sqlite)"), qsTr("Alle Dateien (*)")]
+        title: qsTr("Datenbank auswählen (.sqlite)")
+        nameFilters: [qsTr("Datenbank (*.sqlite)"), qsTr("Alle Dateien (*)")]
         onAccepted: v.picked(v.pathOf(selectedFile), false)
     }
     FolderDialog {
         id: folderPicker
-        title: qsTr("Kopierten MoneyMoney-Ordner auswählen (mit Kontoauszügen)")
+        title: qsTr("Kopierten Ordner mit Datenbank und Kontoauszügen auswählen")
         onAccepted: v.picked(v.pathOf(selectedFolder), true)
     }
     FolderDialog {
@@ -357,7 +389,7 @@ ColumnLayout {
     function progressStatus(p) {
         if (!p || p.account_index === 0) return qsTr("Datenbank wird gelesen …")
         if (p.account_index > p.account_count) return qsTr("Bankzugänge und Gruppen werden angelegt …")
-        return qsTr("Konto %1 von %2 · %3").arg(p.account_index).arg(p.account_count).arg(p.account_name)
+        return qsTr("Konto %1 von %2 · %3").arg(p.account_index).arg(p.account_count).arg(AppModel.masking(p.account_name))
     }
     function progressCounts(p) {
         let s = qsTr("%1 von %2 Buchungen").arg(Fmt.count(p.bookings_done)).arg(Fmt.count(p.bookings_total))
@@ -398,7 +430,7 @@ ColumnLayout {
             }
             FormSection {
                 title: qsTr("Datenbank")
-                footers: [qsTr("MoneyMoney läuft nur auf dem Mac. Kopieren Sie dort den MoneyMoney-Ordner (~/Library/Containers/com.moneymoney-app.retail/Data/Library/Application Support/MoneyMoney) auf diesen Rechner und wählen Sie ihn hier, damit auch die Kontoauszüge übernommen werden. Eine einzelne Datei (MoneyMoney.sqlite), etwa aus einem Backup, geht auch."),
+                footers: [qsTr("Kopieren Sie den Ordner mit Datenbank und Kontoauszügen vom Mac auf diesen Rechner und wählen Sie ihn hier, damit auch die Kontoauszüge übernommen werden. Eine einzelne Datenbankdatei (.sqlite), etwa aus einem Backup, geht auch."),
                           qsTr("Kein Datenbank-Passwort festgelegt? Legen Sie vorher eines in dem Programm fest, das die Datenbank erstellt hat."),
                           qsTr("Das Passwort der Datenbank wurde nicht in GiroCrab festgelegt. Tragen Sie es hier im Feld oben ein.")]
                 ImportFileRow {
@@ -465,10 +497,10 @@ ColumnLayout {
                             anchors.fill: parent; anchors.leftMargin: 8; anchors.rightMargin: 14; spacing: 8
                             Item { Layout.preferredWidth: 22 }
                             Text { text: qsTr("Konto"); Layout.fillWidth: true; font.pixelSize: Theme.caption; color: Theme.secondary }
-                            Text { text: qsTr("Buchungen"); Layout.preferredWidth: 80; horizontalAlignment: Text.AlignRight; font.pixelSize: Theme.caption; color: Theme.secondary }
-                            Text { text: qsTr("Saldo"); Layout.preferredWidth: 110; horizontalAlignment: Text.AlignRight; font.pixelSize: Theme.caption; color: Theme.secondary }
-                            Text { text: qsTr("Kontoart"); Layout.preferredWidth: 150; font.pixelSize: Theme.caption; color: Theme.secondary }
-                            Text { visible: accountTable.showTarget; text: qsTr("Ziel"); Layout.preferredWidth: 170; font.pixelSize: Theme.caption; color: Theme.secondary }
+                            Text { text: qsTr("Buchungen"); Layout.preferredWidth: 80 * Theme.textScale; horizontalAlignment: Text.AlignRight; font.pixelSize: Theme.caption; color: Theme.secondary }
+                            Text { text: qsTr("Saldo"); Layout.preferredWidth: 110 * Theme.textScale; horizontalAlignment: Text.AlignRight; font.pixelSize: Theme.caption; color: Theme.secondary }
+                            Text { text: qsTr("Kontoart"); Layout.preferredWidth: 150 * Theme.textScale; font.pixelSize: Theme.caption; color: Theme.secondary }
+                            Text { visible: accountTable.showTarget; text: qsTr("Ziel"); Layout.preferredWidth: 170 * Theme.textScale; font.pixelSize: Theme.caption; color: Theme.secondary }
                         }
                     }
                     delegate: Rectangle {
@@ -489,28 +521,30 @@ ColumnLayout {
                                 Layout.preferredWidth: 22
                                 checked: rowItem.c.selected
                                 onToggled: v.setChoice(rowItem.modelData, { selected: checked })
-                                Accessible.name: qsTr("„%1“ importieren").arg(rowItem.modelData.name)
+                                Accessible.name: qsTr("„%1“ importieren").arg(AppModel.masking(rowItem.modelData.name))
                             }
                             ColumnLayout {
                                 spacing: 1; Layout.fillWidth: true
                                 opacity: rowItem.c.selected ? 1 : 0.5
-                                Text { text: rowItem.modelData.name; elide: Text.ElideRight; Layout.fillWidth: true; color: Theme.text; font.pixelSize: Theme.body }
-                                Text { text: v.accountSubtitle(rowItem.modelData); elide: Text.ElideRight; Layout.fillWidth: true; color: Theme.secondary; font.pixelSize: Theme.caption }
+                                Text { text: rowItem.modelData.name; elide: Text.ElideRight; Layout.fillWidth: true; color: Theme.text; font.pixelSize: Theme.body; Sensitive {} }
+                                Text { text: v.accountSubtitle(rowItem.modelData); elide: Text.ElideRight; Layout.fillWidth: true; color: Theme.secondary; font.pixelSize: Theme.caption; Sensitive {} }
                             }
                             Text {
-                                Layout.preferredWidth: 80; horizontalAlignment: Text.AlignRight
+                                Layout.preferredWidth: 80 * Theme.textScale; horizontalAlignment: Text.AlignRight
                                 text: Fmt.count(rowItem.modelData.booking_count); color: Theme.text; font.pixelSize: Theme.body; font.features: { "tnum": 1 }
                                 HoverHandler { id: bookingsHover }
                                 ToolTip.visible: bookingsHover.hovered && ToolTip.text !== ""; ToolTip.text: v.bookingSummary(rowItem.modelData); ToolTip.delay: 600
                             }
                             Text {
-                                Layout.preferredWidth: 110; horizontalAlignment: Text.AlignRight
+                                Layout.preferredWidth: 110 * Theme.textScale; horizontalAlignment: Text.AlignRight
                                 text: Fmt.money(rowItem.modelData.computed_balance_cents, rowItem.modelData.currency); color: Theme.text; font.pixelSize: Theme.body; font.features: { "tnum": 1 }
+                                Sensitive { amounts: true }
                                 HoverHandler { id: balanceHover }
                                 ToolTip.visible: balanceHover.hovered; ToolTip.text: rowItem.modelData.balance_source; ToolTip.delay: 600
                             }
                             AppComboBox {
-                                Layout.preferredWidth: 150
+                                Layout.preferredWidth: 150 * Theme.textScale   // .width(150 * textScale) (#650)
+                                Accessible.name: qsTr("Kontoart")   // Picker("Kontoart", …).labelsHidden() (ff91866)
                                 textRole: "text"
                                 model: v.kindChoices
                                 currentIndex: Math.max(0, v.kindChoices.findIndex(k => k.id === rowItem.c.kind))
@@ -519,7 +553,8 @@ ColumnLayout {
                             AppComboBox {
                                 id: targetBox
                                 visible: accountTable.showTarget
-                                Layout.preferredWidth: 170
+                                Layout.preferredWidth: 170 * Theme.textScale
+                                Accessible.name: qsTr("Ziel")
                                 textRole: "text"
                                 readonly property var a: rowItem.modelData
                                 model: {
@@ -590,7 +625,10 @@ ColumnLayout {
                 FormSection {
                     visible: v.preview !== null
                     enabled: v.createConnections
-                    footers: [v.createConnections && v.chosenEnableBanking && !v.enableBankingReady ? qsTr("Enable Banking richten Sie im nächsten Schritt ein.") : ""]
+                    footers: [
+                        v.preview && v.preview.banks.some(b => v.allClosed(b)) ? qsTr("Bei Zugängen, deren Konten alle aufgelöst sind, ist „Nicht verbinden“ vorgewählt.") : "",
+                        v.createConnections && v.chosenEnableBanking && !v.enableBankingReady ? qsTr("Enable Banking richten Sie im nächsten Schritt ein.") : ""
+                    ]
                     Repeater {
                         model: v.preview ? v.preview.banks : []
                         FormRow {
@@ -599,18 +637,15 @@ ColumnLayout {
                             readonly property var options: v.connectionOptions(modelData)
                             label: modelData.name !== "" ? modelData.name : v.connectorName(modelData.connector)
                             detail: v.bankDetail(modelData)
+                            // "Nicht verbinden" for every login (#1437)
                             AppComboBox {
-                                visible: bankRow.options.length > 1
+                                visible: bankRow.options.length > 0
+                                enabled: v.linkedAccounts(bankRow.modelData).length > 0
                                 Layout.preferredWidth: 240
                                 textRole: "text"
-                                model: bankRow.options.map(o => ({ key: o.key, text: v.optionLabel(o) })).concat([{ key: "", text: qsTr("Nicht verbinden") }])
+                                model: bankRow.options.map((o, i) => ({ key: o.key, text: v.optionLabel(o) + (i === 0 && bankRow.modelData.existing_connection_id !== null ? " · " + qsTr("vorhanden") : "") })).concat([{ key: "", text: qsTr("Nicht verbinden") }])
                                 currentIndex: Math.max(0, model.findIndex(o => o.key === v.chosenKey(bankRow.modelData)))
                                 onActivated: i => v.setBankChoice(bankRow.modelData, model[i].key)
-                            }
-                            Text {
-                                visible: bankRow.options.length === 1
-                                text: bankRow.options.length ? v.optionLabel(bankRow.options[0]) + (bankRow.modelData.existing_connection_id !== null ? " · " + qsTr("vorhanden") : "") : ""
-                                color: Theme.secondary; font.pixelSize: Theme.body
                             }
                             Text { visible: bankRow.options.length === 0; text: qsTr("Nicht verfügbar"); color: Theme.tertiary; font.pixelSize: Theme.body }
                         }
@@ -675,6 +710,7 @@ ColumnLayout {
                             label: modelData.bank_name
                             detail: modelData.accounts.map(a => [a.name, a.iban === "" ? (a.account_number === "" ? null : qsTr("Konto %1").arg(a.account_number)) : Fmt.iban(a.iban)]
                                                          .filter(x => !!x).join(" · ")).join("\n")
+                            personalDetail: true
                             Button { text: qsTr("Freigeben …"); onClicked: v.startConsent(modelData.connection_id) }
                         }
                     }
@@ -826,7 +862,7 @@ ColumnLayout {
                                  Accessible.name: modelData.ok ? qsTr("Stimmt") : qsTr("Weicht ab") }
                         ColumnLayout {
                             spacing: 1; Layout.fillWidth: true
-                            Text { text: modelData.name; elide: Text.ElideRight; Layout.fillWidth: true; color: Theme.text; font.pixelSize: Theme.body }
+                            Text { text: modelData.name; elide: Text.ElideRight; Layout.fillWidth: true; color: Theme.text; font.pixelSize: Theme.body; Sensitive {} }
                             Text { readonly property string note: cs.view.checkNote(modelData)
                                    visible: note !== ""; text: note; color: Theme.secondary; font.pixelSize: Theme.caption; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                         }
@@ -834,10 +870,10 @@ ColumnLayout {
                     Text { text: checkRow.found + " / " + modelData.mm_bookings; Layout.preferredWidth: 90; horizontalAlignment: Text.AlignRight
                            color: checkRow.found === modelData.mm_bookings ? Theme.text : Theme.warning; font.pixelSize: Theme.body; font.features: { "tnum": 1 } }
                     Text { text: Fmt.money(modelData.mm_balance_cents, modelData.currency); Layout.preferredWidth: 120; horizontalAlignment: Text.AlignRight
-                           color: Theme.text; font.pixelSize: Theme.body; font.features: { "tnum": 1 } }
+                           color: Theme.text; font.pixelSize: Theme.body; font.features: { "tnum": 1 }; Sensitive { amounts: true } }
                     Text { text: Fmt.money(modelData.girocrab_balance_cents, modelData.currency); Layout.preferredWidth: 120; horizontalAlignment: Text.AlignRight
                            color: modelData.balance_from_bank || modelData.girocrab_balance_cents === modelData.mm_balance_cents ? Theme.text : Theme.warning
-                           font.pixelSize: Theme.body; font.features: { "tnum": 1 } }
+                           font.pixelSize: Theme.body; font.features: { "tnum": 1 }; Sensitive { amounts: true } }
                 }
             }
         }

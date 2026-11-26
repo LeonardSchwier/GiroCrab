@@ -115,22 +115,30 @@ Sheet {
                     }
                     FormRow {
                         label: qsTr("IBAN")
-                        TextField {
-                            Layout.preferredWidth: 280; horizontalAlignment: TextInput.AlignRight
-                            placeholderText: qsTr("DE00 …")
-                            font.family: "monospace"
-                            inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhPreferUppercase
-                            text: sheet.draft.iban
-                            onTextEdited: Payments.setStanding({ iban: AppModel.groupedIBAN(text) })
-                            Sensitive {}
-                        }
-                        SFIcon {
-                            opacity: sheet.draft.iban !== "" && !sheet.ibanValid ? 1 : 0
-                            symbol: "xmark.circle.fill"; size: 16; color: Theme.negative
-                            HoverHandler { id: ibanHover }
-                            ToolTip.visible: ibanHover.hovered && opacity > 0
-                            ToolTip.text: qsTr("IBAN ungültig (Prüfsumme/Länge)")
-                            Accessible.name: qsTr("IBAN ungültig")
+                        // .withBankLine: the bank under field and mark, the line kept while there is none (#1584)
+                        ColumnLayout {
+                            spacing: 4
+                            RowLayout {
+                                spacing: 8
+                                TextField {
+                                    Layout.preferredWidth: 280; horizontalAlignment: TextInput.AlignRight
+                                    placeholderText: qsTr("DE00 …")
+                                    font.family: "monospace"
+                                    inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhPreferUppercase
+                                    text: sheet.draft.iban
+                                    onTextEdited: Payments.setStanding({ iban: AppModel.groupedIBAN(text) })
+                                    Sensitive {}
+                                }
+                                SFIcon {
+                                    opacity: sheet.draft.iban !== "" && !sheet.ibanValid ? 1 : 0
+                                    symbol: "xmark.circle.fill"; size: 16; color: Theme.negative
+                                    HoverHandler { id: ibanHover }
+                                    ToolTip.visible: ibanHover.hovered && opacity > 0
+                                    ToolTip.text: qsTr("IBAN ungültig (Prüfsumme/Länge)")
+                                    Accessible.name: qsTr("IBAN ungültig")
+                                }
+                            }
+                            IBANBankLine { iban: sheet.draft.iban; Layout.preferredWidth: 1 }
                         }
                     }
                     FormRow {
@@ -141,7 +149,7 @@ Sheet {
                             font.features: { "tnum": 1 }
                             text: sheet.draft.amountText
                             onTextEdited: Payments.setStanding({ amountText: text })
-                            Sensitive {}
+                            Sensitive { amounts: true }
                         }
                     }
                     FormRow {
@@ -243,12 +251,14 @@ Sheet {
                         width: parent.width
                         spacing: 10
                         Text { text: Fmt.money(sheet.cents === null ? 0 : sheet.cents); font.pixelSize: Theme.title; font.weight: Font.DemiBold
-                               font.features: { "tnum": 1 }; color: Theme.text; Sensitive {} }
+                               font.features: { "tnum": 1 }; color: Theme.text; Sensitive { amounts: true } }
                         Text { text: Payments.rhythmText(sheet.draft) + " · " + Payments.execDayText(sheet.draft)
                                font.pixelSize: Theme.callout; color: Theme.secondary }
                         Line { label: qsTr("Von Konto"); value: sheet.account ? sheet.account.name + " · " + Fmt.iban(sheet.account.iban) : "" }
                         Line { label: qsTr("Empfänger"); value: sheet.draft.name }
                         Line { label: qsTr("IBAN"); value: sheet.draft.iban; mono: true }
+                        Line { readonly property string bank: AppModel.bankNameForIban(sheet.draft.iban) || ""
+                               visible: bank !== ""; label: qsTr("Bank"); value: bank }
                         Line { visible: sheet.draft.purpose !== ""; label: qsTr("Verwendungszweck"); value: sheet.draft.purpose }
                         Line { label: qsTr("Erste Ausführung"); value: Fmt.medium(Fmt.iso(sheet.draft.firstDate)); personal: false }
                         Line { label: qsTr("Letzte Ausführung"); personal: false
@@ -325,6 +335,7 @@ Sheet {
     // RootView: .alert("Status des Dauerauftrags unklar")
     Sheet {
         id: unknownDialog
+        reportCapturable: false   // an alert on the Mac (ReportDialogs.qml)
         sheetWidth: 440
         visible: Payments.standingUnknown !== null
         onClosed: Payments.standingUnknown = null

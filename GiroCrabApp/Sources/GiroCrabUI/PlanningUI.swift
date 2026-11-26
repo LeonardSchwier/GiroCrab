@@ -22,18 +22,29 @@ extension AppModel {
         return try? await vaultOffMain { try $0.listTransactionSplits(transactionId: id) }
     }
 
+    /// Opens „Umsatz aufteilen“; `percent` (#1663) puts that share of the booking into the second
+    /// part of a booking that is not split yet.
+    func openSplit(_ booking: Booking, percent: Int64? = nil) {
+        splitPresetPercent = percent
+        splitBooking = booking
+    }
+
     func saveSplits(_ parts: [TransactionSplitInput], for booking: Booking) -> String? {
         guard let vault else { return nil }
         do { try vault.setTransactionSplits(transactionId: booking.id, splits: parts) } catch { return "\(error)" }
+        invalidateTotals()
         reloadBookings(); reloadCategories(); reloadAccounts()
         return nil
     }
 
     /// `nil` = locked, cancelled or the vault changed meanwhile (keep what is shown).
-    /// `accountIds` empty = all accounts.
-    func cashflow(_ g: PeriodGranularity, count: Int, accountIds: [Int64] = []) async -> [PeriodCashflow]? {
+    /// `accountIds` empty = all accounts. `respectInTotal`: the card as an
+    /// overall money figure (#337) — only the effective total set contributes;
+    /// the default `false` keeps the proof semantics of a directly requested
+    /// selection (single account).
+    func cashflow(_ g: PeriodGranularity, count: Int, accountIds: [Int64] = [], respectInTotal: Bool = false) async -> [PeriodCashflow]? {
         try? await vaultOffMain {
-            try $0.cashflowByPeriod(granularity: g, count: UInt32(count), accountIds: accountIds)
+            try $0.cashflowByPeriod(granularity: g, count: UInt32(count), accountIds: accountIds, respectInTotal: respectInTotal)
         }
     }
 
@@ -41,20 +52,25 @@ extension AppModel {
         (try? await vaultOffMain { try $0.listTransferTemplates() }) ?? []
     }
 
-    func saveTransferTemplate(named name: String) {
+    /// Saves the recipient of the open form as a template: the transfer's, or with `standing` the
+    /// standing order's (#1475).
+    func saveTransferTemplate(named name: String, standing: Bool = false) {
         guard let vault else { return }
-        let d = transferDraft
+        let f = standing
+            ? (standingDraft.name, standingDraft.iban, standingDraft.bic, standingDraft.amountText, standingDraft.purpose)
+            : (transferDraft.name, transferDraft.iban, transferDraft.bic, transferDraft.amountText, transferDraft.purpose)
         let t = TransferTemplate(
-            id: 0, name: name, recipientName: d.name, recipientIban: d.iban, recipientBic: d.bic,
-            defaultAmountCents: (try? parseAmountToCents(text: d.amountText)).flatMap { $0 > 0 ? $0 : nil },
-            defaultPurpose: d.purpose)
+            id: 0, name: name, recipientName: f.0, recipientIban: f.1, recipientBic: f.2,
+            defaultAmountCents: Money.parseCents(f.3).flatMap { $0 > 0 ? $0 : nil },
+            defaultPurpose: f.4)
         do { _ = try vault.saveTransferTemplate(template: t) } catch { transferError = "\(error)" }
     }
 
-    func applyTransferTemplate(_ t: TransferTemplate) {
-        fillTransferDraft(ParsedPayment(name: t.recipientName, iban: t.recipientIban, bic: t.recipientBic,
-                                        amountText: t.defaultAmountCents.map { Money.plain($0) } ?? "",
-                                        purpose: t.defaultPurpose))
+    func applyTransferTemplate(_ t: TransferTemplate, standing: Bool = false) {
+        let p = ParsedPayment(name: t.recipientName, iban: t.recipientIban, bic: t.recipientBic,
+                              amountText: t.defaultAmountCents.map { Money.plain($0) } ?? "",
+                              purpose: t.defaultPurpose)
+        if standing { fillStandingDraft(p) } else { fillTransferDraft(p) }
     }
 
     func deleteTransferTemplate(_ id: Int64) {
@@ -136,7 +152,7 @@ struct BudgetProgressCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: ViewLayout.cardSpacing) {
+        VStack(alignment: .leading, spacing: ViewLayout.sectionSpacing) {
             HStack {
                 CardChevron(collapsed: $collapsed)
                 Text("Monatsbudgets").appFont(.subheadline, weight: .semibold)
@@ -197,7 +213,7 @@ struct BudgetProgressCard: View {
                 }
             } }
         }
-        .card(padding: ViewLayout.cardPadding, vertical: ViewLayout.cardVerticalPadding(collapsed: collapsed))
+        .flatSection(vertical: collapsed ? 4 : ViewLayout.sectionPadding)
         .task(id: token) {
             let now = Calendar(identifier: .gregorian).dateComponents([.year, .month], from: Date())
             if let loaded = await model.budgetProgress(year: now.year ?? 2025, month: now.month ?? 1) { items = loaded }
@@ -216,7 +232,7 @@ struct BudgetEditorSheet: View {
 
     private var category: GiroCrabCore.Category? { model.categories.first { $0.id == categoryID } }
     private var cents: Int64? {
-        guard let c = try? parseAmountToCents(text: text), c > 0 else { return nil }
+        guard let c = Money.parseCents(text), c > 0 else { return nil }
         return c
     }
 
@@ -288,6 +304,9 @@ struct CashflowCard: View {
     @State private var granularity: PeriodGranularity = .month
     @State private var rows: [PeriodCashflow] = []
     @AppStorage(ViewLayout.cashflowCollapsedKey) private var collapsed = false
+    /// Period (x label) under the pointer and where the pointer is (#889).
+    @State private var hovered: String?
+    @State private var spot: HoverCardSpot?
 
     private struct Bar: Identifiable {
         let id = UUID()
@@ -304,6 +323,38 @@ struct CashflowCard: View {
         HStack(spacing: 5) { Circle().fill(color).frame(width: 8, height: 8); Text(title) }
     }
 
+    /// The period whose group of bars lies under the pointer; nil above or beside the plot.
+    private static func period(atX x: CGFloat, y: CGFloat, proxy: ChartProxy, geo: GeometryProxy) -> String? {
+        guard let plot = proxy.plotFrame else { return nil }
+        let frame = geo[plot]
+        guard frame.contains(CGPoint(x: x, y: y)) else { return nil }
+        return proxy.value(atX: x - frame.origin.x, as: String.self)
+    }
+
+    /// Income, expenses and the balance of one period, at the pointer.
+    private func hoverCard(_ r: PeriodCashflow, income: String, expense: String) -> some View {
+        let net = r.incomeCents - r.expenseCents
+        func line(_ title: String, _ cents: Int64, _ color: Color) -> some View {
+            HStack(spacing: 10) {
+                Text(title).foregroundStyle(Theme.secondary)
+                Spacer(minLength: 0)
+                Text(verbatim: Money.format(cents)).sensitive(.amounts).foregroundStyle(color)
+            }
+            .appFont(.caption, monospacedDigit: true)
+        }
+        return VStack(alignment: .leading, spacing: 2) {
+            Text(label(r.key)).appFont(.caption, weight: .semibold)
+            line(income, r.incomeCents, Theme.inflow)
+            line(expense, r.expenseCents, Theme.outflow)
+            line(String(localized: "Saldo"), net, net >= 0 ? Theme.inflow : Theme.outflow)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .frame(minWidth: 150, alignment: .leading)
+        .fixedSize()
+        // Transient hover readout: a flat plate, no tile or drop shadow.
+        .background(Theme.systemSurface)
+    }
+
     var body: some View {
         let palette = ChartColorPalette(rawValue: paletteRaw) ?? .girocrab
         let income = String(localized: "Einnahmen")
@@ -312,7 +363,7 @@ struct CashflowCard: View {
             [Bar(period: label(r.key), kind: income, euros: Double(r.incomeCents) / 100),
              Bar(period: label(r.key), kind: expense, euros: Double(r.expenseCents) / 100)]
         }
-        VStack(alignment: .leading, spacing: ViewLayout.cardSpacing) {
+        VStack(alignment: .leading, spacing: ViewLayout.sectionSpacing) {
             HStack {
                 CardChevron(collapsed: $collapsed)
                 Text("Cashflow").appFont(.subheadline, weight: .semibold)
@@ -352,8 +403,26 @@ struct CashflowCard: View {
                     .foregroundStyle(by: .value("Art", b.kind))
                     .position(by: .value("Art", b.kind))
                     .clipShape(RoundedRectangle(cornerRadius: 5))
+                    .opacity(hovered == nil || hovered == b.period ? 1 : 0.4)
             }
             .chartForegroundStyleScale([income: palette.incomeGradient, expense: palette.expenseGradient])
+            .chartOverlay { proxy in
+                GeometryReader { geo in
+                    Color.clear.contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let point):
+                                let period = Self.period(atX: point.x, y: point.y, proxy: proxy, geo: geo)
+                                if hovered != period { hovered = period }
+                                let origin = geo.frame(in: .named(HoverCardSpace.name)).origin
+                                spot = period.map { HoverCardSpot(id: $0, point: CGPoint(x: origin.x + point.x, y: origin.y + point.y)) }
+                            case .ended:
+                                if hovered != nil { hovered = nil }
+                                if spot != nil { spot = nil }
+                            }
+                        }
+                }
+            }
             .chartLegend(.hidden)
             .chartYAxis {
                 AxisMarks(position: .leading) { v in
@@ -371,7 +440,7 @@ struct CashflowCard: View {
                     AxisValueLabel { Text(verbatim: v.as(String.self) ?? "").appFont(.caption2).fixedSize() }
                 }
             }
-            .frame(height: 160)
+            .frame(height: 124)
             .accessibilityLabel("Cashflow")
             .accessibilityChartDescriptor(BarChartDescriptor(
                 title: String(localized: "Cashflow"),
@@ -392,10 +461,25 @@ struct CashflowCard: View {
             .accessibilityHidden(true)   // the chart descriptor names both series
             }
         }
-        .card(padding: ViewLayout.cardPadding, vertical: ViewLayout.cardVerticalPadding(collapsed: collapsed))
+        .hoverCardHost(spot) { period in
+            if let row = rows.first(where: { label($0.key) == period }) {
+                hoverCard(row, income: income, expense: expense)
+            }
+        }
+        .flatSection(vertical: collapsed ? 4 : ViewLayout.sectionPadding)
         // Follows the sidebar: overview = all accounts, account/group = its accounts (#731).
-        .task(id: "\(granularity)#\(model.bookings.count)#\(accountIds)") {
-            if let loaded = await model.cashflow(granularity, count: granularity == .year ? 5 : 6, accountIds: accountIds) {
+        // The calculation context is part of the key: switching between a single
+        // account and a group of only that account keeps ids and booking count,
+        // but changes proof (#337) vs. totals sums. `totalsVersion` catches the
+        // account/group switches that change the effective set without moving
+        // the (proof) booking count (invalidateTotals in afterGroupChange/reloadAll).
+        .task(id: "\(granularity)#\(model.bookings.count)#\(accountIds)#\(model.sidebarSelection?.usesTotalsContext ?? true)#\(model.totalsVersion)") {
+            // calculation context like `currentFilter` (#337): overview, group,
+            // kind / bank = overall money figure; a directly requested single
+            // account is a proof view and keeps its sums
+            if let loaded = await model.cashflow(granularity, count: granularity == .year ? 5 : 6, accountIds: accountIds,
+                                                 respectInTotal: model.sidebarSelection?.usesTotalsContext ?? true) {
+                guard !Task.isCancelled else { return }
                 rows = loaded
             }
         }
@@ -457,87 +541,159 @@ struct CustomPeriodForm: View {
 
 /// Split arithmetic in the booking's direction (cents, positive = same sign as the booking).
 enum SplitMath {
-    static func remaining(total: Int64, parts: [Int64]) -> Int64 { total - parts.reduce(0, +) }
-    /// At least two parts, none 0, parts add up to `total`. Negative parts are allowed.
-    static func isValid(total: Int64, parts: [Int64]) -> Bool {
-        parts.count >= 2 && !parts.contains(0) && remaining(total: total, parts: parts) == 0
+    /// The shares offered in one click (#1663), in percent of the booking's amount: the row menu
+    /// under „Umsatz aufteilen“ and the buttons in the sheet. Plain shares: 19 % of 87,43 € is
+    /// 16,61 €, not the VAT contained in it.
+    static let shares: [Int64] = [7, 19, 50]
+    /// A share as the UI writes it: „19 %“ (de), "19%" (en).
+    static func label(_ percent: Int64) -> String { (Double(percent) / 100).formatted(.percent) }
+    /// Show a ledger amount in the booking's direction without negating Int64.min.
+    static func amountText(_ cents: Int64, bookingCents: Int64) -> String {
+        Money.plainCents(bookingCents < 0 ? -Decimal(cents) : Decimal(cents))
+    }
+
+    /// A preset share, formatted in the booking's direction.
+    static func presetText(_ percent: Int64, bookingCents: Int64) -> String? {
+        splitShareCents(totalCents: bookingCents, numerator: percent, denominator: 100)
+            .map { amountText($0, bookingCents: bookingCents) }
+    }
+
+    /// An unsplit booking opens with the menu share in the second part.
+    /// An existing split opens with its stored amounts and a warning if the total changed.
+    static func opening(bookingCents: Int64, stored: [Int64], presetPercent: Int64?)
+        -> (amounts: [String], storedPartsDiffer: Bool, ignoredShare: String?) {
+        guard !stored.isEmpty else {
+            let preset = presetPercent.flatMap { presetText($0, bookingCents: bookingCents) }
+            return (["", preset ?? ""], false, nil)
+        }
+        let amounts = stored.map { amountText($0, bookingCents: bookingCents) }
+        return (amounts, !splitAmountsMatch(bookingCents: bookingCents, amounts: stored), presetPercent.map(label))
+    }
+
+    /// The part a share button fills (#1663): `target` (the part typed in last) unless it is the
+    /// first part or gone, else the last part; nil while there is no part to fill.
+    static func pickIndex<ID: Equatable>(ids: [ID], target: ID?) -> Int? {
+        if let target, let i = ids.firstIndex(of: target), i > 0 { return i }
+        return ids.count > 1 ? ids.count - 1 : nil
     }
 }
 
 struct SplitSheet: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.reportRedaction) private var redaction
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.textScale) private var textScale
     let booking: Booking
+    /// Share (percent) for the second part of a fresh split, from the row menu (#1663).
+    var presetPercent: Int64? = nil
 
     private struct Part: Identifiable {
         let id = UUID()
+        var uuid: String?
         var categoryID: Int64?
         var amount = ""
         var note = ""
     }
+    /// The first part keeps the rest (#1663): its amount follows from the others, so the parts
+    /// always add up and only what is split off is typed.
     @State private var parts: [Part] = []
     @State private var error: String?
     /// The booking is split already (loaded with the parts).
     @State private var hasSplits = false
+    /// The stored split was read (an empty result counts). Until then, and after a failed read,
+    /// nothing can be added, picked or saved: a draft must never replace a split it has not seen.
+    @State private var loaded = false
+    /// The loaded parts no longer add up to the booking (its amount changed after saving): the
+    /// first part shows the rest instead of what was stored (#1663), so the sheet says so.
+    @State private var storedPartsDiffer = false
+    /// The share picked in the row menu, when the booking is split already and it was not
+    /// applied (#1663). Not seeing that a booking is split is #1662.
+    @State private var ignoredShare: String?
+    @FocusState private var focusedPart: UUID?
+    /// The part the share buttons fill: the one typed in last, else the last part.
+    @State private var pickTarget: UUID?
 
-    private var total: Int64 { abs(booking.amountCents) }
-    private var sign: Int64 { booking.amountCents < 0 ? -1 : 1 }
-    private func cents(_ p: Part) -> Int64 { (try? parseAmountToCents(text: p.amount)) ?? 0 }
-    // Amounts are entered in the booking's direction: a negative part counter-books the others
-    // (+59 = +200 and -141, #427). Only the sum must match; no part may be 0.
-    private var remaining: Int64 { SplitMath.remaining(total: total, parts: parts.map(cents)) }
-    private var valid: Bool { SplitMath.isValid(total: total, parts: parts.map(cents)) }
+    /// Amount fields hold up to "−1.234.567,89" at every text size (#343).
+    private var amountWidth: CGFloat { 120 * textScale }
 
     var body: some View {
+        let draft = calculateSplitDraft(bookingCents: booking.amountCents, splitOffTexts: parts.dropFirst().map(\.amount))
         VStack(alignment: .leading, spacing: 14) {
             Text("Umsatz aufteilen").appFont(.title3, weight: .bold)
-            Text("\(booking.merchantName) · \(Money.format(booking.amountCents))").foregroundStyle(Theme.secondary).sensitive([.personal, .amounts])
-            ForEach($parts) { $p in
-                HStack(spacing: 8) {
-                    Picker("Kategorie", selection: $p.categoryID) {
-                        Text(model.uncategorizedLabel).tag(Int64?.none)
-                        ForEach(model.categories, id: \.id) { c in Text(c.path).tag(Int64?.some(c.id)) }
-                    }
-                    .labelsHidden().frame(maxWidth: 190)
-                    .sensitive(.labels)
-                    TextField(Money.plain(0), text: $p.amount)
-                        .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
-                        .appFont(.body, monospacedDigit: true).frame(width: 90)
-                    TextField("Notiz", text: $p.note).textFieldStyle(.roundedBorder)
-                    if parts.count > 2 {
-                        Button { parts.removeAll { $0.id == p.id } } label: { Label("Aufteilung entfernen", systemImage: "minus.circle") }
-                            .labelStyle(.iconOnly)
-                            .buttonStyle(.borderless)
-                            .help("Aufteilung entfernen")
+            HStack(spacing: 8) {
+                Text("\(booking.merchantName) · \(Money.format(booking.amountCents))").foregroundStyle(Theme.secondary).sensitive([.personal, .amounts])
+                Spacer(minLength: 8)
+                quickPicks
+            }
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
+                ForEach($parts) { $p in
+                    let isRest = p.id == parts.first?.id
+                    GridRow {
+                        Picker("Kategorie", selection: $p.categoryID) {
+                            Text(model.uncategorizedLabel).tag(Int64?.none)
+                            ForEach(model.categories, id: \.id) { c in Text(c.path).tag(Int64?.some(c.id)) }
+                        }
+                        .labelsHidden().frame(maxWidth: 190)
+                        .sensitive(.labels)
+                        if isRest {
+                            // what the parts below leave, never typed (#1663)
+                            TextField(Money.plain(0), text: .constant(draft.restCents.map { SplitMath.amountText($0, bookingCents: booking.amountCents) } ?? "–"))
+                                .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
+                                .appFont(.body, monospacedDigit: true).frame(width: amountWidth)
+                                .foregroundStyle(draft.restIsNegative ? Theme.warning : Theme.secondary)
+                                .disabled(true)
+                                .help("Bekommt automatisch, was die anderen Teile übrig lassen")
+                                .accessibilityLabel("Rest")
+                                .sensitive(.amounts)
+                        } else {
+                            TextField(Money.plain(0), text: $p.amount)
+                                .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
+                                .appFont(.body, monospacedDigit: true).frame(width: amountWidth)
+                                .focused($focusedPart, equals: p.id)
+                                .onSubmit { settle(p.id) }
+                                .help("Betrag oder Anteil, z. B. „50 %“")
+                                .sensitive(.amounts)
+                        }
+                        TextField("Notiz", text: $p.note).textFieldStyle(.roundedBorder)
+                            .sensitive()
+                        if !isRest, parts.count > 2 {
+                            Button { parts.removeAll { $0.id == p.id } } label: { Label("Aufteilung entfernen", systemImage: "minus.circle") }
+                                .labelStyle(.iconOnly)
+                                .buttonStyle(.borderless)
+                                .help("Aufteilung entfernen")
+                        }
                     }
                 }
             }
-            HStack {
-                Button { parts.append(Part(amount: remaining != 0 ? Money.plain(remaining) : "")) } label: {
-                    Label("Teil hinzufügen", systemImage: "plus")
-                }
-                .buttonStyle(.borderless)
-                Spacer()
-                Text("Restbetrag: \(Money.format(remaining))")
-                    .appFont(.callout, weight: .semibold, monospacedDigit: true)
-                    .foregroundStyle(remaining == 0 ? Theme.inflow : Theme.warning)
-                    .sensitive(.amounts)
-                if remaining != 0, let last = parts.indices.last {
-                    // one click: the rest goes into the last part (#427)
-                    Button("Rest zuweisen") {
-                        let others = parts.indices.filter { $0 != last }.reduce(0) { $0 + cents(parts[$1]) }
-                        parts[last].amount = Money.plain(total - others)
-                    }
-                    .help("Trägt den Restbetrag im letzten Teil ein")
-                }
+            Button {
+                let part = Part()
+                parts.append(part)
+                focusedPart = part.id
+            } label: {
+                Label("Teil hinzufügen", systemImage: "plus")
             }
-            // Why "Speichern" is greyed out (#383): say so instead of leaving it silent.
-            if !valid, !parts.isEmpty, error == nil {
-                Text(remaining != 0
-                    ? "Die Teilbeträge müssen zusammen \(redaction.masking(Money.format(total), .amounts)) ergeben (Restbetrag: \(redaction.masking(Money.format(remaining), .amounts))), erst dann lässt sich speichern."
+            .buttonStyle(.borderless)
+            .disabled(!loaded)
+            if let ignoredShare {
+                Text("Die Buchung ist schon aufgeteilt, deshalb wurde „\(ignoredShare)“ nicht eingetragen.")
+                    .appFont(.callout).foregroundStyle(Theme.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if storedPartsDiffer {
+                Text("Die gespeicherten Teile ergeben nicht mehr den Betrag der Buchung. Die erste Zeile gleicht die Differenz aus; bitte vor dem Speichern prüfen.")
+                    .appFont(.callout).foregroundStyle(Theme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let problem = draft.problem, error == nil {
+                // `.outOfRange` (absurd input) shows the format hint: no new text for a 92-trillion sum
+                Text(problem != .zeroPart
+                    ? "Teilbeträge sind Beträge wie „43,71“ oder Anteile wie „50 %“."
                     : "Jeder Teil braucht einen Betrag ungleich 0.")
                     .appFont(.callout).foregroundStyle(Theme.secondary)
+            }
+            if draft.restIsNegative, error == nil {
+                Text("Der Rest in der ersten Zeile ist negativ und bucht die anderen Teile gegen. Ist das nicht gewollt, bitte die Beträge prüfen.")
+                    .appFont(.callout).foregroundStyle(Theme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let error { Text(error).appFont(.callout).foregroundStyle(Theme.negative) }
             HStack {
@@ -549,18 +705,25 @@ struct SplitSheet: View {
                 }
                 Spacer()
                 Button("Abbrechen", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                let toSave = draft.amountsToSave
                 Button("Speichern") {
-                    let inputs = parts.map {
-                        TransactionSplitInput(categoryId: $0.categoryID, amountCents: sign * cents($0), note: $0.note)
+                    guard loaded, let toSave else { return }
+                    let inputs = zip(parts, toSave).map { part, cents in
+                        TransactionSplitInput(uuid: part.uuid, categoryId: part.categoryID, amountCents: cents, note: part.note)
                     }
                     error = model.saveSplits(inputs, for: booking)
                     if error == nil { dismiss() }
                 }
-                .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(!valid)
+                .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(!loaded || toSave == nil)
             }
         }
         .padding(22)
-        .macFrame(width: 560)
+        .macFrame(width: 600)
+        // "50 %" becomes the amount once the field is left (#1663)
+        .onChange(of: focusedPart) { old, new in
+            if let old { settle(old) }
+            if let new { pickTarget = new }
+        }
         .task {
             guard let existing = await model.splits(for: booking) else {
                 // never offer a fresh split over one that could not be read
@@ -568,12 +731,46 @@ struct SplitSheet: View {
                 return
             }
             hasSplits = !existing.isEmpty
+            let opening = SplitMath.opening(bookingCents: booking.amountCents, stored: existing.map(\.amountCents), presetPercent: presetPercent)
+            storedPartsDiffer = opening.storedPartsDiffer
+            ignoredShare = opening.ignoredShare
             if existing.isEmpty {
-                parts = [Part(categoryID: booking.categoryId, amount: Money.plain(total)), Part()]
+                parts = [Part(categoryID: booking.categoryId), Part(amount: opening.amounts[1])]
+                focusedPart = parts.last?.id
             } else {
-                parts = existing.map { Part(categoryID: $0.categoryId, amount: Money.plain(sign * $0.amountCents), note: $0.note) }
+                parts = zip(existing, opening.amounts).map { Part(uuid: $0.uuid, categoryID: $0.categoryId, amount: $1, note: $0.note) }
+            }
+            loaded = true
+        }
+    }
+
+    /// A share typed as "50 %" turns into the amount it stands for (#1663); anything else stays.
+    private func settle(_ id: UUID) {
+        guard let i = parts.firstIndex(where: { $0.id == id }), parts[i].amount.contains("%") else { return }
+        let draft = calculateSplitDraft(bookingCents: booking.amountCents, splitOffTexts: [parts[i].amount])
+        if let cents = draft.splitOffCents.first ?? nil {
+            parts[i].amount = SplitMath.amountText(cents, bookingCents: booking.amountCents)
+        }
+    }
+
+    /// Next to the booking's amount: one click to split off 7 %, 19 % or 50 % (#1663) into the
+    /// part typed in last (else the last part); the odd cent stays with the rest.
+    @ViewBuilder
+    private var quickPicks: some View {
+        let pick = { (percent: Int64) in
+            guard let i = SplitMath.pickIndex(ids: parts.map(\.id), target: pickTarget) else { return }
+            parts[i].amount = SplitMath.presetText(percent, bookingCents: booking.amountCents) ?? ""
+        }
+        HStack(spacing: 4) {
+            ForEach(SplitMath.shares, id: \.self) { percent in
+                let label = SplitMath.label(percent)
+                Button { pick(percent) } label: { Text(verbatim: label) }
+                    .help("\(label) abspalten").accessibilityLabel("\(label) abspalten")
             }
         }
+        .buttonStyle(.bordered)
+        .appFont(.body)
+        .disabled(!loaded)
     }
 }
 
@@ -581,6 +778,10 @@ struct SplitSheet: View {
 
 struct TransferTemplatesMenu: View {
     @Environment(AppModel.self) private var model
+    /// In the standing order form (#1475): applies to and saves from its draft.
+    var standing = false
+    private var draftName: String { standing ? model.standingDraft.name : model.transferDraft.name }
+    private var draftIban: String { standing ? model.standingDraft.iban : model.transferDraft.iban }
     @State private var templates: [TransferTemplate] = []
     @State private var naming = false
     @State private var deleting: TransferTemplate?
@@ -589,7 +790,7 @@ struct TransferTemplatesMenu: View {
     var body: some View {
         Menu {
             ForEach(templates, id: \.id) { t in
-                Button("\(t.name) · \(t.recipientName)") { model.applyTransferTemplate(t) }
+                Button("\(t.name) · \(t.recipientName)") { model.applyTransferTemplate(t, standing: standing) }
             }
             if !templates.isEmpty {
                 Divider()
@@ -600,10 +801,10 @@ struct TransferTemplatesMenu: View {
                 }
             }
             Button("Als Vorlage speichern …", systemImage: "square.and.arrow.down") {
-                name = model.transferDraft.name
+                name = draftName
                 naming = true
             }
-            .disabled(model.transferDraft.name.trimmingCharacters(in: .whitespaces).isEmpty || model.transferDraft.iban.isEmpty)
+            .disabled(draftName.trimmingCharacters(in: .whitespaces).isEmpty || draftIban.isEmpty)
         } label: { Label("Vorlagen", systemImage: "doc.on.doc") }
         .menuStyle(.borderlessButton).fixedSize()
         .task { templates = await model.transferTemplates() }
@@ -615,7 +816,7 @@ struct TransferTemplatesMenu: View {
         }
         .alert("Vorlage speichern", isPresented: $naming) {
             TextField("Name der Vorlage", text: $name)
-            Button("Speichern") { model.saveTransferTemplate(named: name); Task { templates = await model.transferTemplates() } }
+            Button("Speichern") { model.saveTransferTemplate(named: name, standing: standing); Task { templates = await model.transferTemplates() } }
             Button("Abbrechen", role: .cancel) {}
         }
     }

@@ -1,12 +1,17 @@
 import Foundation
 import GiroCrabCore
 
+/// A schedule as the rhythm picker offers it: unit (`M` / `W`) and interval.
+struct StandingRhythm: Hashable { var unit: String; var interval: Int }
+
 /// The standing order being created, changed or deleted (#496).
 struct StandingDraft {
     var action: StandingOrderAction = .create
     /// `standing_orders.id` of the order to change or delete.
     var orderRowID: Int64?
     var accountID: Int64?
+    /// Umbuchung (#1475): name and IBAN come from an own account.
+    var ownTransfer = false
     var name = ""
     var iban = ""
     var bic = ""
@@ -21,11 +26,23 @@ struct StandingDraft {
     /// Day of the month (31 = last day) or weekday (1 = Monday … 7).
     var execDay = 1
     var pin = ""
+    /// The rhythm the bank holds for the order being changed: offered and kept for the whole editing
+    /// session, also when the bank does not report it and another rhythm was picked in between.
+    var heldRhythm: StandingRhythm?
+
+    /// A recipient picked from the suggestions: name and IBAN, and no BIC of the one before (it belongs
+    /// to the other bank). The same recipient keeps its BIC.
+    mutating func takeRecipient(name newName: String, iban newIban: String) {
+        func key(_ s: String) -> String { s.filter { !$0.isWhitespace }.uppercased() }
+        if key(newIban) != key(iban) { bic = "" }
+        name = newName
+        iban = BatchRow.grouped(newIban)
+    }
 
     static var tomorrow: Date { Calendar.current.date(byAdding: .day, value: 1, to: Date()) ?? Date() }
 
     var cents: Int64? {
-        guard let c = try? parseAmountToCents(text: amountText), c > 0 else { return nil }
+        guard let c = Money.parseCents(amountText), c > 0 else { return nil }
         return c
     }
     var ibanValid: Bool { validateIban(iban: iban) }
@@ -55,6 +72,7 @@ struct StandingDraft {
         unit = o.timeUnit
         interval = Int(o.interval)
         execDay = Int(o.execDay)
+        heldRhythm = StandingRhythm(unit: unit, interval: interval)
         if action == .change { syncDate(to: nil) }  // the stored start lies in the past: the next date on the order's day
     }
 
@@ -195,10 +213,16 @@ struct StandingDraft {
         return from...max(from, to)
     }
 
+    /// Whether the interval stays as it is: the bank allows it, or it is the rhythm the bank already holds
+    /// for this order (picking it again must not turn "alle 4 Wochen" into "wöchentlich").
+    func keepsInterval(allowed intervals: [Int]) -> Bool {
+        intervals.isEmpty || intervals.contains(interval) || rhythm == heldRhythm
+    }
+
     /// Moves values the bank does not allow to the nearest allowed one, so the form never shows a combination it would refuse.
     mutating func conform(to l: StandingOrderLimits?) {
         let intervals = allowedIntervals(l)
-        if !intervals.isEmpty, !intervals.contains(interval) { interval = intervals[0] }
+        if !keepsInterval(allowed: intervals) { interval = intervals[0] }
         let days = allowedDays(l)
         if !days.isEmpty, !days.contains(execDay) {
             execDay = days.min { abs($0 - execDay) < abs($1 - execDay) } ?? days[0]
@@ -224,6 +248,34 @@ struct StandingDraft {
         case 12: return String(localized: "jährlich")
         default: return String(localized: "alle \(interval) Monate")
         }
+    }
+
+    var rhythm: StandingRhythm { StandingRhythm(unit: unit, interval: interval) }
+
+    /// The text of another schedule ("monatlich", "alle 2 Monate", "wöchentlich" …).
+    func rhythmText(of r: StandingRhythm) -> String {
+        var d = self
+        d.unit = r.unit
+        d.interval = r.interval
+        return d.rhythmText
+    }
+
+    /// What the rhythm picker offers. Without limits from the bank: weekly, monthly, every 2 months, quarterly,
+    /// half-yearly, yearly. With limits: what the bank reports for weeks and for months (up to a year of months),
+    /// so a rhythm outside the usual ones that the bank supports can be picked. The rhythm the bank holds for
+    /// the order and the current rhythm are always in the list (the held one for the whole session, so it can be
+    /// picked again after another one); any other rhythm the bank does not list is moved to one it lists by
+    /// `conform(to:)`, as the bank refuses it when sending.
+    func rhythmChoices(_ l: StandingOrderLimits?) -> [StandingRhythm] {
+        func values(_ reported: [UInt32]?, usual: [Int], top: Int) -> [Int] {
+            let list = (reported ?? []).map(Int.init).filter { (1...top).contains($0) }
+            return list.isEmpty ? usual : Array(Set(list)).sorted()
+        }
+        var list = values(l?.weeks, usual: [1], top: 52).map { StandingRhythm(unit: "W", interval: $0) }
+            + values(l?.months, usual: [1, 2, 3, 6, 12], top: 12).map { StandingRhythm(unit: "M", interval: $0) }
+        if let heldRhythm, !list.contains(heldRhythm) { list.append(heldRhythm) }
+        if !list.contains(rhythm) { list.append(rhythm) }
+        return list
     }
 
     /// "am 15." / "am letzten Tag des Monats" / "montags".

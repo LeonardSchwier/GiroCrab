@@ -174,9 +174,7 @@ pub fn collections_total_cents(collections: &[Collection]) -> Option<i64> {
 
 /// Checks one collection; the message names the 1-based position.
 pub fn validate_collection(position: usize, c: &Collection) -> CoreResult<()> {
-    let fail = |msg: &str| CoreError::InvalidInput {
-        message: trf("Lastschrift {0}: {1}", &[&position, &msg]),
-    };
+    let fail = |msg: &str| CoreError::invalid(trf("Lastschrift {0}: {1}", &[&position, &msg]));
     if c.debtor_name.trim().is_empty() {
         return Err(fail(tr("Der Name des Zahlungspflichtigen fehlt.")));
     }
@@ -201,7 +199,7 @@ pub fn validate_collection(position: usize, c: &Collection) -> CoreResult<()> {
             "Die Mandatsreferenz enthält Zeichen, die SEPA nicht erlaubt (nur Buchstaben ohne Umlaute, Ziffern und / - ? : ( ) . , ' + Leerzeichen).",
         )));
     }
-    if chrono::NaiveDate::parse_from_str(&c.mandate_date, "%Y-%m-%d").is_err() {
+    if jiff::civil::Date::strptime("%Y-%m-%d", &c.mandate_date).is_err() {
         return Err(fail(tr("Das Datum der Mandatsunterschrift fehlt.")));
     }
     Ok(())
@@ -211,26 +209,23 @@ pub fn validate_collection(position: usize, c: &Collection) -> CoreResult<()> {
 /// `DrctDbtTxInf` per collection; `NbOfTxs` and `CtrlSum` in header and block.
 pub fn build_pain008(p: &Pain008) -> CoreResult<String> {
     if p.collections.is_empty() {
-        return Err(CoreError::InvalidInput {
-            message: tr("Der Einzug enthält keine Lastschrift.").into(),
-        });
+        return Err(CoreError::invalid(tr(
+            "Der Einzug enthält keine Lastschrift.",
+        )));
     }
     if !validate_creditor_id(p.creditor_id) {
-        return Err(CoreError::InvalidInput {
-            message: tr("Die Gläubiger-ID ist ungültig.").into(),
-        });
+        return Err(CoreError::invalid(tr("Die Gläubiger-ID ist ungültig.")));
     }
     if !validate_iban(p.creditor_iban) {
-        return Err(CoreError::InvalidInput {
-            message: tr("Die IBAN des Gläubigers ist ungültig.").into(),
-        });
+        return Err(CoreError::invalid(tr(
+            "Die IBAN des Gläubigers ist ungültig.",
+        )));
     }
     for (i, c) in p.collections.iter().enumerate() {
         validate_collection(i + 1, c)?;
     }
-    let total = collections_total_cents(p.collections).ok_or_else(|| CoreError::InvalidInput {
-        message: tr("Die Summe des Einzugs ist zu groß.").into(),
-    })?;
+    let total = collections_total_cents(p.collections)
+        .ok_or_else(|| CoreError::invalid(tr("Die Summe des Einzugs ist zu groß.")))?;
     let sum = format_amount(total);
     let count = p.collections.len();
     let msg_id = xml_escape(&clip(p.message_id, 35));
@@ -353,9 +348,9 @@ pub fn parse_pain008(xml: &str) -> CoreResult<Vec<ParsedDebitBlock>> {
             // an unreadable amount must not turn into 0: the file would be applied
             // with a silently wrong collection
             let cents = tag_text(tx, "InstdAmt", 0)
-                .and_then(|a| crate::money::parse_cents(&a).ok())
-                .ok_or_else(|| CoreError::InvalidInput {
-                    message: tr("Die Datei enthält einen unlesbaren Betrag (pain.008).").into(),
+                .and_then(|a| crate::money::decimal(&a, '.').and_then(crate::money::cents))
+                .ok_or_else(|| {
+                    CoreError::invalid(tr("Die Datei enthält einen unlesbaren Betrag (pain.008)."))
                 })?;
             collections.push(Collection {
                 debtor_name: nested(tx, "Dbtr", "Nm").unwrap_or_default(),
@@ -374,8 +369,8 @@ pub fn parse_pain008(xml: &str) -> CoreResult<Vec<ParsedDebitBlock>> {
         // means a damaged or hand-edited file.
         let declared_count =
             tag_text(head, "NbOfTxs", 0).and_then(|c| c.trim().parse::<usize>().ok());
-        let declared_sum =
-            tag_text(head, "CtrlSum", 0).and_then(|c| crate::money::parse_cents(&c).ok());
+        let declared_sum = tag_text(head, "CtrlSum", 0)
+            .and_then(|c| crate::money::decimal(&c, '.').and_then(crate::money::cents));
         let actual_sum = collections
             .iter()
             .try_fold(0i64, |acc: i64, c: &Collection| {
@@ -384,9 +379,9 @@ pub fn parse_pain008(xml: &str) -> CoreResult<Vec<ParsedDebitBlock>> {
         if declared_count.is_some_and(|n| n != collections.len())
             || declared_sum.is_some_and(|s| Some(s) != actual_sum)
         {
-            return Err(CoreError::InvalidInput {
-                message: tr("Anzahl oder Kontrollsumme der Datei stimmen nicht mit den Lastschriften überein (pain.008).").into(),
-            });
+            return Err(CoreError::invalid(tr(
+                "Anzahl oder Kontrollsumme der Datei stimmen nicht mit den Lastschriften überein (pain.008).",
+            )));
         }
         out.push(ParsedDebitBlock {
             creditor_id: nested(head, "CdtrSchmeId", "Id")
@@ -406,9 +401,9 @@ pub fn parse_pain008(xml: &str) -> CoreResult<Vec<ParsedDebitBlock>> {
         });
     }
     if out.is_empty() {
-        return Err(CoreError::InvalidInput {
-            message: tr("Die Datei enthält keine SEPA-Lastschrift (pain.008).").into(),
-        });
+        return Err(CoreError::invalid(tr(
+            "Die Datei enthält keine SEPA-Lastschrift (pain.008).",
+        )));
     }
     Ok(out)
 }

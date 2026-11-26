@@ -1,3 +1,6 @@
+// xmllint checks the exports against the ISO 20022 schemas; tests may start processes (#948).
+#![allow(clippy::disallowed_types)]
+
 use super::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,9 +93,7 @@ fn add_in(v: &Vault, account: i64, tag: &str, day: &str, cents: i64, currency: &
 
 /// `days` from today (`-5` = five days ago).
 fn day(offset: i64) -> String {
-    (chrono::Local::now().date_naive() + chrono::Duration::days(offset))
-        .format("%Y-%m-%d")
-        .to_string()
+    crate::dates::iso(crate::dates::today() + crate::dates::days(offset))
 }
 
 fn export(

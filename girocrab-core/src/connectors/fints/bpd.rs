@@ -5,13 +5,15 @@
 use std::collections::{HashMap, HashSet};
 
 use super::syntax::Segment;
-use super::{debit, sepa, standing_order, transfer, BankReply, FinTsConnector, UpdAccount};
+use super::{BankReply, FinTsConnector, UpdAccount, debit, sepa, standing_order, transfer};
 
 /// Versions of each business transaction this client implements.
 const IMPLEMENTED: &[(&str, &[u32])] = &[
     ("HKSAL", &[5, 6, 7, 8]),
     ("HKCAZ", &[1]),
     ("HKCCS", &[1]),
+    // SEPA-Umbuchung between the login's own accounts (#1513)
+    ("HKCUM", &[1]),
     ("HKIPZ", &[1]),
     ("HKCSE", &[1]),
     ("HKCCM", &[1]),
@@ -39,7 +41,7 @@ const IMPLEMENTED: &[(&str, &[u32])] = &[
     ("DKKKU", &[2]),
 ];
 
-fn is_segment_code(s: &str) -> bool {
+pub(super) fn is_segment_code(s: &str) -> bool {
     s.len() == 5
         && (s.starts_with("HK") || s.starts_with("DK"))
         && s[2..].chars().all(|c| c.is_ascii_uppercase())
@@ -67,10 +69,10 @@ pub(super) fn parse_upd(upd: &Segment) -> UpdAccount {
         a.iban.clear();
     }
     for el in upd.elements.iter().skip(9) {
-        if let Some(first) = el.first() {
-            if is_segment_code(first.text()) {
-                a.allowed.insert(first.text().to_string());
-            }
+        if let Some(first) = el.first()
+            && is_segment_code(first.text())
+        {
+            a.allowed.insert(first.text().to_string());
         }
     }
     a
@@ -95,6 +97,24 @@ pub(super) fn pain_formats(reply: &BankReply, seg_id: &str) -> Vec<String> {
     out
 }
 
+/// Storage period (days) of a statement parameter segment (HIKAZS / HICAZS):
+/// the first value of its parameters, from the segment of `version`. Another
+/// version's segment only while nothing is `known` yet (0): it must not
+/// replace what the version in use said. `None`: nothing to learn here.
+pub(super) fn storage_days(
+    reply: &BankReply,
+    seg_id: &str,
+    version: u32,
+    known: i64,
+) -> Option<i64> {
+    let days = |s: &Segment| s.get(4, 0).parse().unwrap_or(0);
+    match reply.all(seg_id).filter(|s| s.version() == version).last() {
+        Some(seg) => Some(days(seg)),
+        None if known == 0 => reply.all(seg_id).last().map(days),
+        None => None,
+    }
+}
+
 /// Picks the TAN function from the codes allowed by 3920: app/decoupled
 /// methods first (SecureGo plus, pushTAN …), then a fixed preference list,
 /// never 999 (one-step).
@@ -115,8 +135,10 @@ fn choose_tan_function(allowed: &[String], names: &HashMap<String, String>) -> S
     if let Some(a) = by_name {
         return a.clone();
     }
+    // chipTAN: QR (913) shows an image; manual (910) takes a typed code; optical (911) and
+    // USB/Bluetooth (912) need the generator itself and cannot be answered here (#1641)
     for pref in [
-        "946", "944", "942", "921", "962", "972", "982", "920", "923", "913", "912", "911", "910",
+        "946", "944", "942", "921", "962", "972", "982", "920", "923", "913", "910", "911", "912",
         "900",
     ] {
         if allowed.iter().any(|a| a == pref) {
@@ -124,6 +146,39 @@ fn choose_tan_function(allowed: &[String], names: &HashMap<String, String>) -> S
         }
     }
     allowed.first().cloned().unwrap_or_else(|| "999".into())
+}
+
+/// Structural trace of the TAN parameters (HITANS/HIPINS, TAN media classes) for the
+/// `GIROCRAB_DEPOT_DEBUG=1` log. Bank-wide parameters and method names only; the TAN media
+/// entries (card numbers, device names) are reduced to class and status.
+fn trace_tan_parameters(reply: &BankReply) {
+    for id in ["HITANS", "HIPINS"] {
+        for s in reply.all(id) {
+            let params: Vec<String> = s
+                .elements
+                .iter()
+                .skip(4)
+                .map(|el| el.iter().map(|v| v.text()).collect::<Vec<_>>().join(":"))
+                .collect();
+            crate::depot_debug::log(&format!(
+                "fints {id} v{}: {}",
+                s.version(),
+                params.join(" + ")
+            ));
+        }
+    }
+    if let Some(hitab) = reply.first("HITAB") {
+        let media: Vec<String> = hitab
+            .elements
+            .iter()
+            .skip(2)
+            .map(|el| {
+                let t = |i: usize| el.get(i).map(|v| v.text()).unwrap_or_default();
+                format!("{}:{}", t(0), t(1))
+            })
+            .collect();
+        crate::depot_debug::log(&format!("fints HITAB: {media:?}"));
+    }
 }
 
 impl FinTsConnector {
@@ -164,8 +219,12 @@ impl FinTsConnector {
         // .09 whenever offered: banks that still list .03 may refuse it
         // (comdirect: "Sepa-Format nicht mehr gültig").
         let has = |suffix: &str| formats.is_some_and(|l| l.iter().any(|f| f.ends_with(suffix)));
+        // comdirect lists only the DK profile `.003.03` for HKCCS and rejects `.001.03`
+        // as not valid any more (#1792): use what the bank lists.
         Some(if has(".001.09") {
             sepa::PainVersion::V09
+        } else if !has(".001.03") && has(".003.03") {
+            sepa::PainVersion::V03Dk
         } else {
             sepa::PainVersion::V03
         })
@@ -173,6 +232,27 @@ impl FinTsConnector {
 
     pub(super) fn bank_supports(&self, tx: &str) -> bool {
         self.negotiated(tx).is_some()
+    }
+
+    /// The bank's two-step functions other than `refused` with their names, best first
+    /// (the order `choose_tan_function` would pick them in).
+    pub(super) fn tan_function_fallbacks(&self, refused: &str) -> Vec<(String, String)> {
+        let names: HashMap<String, String> = self.st.tan_functions.iter().cloned().collect();
+        let mut rest: Vec<String> = self
+            .st
+            .tan_functions
+            .iter()
+            .map(|(code, _)| code.clone())
+            .filter(|code| code != refused)
+            .collect();
+        let mut ordered = Vec::new();
+        while !rest.is_empty() {
+            let pick = choose_tan_function(&rest, &names);
+            rest.retain(|code| *code != pick);
+            let name = names.get(&pick).cloned().unwrap_or_default();
+            ordered.push((pick, name));
+        }
+        ordered
     }
 
     pub(super) fn learn_bpd(&mut self, reply: &BankReply) {
@@ -195,6 +275,7 @@ impl FinTsConnector {
                 offered.dedup();
                 crate::depot_debug::log(&format!("fints BPD offers: {}", offered.join(" ")));
             }
+            trace_tan_parameters(reply);
         }
         for s in &reply.segments {
             let id = s.id();
@@ -285,12 +366,20 @@ impl FinTsConnector {
             self.st.kku_no_date_range = p.get(4, 2) == "N";
             self.st.kku_no_account = p.get(4, 3) == "N";
         }
+        // HIKAZS / HICAZS: storage days : … of the version in use (#1043)
+        let kaz = self.st.kaz_storage_days;
+        if let Some(days) = storage_days(reply, "HIKAZS", self.version("HKKAZ"), kaz) {
+            self.st.kaz_storage_days = days;
+        }
+        let caz = self.st.caz_storage_days;
+        if let Some(days) = storage_days(reply, "HICAZS", self.version("HKCAZ"), caz) {
+            self.st.caz_storage_days = days;
+        }
         if crate::depot_debug::enabled() && reply.all("HIPINS").next().is_some() {
-            let card: Vec<String> = ["HKKKU", "DKKKU"]
-                .iter()
-                .filter_map(|t| self.st.tan_required.get(*t).map(|r| format!("{t}={r}")))
-                .collect();
-            crate::depot_debug::log(&format!("fints HIPINS cards: [{}]", card.join(",")));
+            let mut jobs: Vec<(&String, &bool)> = self.st.tan_required.iter().collect();
+            jobs.sort();
+            let jobs: Vec<String> = jobs.iter().map(|(t, r)| format!("{t}={r}")).collect();
+            crate::depot_debug::log(&format!("fints HIPINS: [{}]", jobs.join(",")));
         }
         for cazs in reply.all("HICAZS") {
             for el in &cazs.elements {
@@ -304,11 +393,22 @@ impl FinTsConnector {
             // best (newest) format first: …camt.052.001.08 > …001.02
             self.st.camt_formats.sort_by(|a, b| b.cmp(a));
         }
+        // A full BPD comes with HIBPA. A new BPD version replaces the learned pain formats, so
+        // a schema the bank withdrew (e.g. .001.09 from HISPAS) stops being chosen. Replies
+        // without HIBPA (HKTAB, …) and further messages of the same version only add.
+        if let Some(bpa) = reply.first("HIBPA") {
+            let version = bpa.get(1, 0);
+            if !version.is_empty() && version != self.st.bpd_version {
+                self.st.pain_formats.clear();
+                self.st.bpd_version = version.to_string();
+            }
+        }
         for (seg, tx) in [
             ("HICCSS", "HKCCS"),
             ("HIIPZS", "HKIPZ"),
             ("HICSES", "HKCSE"),
             ("HICCMS", "HKCCM"),
+            ("HICUMS", "HKCUM"),
             ("HICDBS", "HKCDB"),
             ("HICDES", "HKCDE"),
             ("HICDNS", "HKCDN"),
@@ -320,11 +420,37 @@ impl FinTsConnector {
             ("HIBSES", "HKBSE"),
             ("HIBMES", "HKBME"),
         ] {
-            // Merge across BPD messages (anonymous and authenticated dialog).
+            // Merge across BPD messages of the same BPD version (anonymous and
+            // authenticated dialog); a new version was cleared above.
             for f in pain_formats(reply, seg) {
                 let list = self.st.pain_formats.entry(tx.to_string()).or_default();
                 if !list.contains(&f) {
                     list.push(f);
+                }
+            }
+        }
+        // FinTS 3.0 banks (e.g. comdirect, #1419) advertise supported SEPA schemas
+        // centrally in HISPAS while HICCSS carries no format list of its own.
+        for spas in reply.all("HISPAS") {
+            for el in &spas.elements {
+                for v in el {
+                    let t = v.text();
+                    let targets: &[&str] = if t.contains("pain.001.") {
+                        &[
+                            "HKCCS", "HKCUM", "HKCSE", "HKCCM", "HKCDE", "HKCDN", "HKCDL", "HKCDB",
+                        ]
+                    } else if t.contains("pain.008.") {
+                        &["HKDSE", "HKDME", "HKDSC", "HKDMC", "HKBSE", "HKBME"]
+                    } else {
+                        continue;
+                    };
+                    for tx in targets {
+                        let list = self.st.pain_formats.entry((*tx).to_string()).or_default();
+                        let norm = t.strip_suffix(".xsd").unwrap_or(t);
+                        if !list.iter().any(|f| f == norm) {
+                            list.push(norm.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -379,30 +505,67 @@ impl FinTsConnector {
                     .cloned()
                     .collect();
             let names = self.tan_method_names(reply);
+            // process variant 1 cannot take HKTAN process 4 (login, orders): only a last resort (#1876)
+            let single = Self::single_process_methods(reply);
+            let usable: Vec<String> = allowed
+                .iter()
+                .filter(|a| !single.contains(*a))
+                .cloned()
+                .collect();
+            if !allowed.is_empty() {
+                // an init reply carries no HITANS unless the BPD changed: keep the names
+                let known: HashMap<String, String> =
+                    self.st.tan_functions.iter().cloned().collect();
+                self.st.tan_functions = allowed
+                    .iter()
+                    .map(|a| {
+                        let name = names.get(a).or_else(|| known.get(a)).cloned();
+                        (a.clone(), name.unwrap_or_default())
+                    })
+                    .collect();
+            }
             if !allowed.is_empty()
                 && (self.st.sec_func.is_empty() || !allowed.contains(&self.st.sec_func))
             {
                 // Prefer app based / decoupled methods.
-                let pick = choose_tan_function(&allowed, &names);
+                let pick =
+                    choose_tan_function(if usable.is_empty() { &allowed } else { &usable }, &names);
                 self.st.tan_method_name = names.get(&pick).cloned().unwrap_or_default();
                 self.st.sec_func = pick;
+                // a new function: the bank may take HKTAN in the init again (#1641)
+                self.st.init_without_hktan = false;
             }
         }
         if let (Some(hitab), true) = (reply.first("HITAB"), self.tan_medium_override.is_empty()) {
             for el in hitab.elements.iter().skip(2) {
                 let texts: Vec<&str> = el.iter().map(|v| v.text()).collect();
-                if texts.get(1) == Some(&"1") {
-                    if let Some(name) = texts
+                if texts.get(1) == Some(&"1")
+                    && let Some(name) = texts
                         .iter()
                         .skip(2)
                         .find(|t| t.chars().any(|c| c.is_alphabetic()) && t.len() > 2)
-                    {
-                        self.st.tan_medium = name.to_string();
-                        break;
+                {
+                    self.st.tan_medium = name.to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// TAN functions whose HITANS entry has process variant 1 (code, process, …).
+    fn single_process_methods(reply: &BankReply) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for s in reply.all("HITANS") {
+            if let Some(el) = s.elements.get(4) {
+                let t: Vec<&str> = el.iter().map(|v| v.text()).collect();
+                for i in 0..t.len().saturating_sub(1) {
+                    if t[i].len() == 3 && t[i].starts_with('9') && t[i + 1] == "1" {
+                        out.insert(t[i].to_string());
                     }
                 }
             }
         }
+        out
     }
 
     /// code -> human name, from HITANS (v6/v7: code, process, tech id, ZKA name, ZKA version, name …).

@@ -4,9 +4,10 @@
 //! to [`Vault::list_planned_payments`]. Only real orders appear here, never
 //! guesses from the booking history (`recurring.rs`).
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::connectors::TransferJob;
+use crate::dates::today_iso as today;
 use crate::error::{CoreError, CoreResult};
 use crate::schema::{has_column, has_table};
 use crate::vault::Vault;
@@ -42,6 +43,22 @@ pub(crate) fn planned_kind(conn: &Connection) -> CoreResult<()> {
             "ALTER TABLE planned_transfers ADD COLUMN kind TEXT NOT NULL DEFAULT 'transfer';",
         )?;
     }
+    Ok(())
+}
+
+/// Step 43 (#1900): `settled_ms` marks a scheduled order the bank's booking has
+/// settled (NULL = still open), so a vault merge cannot bring it back. The date
+/// index already covers it for the `settled_ms IS NULL` filter that lists and
+/// counts get in part 2; no query reads it yet. Idempotent.
+pub(crate) fn planned_settled(conn: &Connection) -> CoreResult<()> {
+    if !has_column(conn, "main", "planned_transfers", "settled_ms")? {
+        conn.execute_batch("ALTER TABLE planned_transfers ADD COLUMN settled_ms INTEGER;")?;
+    }
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS planned_transfers_date;
+         CREATE INDEX IF NOT EXISTS planned_transfers_date_settled
+            ON planned_transfers(execution_date, settled_ms);",
+    )?;
     Ok(())
 }
 
@@ -98,10 +115,6 @@ fn prune_old(db: &Connection) -> CoreResult<()> {
         [],
     )?;
     Ok(())
-}
-
-fn today() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 impl Vault {
@@ -169,11 +182,9 @@ impl Vault {
 }
 
 fn check_date(label: &str, d: &str) -> CoreResult<()> {
-    chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+    jiff::civil::Date::strptime("%Y-%m-%d", d)
         .map(|_| ())
-        .map_err(|_| CoreError::InvalidInput {
-            message: format!("{label}: {d}"),
-        })
+        .map_err(|_| CoreError::invalid(format!("{label}: {d}")))
 }
 
 #[uniffi::export]
@@ -232,7 +243,7 @@ impl Vault {
             }
         }
         // Standing orders: the executions in the same period.
-        let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+        let parse = |s: &str| jiff::civil::Date::strptime("%Y-%m-%d", s).ok();
         if let Some(f) = parse(&from) {
             let t = to.as_deref().and_then(parse);
             out.extend(crate::standing_orders::planned_executions(
@@ -300,7 +311,7 @@ impl Vault {
         };
         // Standing orders only exist as computed executions (few orders, no row load of
         // the transfers needed).
-        let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+        let parse = |s: &str| jiff::civil::Date::strptime("%Y-%m-%d", s).ok();
         if let Some(f) = parse(&from) {
             let end = to.as_deref().and_then(parse);
             for p in crate::standing_orders::planned_executions(&db, f, end, &account_ids)? {

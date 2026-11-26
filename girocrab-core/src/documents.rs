@@ -10,13 +10,13 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, CoreResult};
 use crate::i18n::{tr, trf};
 use crate::models::Booking;
 use crate::money::format_cents;
-use crate::vault::{sql_int_list, Vault};
+use crate::vault::{Vault, sql_int_list};
 
 pub const DOC_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS booking_documents (
@@ -73,6 +73,9 @@ pub struct DocumentFilter {
     pub search: Option<String>,
     /// Only documents not linked to a booking (PostBox / unmatched).
     pub unlinked_only: bool,
+    /// Only documents of accounts of this bank connection (`accounts.connection_id` of the
+    /// document's account; documents without an account never match).
+    pub connection_id: Option<i64>,
 }
 
 /// Document delivered by a bank connector.
@@ -121,12 +124,11 @@ pub(crate) fn title_from_file(file_name: &str) -> String {
 /// or an archive import must not flood the unread count. Newer ones are unread until opened.
 pub(crate) const UNSEEN_DAYS: i64 = 45;
 
-/// `seen_at` of a document arriving with this date: now if it is old, else NULL (unread). An
-/// unreadable date counts as new.
-fn seen_on_arrival(date: &str) -> Option<i64> {
-    let d = chrono::NaiveDate::parse_from_str(date.get(..10)?, "%Y-%m-%d").ok()?;
-    let old = (chrono::Local::now().date_naive() - d).num_days() > UNSEEN_DAYS;
-    old.then(|| chrono::Utc::now().timestamp())
+/// `seen_at` of a document arriving with this date: now if it is old, else NULL (unread). A
+/// document without a date counts as new.
+fn seen_on_arrival(date: Option<jiff::civil::Date>) -> Option<i64> {
+    let old = crate::dates::days_between(date?, crate::dates::today()) > UNSEEN_DAYS;
+    old.then(|| jiff::Timestamp::now().as_second())
 }
 
 /// Marks documents read (`seen` true) or unread; returns how many changed.
@@ -159,10 +161,13 @@ pub(crate) fn insert_doc(
             message: tr("Leere Datei").into(),
         });
     }
+    // The date comes from bank or PDF text: anything but a real day is stored empty, so the
+    // document falls back to its booking's date.
+    let date = crate::dates::parse_iso(date);
     let n = conn.execute(
         "INSERT OR IGNORE INTO booking_documents(booking_id, account_id, title, doc_type, mime_type, file_name, pdf_bytes, source_url, doc_date, seen_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![booking_id, account_id, title, doc_type, mime, file_name, bytes, source_url, date, seen_on_arrival(date)],
+        params![booking_id, account_id, title, doc_type, mime, file_name, bytes, source_url, date.map(crate::dates::iso).unwrap_or_default(), seen_on_arrival(date)],
     )?;
     Ok(if n > 0 {
         Some(conn.last_insert_rowid())
@@ -173,7 +178,69 @@ pub(crate) fn insert_doc(
 
 // ------------------------------------------------------------------ PDF text extraction
 
+/// IBM-273 (German EBCDIC) as Unicode. Some banks (comdirect) print their documents from a mainframe: the
+/// PDF text is EBCDIC, a space is `0x40`, the digits are `0xF0..=0xF9`.
+#[rustfmt::skip]
+const EBCDIC_273: [u16; 256] = [
+    0x0000, 0x0001, 0x0002, 0x0003, 0x009C, 0x0009, 0x0086, 0x007F, 0x0097, 0x008D, 0x008E, 0x000B, 0x000C, 0x000D, 0x000E, 0x000F,
+    0x0010, 0x0011, 0x0012, 0x0013, 0x009D, 0x0085, 0x0008, 0x0087, 0x0018, 0x0019, 0x0092, 0x008F, 0x001C, 0x001D, 0x001E, 0x001F,
+    0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x000A, 0x0017, 0x001B, 0x0088, 0x0089, 0x008A, 0x008B, 0x008C, 0x0005, 0x0006, 0x0007,
+    0x0090, 0x0091, 0x0016, 0x0093, 0x0094, 0x0095, 0x0096, 0x0004, 0x0098, 0x0099, 0x009A, 0x009B, 0x0014, 0x0015, 0x009E, 0x001A,
+    0x0020, 0x00A0, 0x00E2, 0x007B, 0x00E0, 0x00E1, 0x00E3, 0x00E5, 0x00E7, 0x00F1, 0x00C4, 0x002E, 0x003C, 0x0028, 0x002B, 0x0021,
+    0x0026, 0x00E9, 0x00EA, 0x00EB, 0x00E8, 0x00ED, 0x00EE, 0x00EF, 0x00EC, 0x007E, 0x00DC, 0x0024, 0x002A, 0x0029, 0x003B, 0x005E,
+    0x002D, 0x002F, 0x00C2, 0x005B, 0x00C0, 0x00C1, 0x00C3, 0x00C5, 0x00C7, 0x00D1, 0x00F6, 0x002C, 0x0025, 0x005F, 0x003E, 0x003F,
+    0x00F8, 0x00C9, 0x00CA, 0x00CB, 0x00C8, 0x00CD, 0x00CE, 0x00CF, 0x00CC, 0x0060, 0x003A, 0x0023, 0x00A7, 0x0027, 0x003D, 0x0022,
+    0x00D8, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067, 0x0068, 0x0069, 0x00AB, 0x00BB, 0x00F0, 0x00FD, 0x00FE, 0x00B1,
+    0x00B0, 0x006A, 0x006B, 0x006C, 0x006D, 0x006E, 0x006F, 0x0070, 0x0071, 0x0072, 0x00AA, 0x00BA, 0x00E6, 0x00B8, 0x00C6, 0x00A4,
+    0x00B5, 0x00DF, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077, 0x0078, 0x0079, 0x007A, 0x00A1, 0x00BF, 0x00D0, 0x00DD, 0x00DE, 0x00AE,
+    0x00A2, 0x00A3, 0x00A5, 0x00B7, 0x00A9, 0x0040, 0x00B6, 0x00BC, 0x00BD, 0x00BE, 0x00AC, 0x007C, 0x203E, 0x00A8, 0x00B4, 0x00D7,
+    0x00E4, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047, 0x0048, 0x0049, 0x00AD, 0x00F4, 0x00A6, 0x00F2, 0x00F3, 0x00F5,
+    0x00FC, 0x004A, 0x004B, 0x004C, 0x004D, 0x004E, 0x004F, 0x0050, 0x0051, 0x0052, 0x00B9, 0x00FB, 0x007D, 0x00F9, 0x00FA, 0x00FF,
+    0x00D6, 0x00F7, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057, 0x0058, 0x0059, 0x005A, 0x00B2, 0x00D4, 0x005C, 0x00D2, 0x00D3, 0x00D5,
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037, 0x0038, 0x0039, 0x00B3, 0x00DB, 0x005D, 0x00D9, 0x00DA, 0x009F,
+];
+
+/// Whether the strings of a content stream are EBCDIC rather than ASCII/Latin-1 text: the letters,
+/// digits and the space of EBCDIC outweigh those of ASCII by far.
+fn looks_ebcdic(bytes: impl Iterator<Item = u8>) -> bool {
+    let (mut ebcdic, mut ascii, mut total) = (0usize, 0usize, 0usize);
+    for b in bytes {
+        total += 1;
+        if matches!(b, 0x40 | 0x81..=0x89 | 0x91..=0x99 | 0xA2..=0xA9 | 0xC1..=0xC9 | 0xD1..=0xD9 | 0xE2..=0xE9 | 0xF0..=0xF9)
+        {
+            ebcdic += 1;
+        }
+        if matches!(b, 0x20 | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z') {
+            ascii += 1;
+        }
+    }
+    total >= 20 && ebcdic > ascii * 2
+}
+
+/// Whether bytes read as text (letters, digits, spaces, punctuation): hex strings of a CID font hold
+/// glyph numbers (many zero bytes) and are no text.
+fn looks_texty(bytes: &[u8], ebcdic: bool) -> bool {
+    if bytes.is_empty() || bytes.contains(&0) {
+        return false;
+    }
+    let texty = bytes
+        .iter()
+        .filter(|&&b| {
+            if ebcdic {
+                EBCDIC_273[b as usize] >= 0x20 && !(0x7F..=0x9F).contains(&EBCDIC_273[b as usize])
+            } else {
+                (0x20..0x7F).contains(&b) || b >= 0xA0
+            }
+        })
+        .count();
+    texty * 10 >= bytes.len() * 8
+}
+
 fn literal_strings(content: &[u8], out: &mut String) {
+    let mut strings = Vec::new();
+    // hex strings are text only in a stream that shows text (a CMap or a dictionary holds hex pairs too)
+    let shows_text = find(content, b"BT", 0).is_some()
+        && (find(content, b"Tj", 0).is_some() || find(content, b"TJ", 0).is_some());
     let mut i = 0;
     while i < content.len() {
         if content[i] == b'(' {
@@ -206,12 +273,58 @@ fn literal_strings(content: &[u8], out: &mut String) {
                 }
                 i += 1;
             }
-            // PDFDocEncoding ≈ Latin-1 for the characters we need (€ 0xA0 → handled by "EUR")
-            out.extend(s.iter().map(|&b| if b == 0x80 { '€' } else { b as char }));
-            out.push(' ');
+            strings.push((s, false));
+        } else if shows_text
+            && content[i] == b'<'
+            && content.get(i + 1) != Some(&b'<')
+            && (i == 0 || content[i - 1] != b'<')
+        {
+            // `<E3 85 93>`: hex digits up to the closing '>'
+            let mut digits: Vec<u8> = Vec::new();
+            let mut j = i + 1;
+            while j < content.len() && content[j] != b'>' {
+                if content[j].is_ascii_hexdigit() {
+                    digits.push(content[j]);
+                } else if !content[j].is_ascii_whitespace() {
+                    digits.clear();
+                    break;
+                }
+                j += 1;
+            }
+            if !digits.is_empty() {
+                if digits.len() % 2 == 1 {
+                    digits.push(b'0');
+                }
+                let bytes: Vec<u8> = digits
+                    .chunks(2)
+                    .map(|p| {
+                        u8::from_str_radix(std::str::from_utf8(p).unwrap_or("0"), 16).unwrap_or(0)
+                    })
+                    .collect();
+                if looks_texty(&bytes, false) || looks_texty(&bytes, true) {
+                    strings.push((bytes, true));
+                }
+            }
+            i = j + 1;
         } else {
             i += 1;
         }
+    }
+    let ebcdic = looks_ebcdic(strings.iter().flat_map(|(bytes, _)| bytes.iter().copied()));
+    for (s, is_hex) in strings {
+        if is_hex && !looks_texty(&s, ebcdic) {
+            continue;
+        }
+        if ebcdic {
+            out.extend(
+                s.iter()
+                    .map(|&b| char::from_u32(EBCDIC_273[b as usize] as u32).unwrap_or(' ')),
+            );
+        } else {
+            // PDFDocEncoding ≈ Latin-1 for the characters we need (€ 0xA0 → handled by "EUR")
+            out.extend(s.iter().map(|&b| if b == 0x80 { '€' } else { b as char }));
+        }
+        out.push(' ');
     }
 }
 
@@ -231,11 +344,20 @@ pub fn extract_pdf_text(bytes: &[u8]) -> String {
     let mut inflate_budget = MAX_INFLATED_TOTAL;
     let mut i = 0;
     while let Some(pos) = find(bytes, b"stream", i) {
-        let dict_start = bytes[..pos]
-            .iter()
-            .rposition(|&b| b == b'<')
-            .map(|p| p.saturating_sub(400))
-            .unwrap_or(0);
+        // the dictionary of this stream: from its `obj` keyword on (a window before the dictionary
+        // would take in the previous object, "/Image" of a picture included, and skip a text stream)
+        let window = pos.saturating_sub(1500);
+        let dict_start = bytes[window..pos]
+            .windows(3)
+            .rposition(|w| w == b"obj")
+            .map(|p| window + p)
+            .unwrap_or_else(|| {
+                bytes[..pos]
+                    .iter()
+                    .rposition(|&b| b == b'<')
+                    .map(|p| p.saturating_sub(400))
+                    .unwrap_or(0)
+            });
         let dict = &bytes[dict_start..pos];
         let mut start = pos + 6;
         if bytes.get(start) == Some(&b'\r') {
@@ -289,32 +411,105 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|p| p + from)
 }
 
+/// Document type (`beleg | abrechnung | kontoauszug | postbox | steuer`) from a lower-cased German
+/// bank title: "Abrechnung Ausführung", "Online Auszug", "Quartalsdepotauszug", "Steuerbescheinigung",
+/// "Kosteninformation", "Kundeninformation …", "Dividende Wahlweise", "Eröffnungsantrag" and the like.
+/// Keyword based; what a connector knows better (the event behind a document) it refines itself.
+pub fn type_from_title(lower_title: &str) -> &'static str {
+    TITLE_RULES
+        .iter()
+        .find(|(_, words)| words.iter().any(|word| lower_title.contains(word)))
+        .map_or("beleg", |(kind, _)| *kind)
+}
+
+// The first matching title rule wins.
+const TITLE_RULES: &[(&str, &[&str])] = &[
+    (
+        "steuer",
+        &["steuer", "ertragsaufstellung", "vorabpauschale"],
+    ),
+    (
+        "kontoauszug",
+        &["auszug", "statement", "abschluss", "finanzreport"],
+    ),
+    (
+        "postbox",
+        &[
+            "wahlweise",
+            "kundenvereinbarung",
+            "rechtliche",
+            "mitteilung",
+            "information",
+            "kundenanschreiben",
+            "bedingungsänderung",
+            "vertragsunterlagen",
+            "antrag",
+            "löschbestätigung",
+            "prospekt",
+            "hauptversammlung",
+            "rückkaufangebot",
+            "geschäftsbedingungen",
+            "agb",
+            "agreement",
+            "datenschutz",
+            "leistungsverzeichnis",
+            "eignungsprüfung",
+            "treuhand",
+            "hinweise",
+        ],
+    ),
+    (
+        "abrechnung",
+        &[
+            "abrechnung",
+            "bestätigung",
+            "dividende",
+            "ausführungsanzeige",
+            "ertragsgutschrift",
+            "thesaurierend",
+        ],
+    ),
+];
+
+/// Type of a document that belongs to an account, not to a booking: like `type_from_title`, but a
+/// document that is nothing in particular is a PostBox notice.
+pub fn account_document_type(title: &str) -> &'static str {
+    match type_from_title(&title.to_lowercase()) {
+        "beleg" => "postbox",
+        t => t,
+    }
+}
+
 // ------------------------------------------------------------------ matching
 
 /// Amounts (cents, positive) mentioned in a text: "56,13", "1.234,56 €", "EUR 12.50".
 pub fn amounts_in(text: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    for (_, amount) in amount_occurrences(text) {
+        if !out.contains(&amount) {
+            out.push(amount);
+        }
+    }
+    out
+}
+
+pub(crate) fn amount_occurrences(text: &str) -> impl Iterator<Item = (usize, i64)> + '_ {
     static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?:^|[^\d,.])(\d{1,3}(?:\.\d{3})+,\d{2}|\d+,\d{2}|\d+\.\d{2})").unwrap()
     });
-    let mut out: Vec<i64> = Vec::new();
-    for c in AMOUNT.captures_iter(text) {
-        // The trailing separator is not part of the match (so "12,50 13,00"
-        // finds both); only a following digit disqualifies it.
-        if text[c.get(1).map_or(0, |m| m.end())..]
+    AMOUNT.captures_iter(text).filter_map(move |capture| {
+        let amount = capture.get(1)?;
+        // A following digit belongs to the same number, e.g. the third decimal of a price.
+        if text[amount.end()..]
             .chars()
             .next()
             .is_some_and(|ch| ch.is_ascii_digit())
         {
-            continue;
+            return None;
         }
-        if let Ok(v) = crate::money::parse_cents(&c[1]) {
-            let v = v.abs();
-            if v > 0 && !out.contains(&v) {
-                out.push(v);
-            }
-        }
-    }
-    out
+        let cents = crate::money::parse_cents(amount.as_str()).ok()?.abs();
+        (cents > 0).then_some((amount.start(), cents))
+    })
 }
 
 /// Dates mentioned in a text as ISO strings.
@@ -326,16 +521,12 @@ pub fn dates_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for c in GERMAN.captures_iter(text) {
         let (d, m): (u32, u32) = (c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0));
-        let y: i32 = if c[3].len() == 2 {
-            2000 + c[3].parse::<i32>().unwrap_or(0)
-        } else {
-            c[3].parse().unwrap_or(0)
+        let Some(date) = crate::dates::year(&c[3]).and_then(|y| crate::dates::ymd(y, m, d)) else {
+            continue;
         };
-        if chrono::NaiveDate::from_ymd_opt(y, m, d).is_some() {
-            let iso = format!("{y:04}-{m:02}-{d:02}");
-            if !out.contains(&iso) {
-                out.push(iso);
-            }
+        let iso = crate::dates::iso(date);
+        if !out.contains(&iso) {
+            out.push(iso);
         }
     }
     for c in ISO.captures_iter(text) {
@@ -347,7 +538,7 @@ pub fn dates_in(text: &str) -> Vec<String> {
             continue;
         }
         let s = format!("{}-{}-{}", &c[1], &c[2], &c[3]);
-        if chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").is_ok() && !out.contains(&s) {
+        if jiff::civil::Date::strptime("%Y-%m-%d", &s).is_ok() && !out.contains(&s) {
             out.push(s);
         }
     }
@@ -355,9 +546,9 @@ pub fn dates_in(text: &str) -> Vec<String> {
 }
 
 fn days_between(a: &str, b: &str) -> Option<i64> {
-    let a = chrono::NaiveDate::parse_from_str(a, "%Y-%m-%d").ok()?;
-    let b = chrono::NaiveDate::parse_from_str(b, "%Y-%m-%d").ok()?;
-    Some((a - b).num_days().abs())
+    let a = jiff::civil::Date::strptime("%Y-%m-%d", a).ok()?;
+    let b = jiff::civil::Date::strptime("%Y-%m-%d", b).ok()?;
+    Some(crate::dates::days_between(b, a).abs())
 }
 
 /// Days between a receipt date and a booking that score full date points; a
@@ -377,10 +568,13 @@ pub fn best_match<'a>(bookings: &'a [Booking], text: &str) -> Option<(&'a Bookin
             score += 5;
         }
         let name_hit = {
-            let n = b.merchant.name.to_lowercase();
+            // The bundled merchant, as a receipt names the brand: a name the user gave
+            // the booking (#1373) is in no receipt and must not link one.
+            let m = crate::merchants::MerchantResolver::resolve(&b.counterparty, &b.purpose);
+            let n = m.name.to_lowercase();
             let first = n.split_whitespace().next().unwrap_or("").to_string();
             (!first.is_empty() && first.len() >= 3 && lower.contains(&first))
-                || lower.contains(&b.merchant.key.replace('-', " "))
+                || lower.contains(&m.key.replace('-', " "))
         };
         if name_hit {
             score += 3;
@@ -416,13 +610,20 @@ fn label(b: &Booking) -> String {
     )
 }
 
-fn row_to_info(r: &rusqlite::Row) -> rusqlite::Result<DocumentInfo> {
+/// `merchants`: the vault's merchant recognition, so the booking reads as in the list (#1373).
+fn row_to_info(
+    r: &rusqlite::Row,
+    merchants: &crate::merchants::MerchantRules,
+) -> rusqlite::Result<DocumentInfo> {
     let cp: Option<String> = r.get(12)?;
     let amount: Option<i64> = r.get(13)?;
     let date: Option<String> = r.get(14)?;
+    let purpose: Option<String> = r.get(16)?;
     let booking_label = match (cp, amount, date) {
         (Some(cp), Some(a), Some(d)) => {
-            let m = crate::merchants::MerchantResolver::resolve(&cp, "");
+            // as the booking list names it: the purpose decides behind payment services,
+            // and without a counterparty
+            let m = merchants.resolve(&cp, purpose.as_deref().unwrap_or(""));
             format!("{} · {} · {}", m.name, format_cents(a, "EUR".into()), d)
         }
         _ => String::new(),
@@ -449,7 +650,7 @@ fn row_to_info(r: &rusqlite::Row) -> rusqlite::Result<DocumentInfo> {
 /// `ON DELETE SET NULL` did): `t` and `da` only join live rows.
 const SELECT_INFO: &str = "SELECT d.id, t.id, COALESCE(da.id, t.account_id), d.title, d.doc_type, d.mime_type, d.file_name,
         length(d.pdf_bytes), d.source_url, COALESCE(NULLIF(d.doc_date,''), t.booking_date, ''), d.created_at, a.name,
-        t.counterparty, t.amount_cents, t.booking_date, d.seen_at IS NOT NULL
+        t.counterparty, t.amount_cents, t.booking_date, d.seen_at IS NOT NULL, t.purpose
    FROM booking_documents d
    LEFT JOIN transactions t ON t.id = d.booking_id AND t.deleted_ms IS NULL
    LEFT JOIN accounts da ON da.id = d.account_id AND da.deleted_ms IS NULL
@@ -488,15 +689,18 @@ fn truncate_chars(s: &mut String, max: usize) {
 impl Vault {
     /// The bookings `best_match` can accept for `text`: those with one of its
     /// amounts, or (for a name hit) booked within `CLOSE_DAYS` of one of its dates.
-    fn bookings_for_matching(&self, text: &str) -> CoreResult<Vec<Booking>> {
+    pub(crate) fn bookings_for_matching(&self, text: &str) -> CoreResult<Vec<Booking>> {
         // Inlined values, all built here from integers and parsed dates. Two IN
         // lists keep the SQL flat however many amounts and dates a long PDF names.
         let amounts: Vec<i64> = amounts_in(text).iter().flat_map(|a| [*a, -a]).collect();
         let mut days: Vec<String> = dates_in(text)
             .iter()
-            .filter_map(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-            .flat_map(|d| (-CLOSE_DAYS..=CLOSE_DAYS).map(move |k| d + chrono::Duration::days(k)))
-            .map(|d| d.format("'%Y-%m-%d'").to_string())
+            .filter_map(|d| jiff::civil::Date::strptime("%Y-%m-%d", d).ok())
+            // "gültig bis 31.12.9999" is common: jiff dates end there, so skip what lies past it.
+            .flat_map(|d| {
+                (-CLOSE_DAYS..=CLOSE_DAYS).filter_map(move |k| crate::dates::add_days(d, k))
+            })
+            .map(|d| d.strftime("'%Y-%m-%d'").to_string())
             .collect();
         days.sort_unstable();
         days.dedup();
@@ -529,6 +733,7 @@ fn list_all_documents_sql() -> String {
             AND (?2 IS NULL OR d.doc_type = ?2)
             AND (?3 IS NULL OR d.title LIKE ?3 OR d.file_name LIKE ?3 OR t.counterparty LIKE ?3)
             AND (?4 = 0 OR t.id IS NULL)
+            AND (?5 IS NULL OR a.connection_id = ?5)
          ORDER BY COALESCE(NULLIF(d.doc_date,''), t.booking_date) DESC, d.id DESC"
     )
 }
@@ -540,11 +745,12 @@ impl Vault {
         booking_id: i64,
     ) -> Result<Vec<DocumentInfo>, CoreError> {
         let db = self.db()?;
+        let merchants = self.merchant_rules(&db)?;
         let mut st = db.prepare(&format!(
             "{SELECT_INFO} WHERE d.booking_id = ?1 AND t.id IS NOT NULL ORDER BY d.doc_date DESC, d.id DESC"
         ))?;
         let rows = st
-            .query_map([booking_id], row_to_info)?
+            .query_map([booking_id], |r| row_to_info(r, &merchants))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -554,6 +760,7 @@ impl Vault {
         filter: DocumentFilter,
     ) -> Result<Vec<DocumentInfo>, CoreError> {
         let db = self.db()?;
+        let merchants = self.merchant_rules(&db)?;
         let mut st = db.prepare(&list_all_documents_sql())?;
         let search = filter
             .search
@@ -565,9 +772,10 @@ impl Vault {
                     filter.account_id,
                     filter.doc_type,
                     search,
-                    filter.unlinked_only as i64
+                    filter.unlinked_only as i64,
+                    filter.connection_id
                 ],
-                row_to_info,
+                |r| row_to_info(r, &merchants),
             )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -665,7 +873,7 @@ impl Vault {
     ) -> Result<i64, CoreError> {
         let db = self.db()?;
         let mime = sniff_mime(&bytes, &file_name);
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = crate::dates::today_iso();
         let id = insert_doc(
             &db,
             None,
@@ -687,12 +895,26 @@ impl Vault {
 
     /// Re-links (or unlinks) a document.
     pub fn link_document(&self, doc_id: i64, booking_id: Option<i64>) -> Result<(), CoreError> {
-        let db = self.db()?;
-        db.execute(
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let changed = tx.execute(
             "UPDATE booking_documents SET booking_id = ?1,
                 account_id = COALESCE((SELECT account_id FROM transactions WHERE id = ?1), account_id) WHERE id = ?2",
             params![booking_id, doc_id],
         )?;
+        if changed > 0 {
+            let key = format!("doc.unlinked.{doc_id}");
+            if booking_id.is_none() {
+                tx.execute(
+                    "INSERT INTO settings(key, value) VALUES (?1, '1')
+                     ON CONFLICT(key) DO UPDATE SET value = '1'",
+                    [key],
+                )?;
+            } else {
+                tx.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -704,7 +926,7 @@ impl Vault {
         doc_id: i64,
         account_id: Option<i64>,
     ) -> Result<(), CoreError> {
-        let db = self.db()?;
+        let mut db = self.db()?;
         if let Some(a) = account_id {
             let exists: bool = db.query_row(
                 "SELECT EXISTS (SELECT 1 FROM accounts WHERE id = ?1 AND deleted_ms IS NULL)",
@@ -717,7 +939,20 @@ impl Vault {
                 });
             }
         }
-        let n = db.execute(
+        let previous: Option<Option<i64>> = db
+            .query_row(
+                "SELECT account_id FROM booking_documents WHERE id = ?1",
+                [doc_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(previous) = previous else {
+            return Err(CoreError::NotFound {
+                what: trf("Dokument {0}", &[&doc_id]),
+            });
+        };
+        let tx = db.transaction()?;
+        tx.execute(
             "UPDATE booking_documents SET account_id = ?1,
                 booking_id = CASE WHEN ?1 IS NOT NULL AND
                     (SELECT account_id FROM transactions WHERE id = booking_id) = ?1
@@ -725,17 +960,28 @@ impl Vault {
               WHERE id = ?2",
             params![account_id, doc_id],
         )?;
-        if n == 0 {
-            return Err(CoreError::NotFound {
-                what: trf("Dokument {0}", &[&doc_id]),
-            });
+        if previous != account_id {
+            tx.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                [format!("doc.unlinked.{doc_id}")],
+            )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_document(&self, doc_id: i64) -> Result<(), CoreError> {
-        self.db()?
-            .execute("DELETE FROM booking_documents WHERE id = ?1", [doc_id])?;
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM booking_documents WHERE id = ?1", [doc_id])?;
+        tx.execute(
+            "DELETE FROM settings WHERE key IN (?1, ?2)",
+            rusqlite::params![
+                format!("doc.unlinked.{doc_id}"),
+                format!("doc.match_days.{doc_id}")
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -884,7 +1130,7 @@ impl Vault {
         let mut used = HashSet::new();
         let mut n = 0u32;
         for d in docs {
-            let year = d.doc_date.get(..4).unwrap_or(tr("ohne-Datum")).to_string();
+            let year = year_folder(&d.doc_date);
             let dir = base.join(&year);
             std::fs::create_dir_all(&dir).map_err(|e| CoreError::InvalidInput {
                 message: format!("{e}"),
@@ -919,6 +1165,16 @@ impl Vault {
         }
         Ok(n)
     }
+}
+
+/// The year folder a document is exported into. Only a parsed date may name a directory:
+/// `doc_date` falls back to the booking date, which comes from bank data ("../x" would leave
+/// the export folder).
+fn year_folder(doc_date: &str) -> String {
+    crate::dates::parse_iso(doc_date).map_or_else(
+        || tr("ohne-Datum").to_string(),
+        |d| format!("{:04}", d.year()),
+    )
 }
 
 /// File name of a document in the mirror folder: `<Datum>_<Händler>_<Titel>.<ext>`.
@@ -959,8 +1215,8 @@ impl Vault {
             let db = self.db()?;
             let mut st =
                 db.prepare("SELECT id FROM booking_documents WHERE exported_at IS NULL")?;
-            let ids = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            ids
+
+            st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
         };
         if pending.is_empty() {
             return Ok(0);
@@ -979,7 +1235,7 @@ impl Vault {
             } else {
                 safe_name(&d.account_name)
             };
-            let year = d.doc_date.get(..4).unwrap_or(tr("ohne-Datum")).to_string();
+            let year = year_folder(&d.doc_date);
             let dir = base.join(account).join(year);
             std::fs::create_dir_all(&dir).map_err(io)?;
             let bytes = self.get_document_bytes(d.id)?;
@@ -1079,6 +1335,232 @@ pub fn simple_pdf(lines: &[String]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Characters of a text as IBM-273 bytes, the way comdirect's mainframe prints them.
+    fn ebcdic(text: &str) -> Vec<u8> {
+        text.chars()
+            .map(|c| {
+                EBCDIC_273
+                    .iter()
+                    .position(|&u| u as u32 == c as u32)
+                    .expect("in the table") as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ebcdic_text_of_a_mainframe_pdf_is_read_in_literal_and_hex_strings() {
+        let line = "Zu Ihren Lasten vor Steuern EUR 24,94 Wertpapierkauf IE00B3RBWM25";
+        let bytes = ebcdic(line);
+        let mut literal = b"BT (".to_vec();
+        literal.extend(&bytes);
+        literal.extend(b") Tj ET");
+        let mut out = String::new();
+        literal_strings(&literal, &mut out);
+        assert!(out.contains(line), "{out}");
+        // the same line as a hex string
+        let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let mut out = String::new();
+        literal_strings(format!("BT <{hex}> Tj ET").as_bytes(), &mut out);
+        assert!(out.contains(line), "{out}");
+    }
+
+    #[test]
+    fn ordinary_text_and_non_text_hex_stay_as_they_were() {
+        // an ASCII PDF is not taken for EBCDIC
+        let mut out = String::new();
+        literal_strings(
+            b"BT (Kontoauszug vom 01.02.2024 Saldo 1.234,56 EUR) Tj ET",
+            &mut out,
+        );
+        assert!(
+            out.contains("Kontoauszug vom 01.02.2024 Saldo 1.234,56 EUR"),
+            "{out}"
+        );
+        // hex glyph numbers of a CID font are no text
+        let mut out = String::new();
+        literal_strings(b"BT <0012001300140015> Tj <00240025> Tj ET", &mut out);
+        assert!(out.trim().is_empty(), "{out:?}");
+        // a CMap (no text operators) is not read as text either
+        let mut out = String::new();
+        literal_strings(b"begincmap <0000> <FFFF> <0041> endcmap", &mut out);
+        assert!(out.trim().is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn cid_glyphs_do_not_change_the_encoding_of_readable_text() {
+        let glyphs = "00C1".repeat(60);
+        let mut out = String::new();
+        literal_strings(
+            format!("BT (IBAN DE75200411550765432100) Tj <{glyphs}> Tj ET").as_bytes(),
+            &mut out,
+        );
+        assert_eq!(out.trim(), "IBAN DE75200411550765432100");
+    }
+
+    #[test]
+    fn mixed_literal_and_hex_text_keeps_an_iban_in_source_order() {
+        let mut out = String::new();
+        literal_strings(
+            b"BT (IBAN DE75 ) Tj <323030343131353530373635343332313030> Tj ( Kontostand) Tj ET",
+            &mut out,
+        );
+        assert_eq!(
+            out.split_whitespace().collect::<String>(),
+            "IBANDE75200411550765432100Kontostand",
+        );
+    }
+
+    #[test]
+    fn a_text_stream_after_a_picture_object_is_not_skipped_as_an_image() {
+        // the object before holds "/Subtype /Image"; this stream's own dictionary is plain
+        let content = b"BT (Wertpapierkauf 24,94 EUR) Tj ET";
+        let mut pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /XObject /Subtype /Image >>\nstream\nxx\nendstream\nendobj\n".to_vec();
+        pdf.extend(b"2 0 obj\n<< /Length 40 >>\nstream\n");
+        pdf.extend(content);
+        pdf.extend(b"\nendstream\nendobj\n");
+        assert!(extract_pdf_text(&pdf).contains("Wertpapierkauf 24,94 EUR"));
+    }
+
+    /// The rules as they were hard-coded before `data/document_rules.json`.
+    fn legacy_type_from_title(lower_title: &str) -> &'static str {
+        let has = |k: &str| lower_title.contains(k);
+        if has("steuer") || has("ertragsaufstellung") || has("vorabpauschale") {
+            "steuer"
+        } else if has("auszug") || has("statement") || has("abschluss") {
+            "kontoauszug"
+        } else if [
+            "wahlweise",
+            "kundenvereinbarung",
+            "rechtliche",
+            "mitteilung",
+            "information",
+            "kundenanschreiben",
+            "bedingungsänderung",
+            "vertragsunterlagen",
+            "antrag",
+            "löschbestätigung",
+            "prospekt",
+            "hauptversammlung",
+            "rückkaufangebot",
+            "geschäftsbedingungen",
+            "agb",
+            "agreement",
+            "datenschutz",
+            "leistungsverzeichnis",
+            "eignungsprüfung",
+            "treuhand",
+            "hinweise",
+        ]
+        .iter()
+        .any(|k| has(k))
+        {
+            "postbox"
+        } else if has("abrechnung")
+            || has("bestätigung")
+            || has("dividende")
+            || has("ausführungsanzeige")
+        {
+            "abrechnung"
+        } else {
+            "beleg"
+        }
+    }
+
+    #[test]
+    fn the_rules_file_gives_the_same_types_as_the_old_keyword_chain() {
+        for title in [
+            "abrechnung ausführung",
+            "online auszug",
+            "quartalsdepotauszug",
+            "steuerbescheinigung",
+            "kosteninformation",
+            "kundeninformation zu ihrem depot",
+            "dividende wahlweise",
+            "eröffnungsantrag",
+            "wertpapierabrechnung sparplan",
+            "vorabpauschale 2024",
+            "kundenvereinbarung",
+            "agb",
+            "ausführungsanzeige",
+            "rechnungsabschluss",
+            "jahresdepotauszug",
+            "dokumente",
+            "",
+            "rechnung",
+            "beleg 12/2024",
+            "bestätigung",
+            "hinweise zu den kosten",
+            "statement 03/2025",
+        ] {
+            assert_eq!(
+                type_from_title(title),
+                legacy_type_from_title(title),
+                "{title}"
+            );
+        }
+        assert_eq!(account_document_type("Rechnung"), "postbox");
+        assert_eq!(type_from_title("rechnung"), "beleg");
+    }
+
+    #[test]
+    fn the_rule_examples_have_the_expected_document_types() {
+        for (title, expected) in [
+            (
+                "Wertpapierabrechnung Kauf 12,5 St. WKN A1JX52 (VANGUARD FTSE ALL-WORLD) vom 01.02.2024",
+                "abrechnung",
+            ),
+            (
+                "Wertpapierabrechnung Verkauf 10 St. WKN 716460 (SAP SE O.N.) vom 05.05.2024",
+                "abrechnung",
+            ),
+            (
+                "Dividendengutschrift 10 St. WKN 716460 (SAP SE O.N.) vom 05.05.2024",
+                "abrechnung",
+            ),
+            (
+                "Ertragsgutschrift 100 St. WKN 847101 (FONDAK P) vom 10.10.2024",
+                "abrechnung",
+            ),
+            (
+                "Gutschrift thesaurierend 100 St. WKN ETF001 vom 01.02.2024",
+                "abrechnung",
+            ),
+            ("Steuermitteilung WKN A1JX52 vom 31.07.2024", "steuer"),
+            ("Jahressteuerbescheinigung 2023", "steuer"),
+            ("Finanzreport Nr. 12 per 31.12.2024", "kontoauszug"),
+            (
+                "Kosteninformation MSCI World WKN A1H2QY vom 01.03.2024",
+                "postbox",
+            ),
+            (
+                "Kauf - WKN A1JX52 - Wertpapierabrechnung vom 23.07.2021 zu Depot 1 - Ordernr. 2",
+                "abrechnung",
+            ),
+            (
+                "Ertragsabrechnung Dividenden vom 01.06.2023 zu Depot 1",
+                "abrechnung",
+            ),
+            ("Depotauszug vom 15.01.2023 zu Depot 1", "kontoauszug"),
+            (
+                "Kontoauszug 3/2024 vom 31.03.2024 zu Konto 1",
+                "kontoauszug",
+            ),
+            ("Rechnungsabschluss 2024 Konto 1 EUR", "kontoauszug"),
+            ("Erträgnisabrechnung IE00B3RBWM25", "abrechnung"),
+            ("Quartalsbericht Q3 2024 Globales Portfolio", "postbox"),
+            ("OnlineAuszug-Nr 12 2025", "kontoauszug"),
+            (
+                "Wertpapierabrechnung Sparplan – JPM USD EM Bond",
+                "abrechnung",
+            ),
+            ("Dividende – Apple", "abrechnung"),
+            ("Kosteninformation – Apple", "postbox"),
+        ] {
+            assert_eq!(account_document_type(title), expected, "{title}");
+        }
+    }
+
     use crate::test_support::query_plan;
 
     #[test]
@@ -1142,7 +1624,7 @@ mod tests {
             let p = query_plan(
                 &db,
                 &list_all_documents_sql(),
-                params![None::<i64>, None::<String>, None::<String>, 0],
+                params![None::<i64>, None::<String>, None::<String>, 0, None::<i64>],
             );
             assert!(p.contains("COVERING INDEX booking_documents_info"), "{p}");
         }
@@ -1161,12 +1643,127 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Bank connection filter (#1042): goes through the document's account, needs no
+    /// `booking_documents` column, and documents without an account never match.
+    #[test]
+    fn filters_documents_by_bank_connection() {
+        let dir = crate::test_support::TempDir::new("gc-docs-conn");
+        let path = dir.join("v.db");
+        let v = Vault::open(path.to_string_lossy().into(), vec![5u8; 32]).unwrap();
+        let ((a, conn_a), (b, conn_b)) = {
+            let db = v.db().unwrap();
+            db.execute("INSERT INTO account_groups(name) VALUES ('G')", [])
+                .unwrap();
+            let mut ids = vec![];
+            for r in ["A", "B"] {
+                db.execute(
+                    "INSERT INTO bank_connections(connector, display_name) VALUES ('demo', ?1)",
+                    [r],
+                )
+                .unwrap();
+                let conn = db.last_insert_rowid();
+                db.execute(
+                    "INSERT INTO accounts(group_id, external_ref, name, connection_id)
+                     VALUES ((SELECT id FROM account_groups), ?1, ?1, ?2)",
+                    params![r, conn],
+                )
+                .unwrap();
+                ids.push((db.last_insert_rowid(), conn));
+            }
+            (ids[0], ids[1])
+        };
+        for (acc, title) in [(a, "Von A"), (b, "Von B")] {
+            v.attach_document_to_account(
+                acc,
+                title.into(),
+                format!("{title}.pdf"),
+                simple_pdf(&[title.to_string()]),
+                "kontoauszug".into(),
+            )
+            .unwrap();
+        }
+        let by = |connection_id, account_id| {
+            v.list_all_documents(DocumentFilter {
+                connection_id,
+                account_id,
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|d| d.title)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(by(Some(conn_a), None), ["Von A"]);
+        assert_eq!(by(Some(conn_b), None), ["Von B"]);
+        assert!(by(Some(conn_b + 100), None).is_empty());
+        assert_eq!(by(None, None).len(), 2);
+        // both filters combine (AND)
+        assert_eq!(by(Some(conn_a), Some(a)), ["Von A"]);
+        assert!(by(Some(conn_a), Some(b)).is_empty());
+        {
+            let db = v.db().unwrap();
+            let p = query_plan(
+                &db,
+                &list_all_documents_sql(),
+                params![None::<i64>, None::<String>, None::<String>, 0, Some(conn_a)],
+            );
+            assert!(p.contains("COVERING INDEX booking_documents_info"), "{p}");
+        }
+    }
+
     #[test]
     fn reads_amounts_and_dates() {
         assert_eq!(amounts_in("Summe EUR 56,13 bar 60,00"), vec![56_13, 60_00]);
         assert_eq!(amounts_in("Total 1.234,56 €"), vec![1_234_56]);
         assert!(dates_in("Datum 07.11.2026 / 2026-11-08").contains(&"2026-11-07".to_string()));
         assert!(dates_in("Rechnung_2026-11-08_Metro.pdf").contains(&"2026-11-08".to_string()));
+        assert_eq!(dates_in("vom 31.12.99"), vec!["1999-12-31".to_string()]);
+        assert_eq!(dates_in("vom 02.01.26"), vec!["2026-01-02".to_string()]);
+    }
+
+    #[test]
+    fn a_document_date_that_is_no_day_is_stored_empty() {
+        let dir = crate::test_support::TempDir::new("girocrab-docs-date");
+        let v = Vault::open(
+            dir.join("v.db").to_string_lossy().to_string(),
+            vec![8u8; 32],
+        )
+        .unwrap();
+        let db = v.db().unwrap();
+        let stored = |date: &str| {
+            let id = insert_doc(
+                &db,
+                None,
+                None,
+                "t",
+                "beleg",
+                "application/pdf",
+                "x.pdf",
+                b"%PDF-1.4 x",
+                date,
+                date,
+            )
+            .unwrap()
+            .unwrap();
+            db.query_row(
+                "SELECT doc_date FROM booking_documents WHERE id = ?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored("2025-03-02"), "2025-03-02");
+        assert_eq!(stored("2025-03-04T10:00:00Z"), "2025-03-04");
+        assert_eq!(stored("2025-02-30"), "");
+        assert_eq!(stored("../x"), "");
+    }
+
+    #[test]
+    fn export_folders_are_years_only() {
+        assert_eq!(year_folder("2025-03-02"), "2025");
+        assert_eq!(year_folder("../x"), tr("ohne-Datum"));
+        assert_eq!(year_folder("2025-02-30"), tr("ohne-Datum"));
+        assert_eq!(year_folder(""), tr("ohne-Datum"));
     }
 
     #[test]
@@ -1197,9 +1794,9 @@ mod tests {
             .unwrap()
             .transactions;
         let de = |iso: &str, shift: i64| {
-            let d = chrono::NaiveDate::parse_from_str(iso, "%Y-%m-%d").unwrap();
-            (d + chrono::Duration::days(shift))
-                .format("%d.%m.%Y")
+            let d = jiff::civil::Date::strptime("%Y-%m-%d", iso).unwrap();
+            (d + crate::dates::days(shift))
+                .strftime("%d.%m.%Y")
                 .to_string()
         };
         let mut name_date_hits = 0;
@@ -1224,14 +1821,23 @@ mod tests {
     }
 
     #[test]
+    fn a_date_at_the_end_of_the_calendar_does_not_panic() {
+        // jiff dates stop at 9999-12-31, so the days around it must be skipped.
+        let text = "Freistellungsauftrag gültig bis 31.12.9999";
+        assert!(dates_in(text).contains(&"9999-12-31".to_string()));
+        let (_dir, v) = demo_vault();
+        v.bookings_for_matching(text).unwrap();
+    }
+
+    #[test]
     fn thousands_of_dates_keep_the_prefilter_sql_valid() {
         let (_dir, v) = demo_vault();
-        let start = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        let start = jiff::civil::date(2000, 1, 1);
         let text: String = (0..3000)
             .map(|k| {
                 format!(
                     "{} ",
-                    (start + chrono::Duration::days(k * 2)).format("%d.%m.%Y")
+                    (start + crate::dates::days(k * 2)).strftime("%d.%m.%Y")
                 )
             })
             .collect();
@@ -1256,8 +1862,8 @@ mod tests {
         let p = p_dir.join("v.db");
         let v = Vault::open(p.to_string_lossy().to_string(), vec![6u8; 32]).unwrap();
         v.seed_demo_data().unwrap();
-        let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
-            .format("%d.%m.%Y")
+        let yesterday = (crate::dates::today() - crate::dates::days(1))
+            .strftime("%d.%m.%Y")
             .to_string();
         let pdf = simple_pdf(&[
             "REWE Markt GmbH".into(),
@@ -1301,11 +1907,7 @@ mod tests {
             )
             .unwrap();
             let acc = db.last_insert_rowid();
-            let day = |ago: i64| {
-                (chrono::Local::now().date_naive() - chrono::Duration::days(ago))
-                    .format("%Y-%m-%d")
-                    .to_string()
-            };
+            let day = |ago: i64| crate::dates::iso(crate::dates::today() - crate::dates::days(ago));
             let add = |title: &str, url: &str, date: &str| {
                 insert_doc(
                     &db,
@@ -1391,7 +1993,7 @@ mod tests {
             )
             .unwrap();
             let deleted_booking = db.last_insert_rowid();
-            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let today = crate::dates::today_iso();
             let add = |booking: Option<i64>, account: Option<i64>, url: &str| {
                 insert_doc(
                     &db,
@@ -1429,8 +2031,8 @@ mod tests {
         let p = p_dir.join("v.db");
         let v = Vault::open(p.to_string_lossy().to_string(), vec![6u8; 32]).unwrap();
         v.seed_demo_data().unwrap();
-        let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
-            .format("%d.%m.%Y")
+        let yesterday = (crate::dates::today() - crate::dates::days(1))
+            .strftime("%d.%m.%Y")
             .to_string();
         let pdf = simple_pdf(&[
             "REWE Markt GmbH".into(),
@@ -1442,17 +2044,19 @@ mod tests {
         let docs = v.list_all_documents(DocumentFilter::default()).unwrap();
         assert!(docs.iter().any(|d| d.booking_label.starts_with("REWE")));
         // unmatched -> PostBox
-        assert!(v
-            .auto_match_dropped_pdf("irgendwas.pdf".into(), simple_pdf(&["Hallo".into()]))
-            .unwrap()
-            .is_none());
-        assert!(!v
-            .list_all_documents(DocumentFilter {
+        assert!(
+            v.auto_match_dropped_pdf("irgendwas.pdf".into(), simple_pdf(&["Hallo".into()]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !v.list_all_documents(DocumentFilter {
                 unlinked_only: true,
                 ..Default::default()
             })
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
         // export
         let export = crate::test_support::TempDir::new("export");
         let dir = export.path();

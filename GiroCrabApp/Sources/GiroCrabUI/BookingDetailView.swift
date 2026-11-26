@@ -1,19 +1,20 @@
 import SwiftUI
 import GiroCrabCore
 
-/// Column 3: permanent context & receipt inspector.
+/// Column 3: permanent context & receipt inspector. See `docs/INSPEKTOR_UI.md`.
 struct InspectorView: View {
     @Environment(AppModel.self) private var model
     /// Order and hidden cards (#448), see `InspectorLayout`.
     @AppStorage(InspectorLayout.defaultsKey) private var layoutValue = ""
     @State private var editingLayout = LaunchOptions.current.inspectorEdit
+    @State private var revealedNoteBookingID: Booking.ID?
 
     private var layout: InspectorLayout { InspectorLayout(storageValue: layoutValue) }
 
     private func updateLayout(_ change: (inout InspectorLayout) -> Void) {
         var next = layout
         change(&next)
-        withAnimation(.snappy(duration: 0.2)) { layoutValue = next.persistedValue }
+        withAnimation(Motion.animation(.snappy(duration: 0.2))) { layoutValue = next.persistedValue }
     }
 
     var body: some View {
@@ -25,119 +26,134 @@ struct InspectorView: View {
                     updateLayout { $0 = .standard }
                 }
             }
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if model.sidebarSelection == .planned {
-                    PlannedInspector()
-                } else if model.sidebarSelection == .directDebits {
-                    MandateInspector()
-                } else {
-                if case .account(let id) = model.sidebarSelection, let a = model.account(for: id), a.kind == .loan {
-                    LoanProgressCard(account: a)
-                }
-                if model.isMultiSelection {
-                    MultiSelectionCard()
-                } else if let b = model.selectedBooking {
-                    if editingLayout {
-                        InspectorLayoutEditor(booking: b, layout: layout, update: updateLayout)
-                    } else {
-                        ForEach(layout.visible) { section in
-                            InspectorSectionCard(section: section, booking: b)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        if model.mainColumn == .planned {
+                            PlannedInspector()
+                        } else if model.mainColumn == .directDebits {
+                            MandateInspector()
+                        } else if model.mainColumn == .subscriptions {
+                            SubscriptionInspector()
+                        } else {
+                            SelectedLoanCard()
+                            if model.isMultiSelection {
+                                MultiSelectionCard()
+                            } else if let booking = model.selectedBooking {
+                                if editingLayout {
+                                    InspectorLayoutEditor(booking: booking, layout: layout, update: updateLayout)
+                                } else {
+                                    ForEach(Array(visibleSections(for: booking).enumerated()), id: \.element.id) { index, section in
+                                        if index > 0 { Divider() }
+                                        InspectorSectionCard(section: section, booking: booking) {
+                                            proxy.scrollTo(InspectorSection.note.id)
+                                        }
+                                        .id(section.id)
+                                    }
+                                }
+                            } else {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label("Keine Buchung ausgewählt", systemImage: "doc.text.magnifyingglass")
+                                        .appFont(.headline)
+                                    Text("Wählen Sie eine Buchung, um Beleg, Händler-Historie und Kategorie zu sehen.")
+                                        .appFont(.callout).foregroundStyle(Theme.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .flatSection()
+                            }
                         }
                     }
-                } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("Keine Buchung ausgewählt", systemImage: "doc.text.magnifyingglass")
-                            .appFont(.headline)
-                        Text("Wählen Sie eine Buchung, um Beleg, Händler-Historie und Kategorie zu sehen.")
-                            .appFont(.callout).foregroundStyle(Theme.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .card()
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 8)
                 }
+                .onChange(of: model.pendingNoteFocus, initial: true) { _, requestedID in
+                    guard let requestedID, requestedID == model.selectedBookingID else { return }
+                    editingLayout = false
+                    if layout.hidden.contains(.note) { revealedNoteBookingID = requestedID }
+                }
+                .onChange(of: model.selectedBookingID) { _, selectedID in
+                    if revealedNoteBookingID != selectedID { revealedNoteBookingID = nil }
+                }
+                .onChange(of: editingLayout) { _, editing in
+                    if editing { revealedNoteBookingID = nil }
                 }
             }
-            .padding(16)
         }
+        .background(Theme.systemBackground)
+    }
+
+    private func visibleSections(for booking: Booking) -> [InspectorSection] {
+        let sections: [InspectorSection]
+        if revealedNoteBookingID == booking.id, layout.hidden.contains(.note) {
+            sections = layout.visible + [.note]
+        } else {
+            sections = layout.visible
         }
-        .background(Theme.canvas)
+        // The salary card renders nothing for an outflow. Skip the section so the
+        // flat list does not show a divider with no content below it.
+        return sections.filter { $0 != .salary || booking.amountCents > 0 }
     }
 
     /// The single-booking cards are shown, so their layout can be edited.
     private var showsBookingCards: Bool {
-        model.sidebarSelection != .planned && model.sidebarSelection != .directDebits
+        model.mainColumn != .planned && model.mainColumn != .directDebits && model.mainColumn != .subscriptions
             && !model.isMultiSelection && model.selectedBooking != nil
+    }
+}
+
+/// The loan's progress above the booking cards while a loan account is selected. A view of its
+/// own so that only it follows the sidebar selection, not the whole inspector.
+private struct SelectedLoanCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        if case .account(let id) = model.shownSelection, let a = model.account(for: id), a.kind == .loan {
+            LoanProgressCard(account: a)
+        }
     }
 }
 
 struct ReceiptCard: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.textScale) private var textScale
     let booking: Booking
     @State private var editing = false
     @State private var draftName = ""
     @State private var draftPurpose = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Spacer()
-                Button {
-                    draftName = booking.counterparty
-                    draftPurpose = booking.purpose
-                    editing = true
-                } label: { Label("Text bearbeiten …", systemImage: "pencil") }
-                    .buttonStyle(.borderless).controlSize(.small).appFont(.caption)
-                    .help("Gegenpartei und Verwendungszweck korrigieren")
-            }
-            .capturablePopover(isPresented: $editing) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Gegenpartei").appFont(.caption).foregroundStyle(Theme.secondary)
-                    TextField("Gegenpartei", text: $draftName).textFieldStyle(.roundedBorder)
-                    Text("Verwendungszweck").appFont(.caption).foregroundStyle(Theme.secondary)
-                    TextEditor(text: $draftPurpose)
-                        .appFont(.callout).frame(height: 90)
-                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.secondary.opacity(0.3)))
-                    HStack {
-                        Spacer()
-                        Button("Abbrechen") { editing = false }
-                            .keyboardShortcut(.cancelAction)
-                        Button("Speichern") {
-                            model.updateText(counterparty: draftName, purpose: draftPurpose, for: booking)
-                            editing = false
-                        }.keyboardShortcut(.defaultAction)
-                    }
-                }
-                .padding(14).frame(width: 340)
-            }
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
                 MerchantSignet(merchant: booking.merchant, categorySymbol: booking.categorySymbol, size: 48)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(booking.merchant.name)
-                        .sensitive()
-                        .appFont(.title3, weight: .semibold)
-                        .foregroundStyle(Theme.text)
-                        .textSelection(.enabled)
+                    HStack(spacing: 6) {
+                        Text(booking.merchant.name)
+                            .sensitive()
+                            .appFont(.title3, weight: .semibold)
+                            .foregroundStyle(Theme.text)
+                            .textSelection(.enabled)
+                        Spacer(minLength: 0)
+                        editTextButton
+                    }
                     Text("\(booking.accountName) · \(booking.paymentMethod)")
                         .sensitive()
                         .appFont(.caption).foregroundStyle(Theme.secondary)
-                    if let counter = model.counterAccount(for: booking) {
-                        Text("⇄ \(counter.name) (\(formatIBAN(booking.counterpartyIban)))")
+                    if !booking.counterpartyIban.isEmpty {
+                        counterpartyIBAN
                             .sensitive()
                             .appFont(.caption).foregroundStyle(Theme.secondary)
                             .textSelection(.enabled)
-                    } else if !booking.counterpartyIban.isEmpty {
-                        Text(formatIBAN(booking.counterpartyIban))
-                            .sensitive()
-                            .appFont(.caption, design: .monospaced).foregroundStyle(Theme.secondary)
-                            .textSelection(.enabled)
                     }
-                    MerchantDomainRow(merchant: booking.merchant)
+                    // with the recognition off no logo shows, so there is no domain to set (#1373)
+                    if model.merchantRecognitionEnabled {
+                        MerchantDomainRow(merchant: booking.merchant)
+                    }
                 }
-                Spacer()
             }
-            Text(Money.signed(booking.amountCents))
+            Text(Money.signed(booking.amountCents, currency: booking.currency))
                 .sensitive(.amounts)
-                .font(.system(.largeTitle, design: .rounded, weight: .semibold).monospacedDigit())
+                // follows the text size like the rest of the card (#343, UI-Audit INS-1)
+                .appFont(.largeTitle, weight: .semibold, design: .rounded, monospacedDigit: true)
                 .foregroundStyle(Money.ink(booking.amountCents))
             HStack(spacing: 6) {
                 Image(systemName: "calendar").foregroundStyle(Theme.tertiary)
@@ -215,27 +231,100 @@ struct ReceiptCard: View {
                 .controlSize(.small)
                 .appFont(.caption)
         }
-        .card()
+        .flatSection()
+    }
+
+    private var counterpartyIBAN: Text {
+        let iban = Text(formatIBAN(booking.counterpartyIban)).monospaced()
+        if let counter = model.counterAccount(for: booking) {
+            return Text("⇄ \(counter.name) (\(iban))")
+        }
+        return iban
+    }
+
+    private var editTextButton: some View {
+        Button {
+            draftName = booking.counterparty
+            draftPurpose = booking.purpose
+            editing = true
+        } label: {
+            Label("Text bearbeiten …", systemImage: "pencil")
+                .labelStyle(.iconOnly)
+                #if os(iOS)
+                .frame(minWidth: 44, minHeight: 44)
+                #endif
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .appFont(.body)
+        .help("Gegenpartei und Verwendungszweck korrigieren")
+        .capturablePopover(isPresented: $editing) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Gegenpartei").appFont(.caption).foregroundStyle(Theme.secondary)
+                TextField("Gegenpartei", text: $draftName).textFieldStyle(.roundedBorder)
+                Text("Verwendungszweck").appFont(.caption).foregroundStyle(Theme.secondary)
+                TextEditor(text: $draftPurpose)
+                    .appFont(.callout).frame(height: 90 * textScale)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.secondary.opacity(0.3)))
+                HStack {
+                    Spacer()
+                    Button("Abbrechen") { editing = false }
+                        .keyboardShortcut(.cancelAction)
+                    Button("Speichern") {
+                        model.updateText(counterparty: draftName, purpose: draftPurpose, for: booking)
+                        editing = false
+                    }.keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(14).frame(width: 340 * textScale)
+        }
     }
 }
 
 /// Free-text user note (imported from MoneyMoney or typed here).
 struct NoteCard: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.textScale) private var textScale
     let booking: Booking
+    var scrollToNote: (() -> Void)?
     @State private var draft = ""
+    /// The booking `draft` was started from. The inspector reuses the card for the next selected
+    /// booking (no `.id`: rebuilding the text editor on every selection was a large part of the
+    /// inspector's update), so a save that runs after the switch (focus loss from the click in
+    /// the list) must still go to this booking, never to the new one.
+    @State private var draftBooking: Booking?
+    /// The text last stored for `draftBooking`: a second save of the same text (focus loss, then
+    /// the switch) writes nothing.
+    @State private var savedText: String?
+    /// Identity of the text editor. It stays across bookings, except after typing: the editor's
+    /// undo history then holds the previous booking's edits, and ⌘Z in the next booking's note
+    /// would bring that text back (and the next save store it there). A new editor drops it.
+    @State private var editorID = 0
+    @State private var typed = false
     @FocusState private var focused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Label("Notiz", systemImage: "note.text").appFont(.subheadline, weight: .semibold).foregroundStyle(Theme.text)
             TextEditor(text: $draft)
+                .id(editorID)
                 .appFont(.callout)
-                .frame(minHeight: 54, maxHeight: 120)
+                .frame(minHeight: 54 * textScale, maxHeight: 120 * textScale)
                 .sensitive()
                 .scrollContentBackground(.hidden)
+                .background(Theme.systemSurface)
+                // an empty editor read as a blank box; the label ties it to the heading for VoiceOver (UI-Audit INS-10)
+                .overlay(alignment: .topLeading) {
+                    if draft.isEmpty && !focused {
+                        Text("Notiz hinzufügen …")
+                            .appFont(.callout).foregroundStyle(Theme.tertiary)
+                            .padding(.leading, 5).padding(.top, 1)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .accessibilityLabel(Text("Notiz"))
                 .focused($focused)
-                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.border))
                 .onChange(of: focused) { _, f in if !f { save() } }
                 // Esc: leave the note (saves via focus loss) and go back to the list
                 .onKeyPress(.escape) {
@@ -244,23 +333,57 @@ struct NoteCard: View {
                     return .handled
                 }
         }
-        .card()
-        .onAppear { draft = booking.note; claimFocus() }
+        .flatSection()
+        .onAppear { start(booking); claimFocus() }
         .onDisappear { save() }
-        .onChange(of: booking.note) { _, n in if !focused { draft = n } }
+        .onChange(of: draft) { if focused { typed = true } }
+        .onChange(of: booking.id) {
+            // what was typed for the previous booking is stored first; then the editor is left,
+            // as with a new card, unless the new booking asked for it
+            save()
+            start(booking)
+            focused = false
+            if typed {
+                typed = false
+                editorID &+= 1
+            }
+            claimFocus()
+        }
+        .onChange(of: booking.note) {
+            if !focused, draftBooking?.id == booking.id { start(booking) }
+        }
         .onChange(of: model.pendingNoteFocus) { _, _ in claimFocus() }
+    }
+
+    private func start(_ b: Booking) {
+        draft = b.note
+        draftBooking = b
+        savedText = nil
     }
 
     /// Takes the focus requested by a double-click / Return in the list for this booking.
     private func claimFocus() {
-        guard model.pendingNoteFocus == booking.id else { return }
-        model.pendingNoteFocus = nil
-        // deferred: focus on a just-appeared TextEditor is otherwise dropped
-        DispatchQueue.main.async { focused = true }
+        // The layout editor shows a preview of the card and must leave the request for
+        // the editable card. Give a newly revealed inspector one layout pass before scrolling.
+        guard let scrollToNote, model.pendingNoteFocus == booking.id else { return }
+        DispatchQueue.main.async {
+            guard model.pendingNoteFocus == booking.id else { return }
+            guard model.selectedBookingID == booking.id else {
+                model.pendingNoteFocus = nil
+                return
+            }
+            scrollToNote()
+            model.pendingNoteFocus = nil
+            focused = true
+        }
     }
 
     private func save() {
-        if draft.trimmingCharacters(in: .whitespacesAndNewlines) != booking.note { model.updateNote(draft, for: booking) }
+        guard let b = draftBooking else { return }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text != (savedText ?? b.note) else { return }
+        model.updateNote(draft, for: b)
+        savedText = text
     }
 }
 
@@ -367,7 +490,7 @@ struct SalaryCard: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card()
+        .flatSection()
     }
 
     private var hint: LocalizedStringKey {
@@ -404,7 +527,7 @@ struct MerchantHistoryCard: View {
     let booking: Booking
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             // The heading opens the list of this merchant's bookings (#495).
             Button { model.focusMerchant(of: booking) } label: {
                 HStack(spacing: 4) {
@@ -440,7 +563,7 @@ struct MerchantHistoryCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card()
+        .flatSection()
     }
 
     private func statsRow(label: LocalizedStringKey?, accountName: String? = nil, _ s: MerchantStats) -> some View {
@@ -486,6 +609,8 @@ struct MerchantHistoryCard: View {
 /// "Regel für diesen Händler erstellen …".
 struct CategoryGridCard: View {
     @Environment(AppModel.self) private var model
+    /// Column minimums grow with the text, or larger text gets more, narrower tiles (UI-Audit INS-2).
+    @Environment(\.textScale) private var textScale
     let booking: Booking
     /// Opened categories from the top level down; nil = the booking's branch.
     @State private var openPath: [Int64]?
@@ -515,7 +640,7 @@ struct CategoryGridCard: View {
 
     var body: some View {
         let path = openPath ?? currentPath
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Kategorie").appFont(.subheadline, weight: .semibold)
                 Spacer()
@@ -526,9 +651,9 @@ struct CategoryGridCard: View {
                let category = model.categories.first(where: { $0.id == s.categoryId }) {
                 CategorySuggestionBox(booking: booking, suggestion: s, category: category)
             }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 6)], spacing: 6) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 104 * textScale), spacing: 6)], spacing: 6) {
                 ForEach(model.categoryTree) { node in
-                    CategoryChip(category: node.category, selected: node.id == path.first) {
+                    CategoryChip(category: node.category, selected: node.id == path.first, usesSystemSurface: true) {
                         pick(node, level: 0, in: path)
                     }
                 }
@@ -537,16 +662,16 @@ struct CategoryGridCard: View {
                 if let kids = model.categoryTree.node(id)?.children {
                     let selected = level + 1 < path.count ? path[level + 1] : booking.categoryId
                     Divider()
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), spacing: 6)], spacing: 6) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150 * textScale), spacing: 6)], spacing: 6) {
                         ForEach(kids) { kid in
-                            CategoryChip(category: kid.category, selected: kid.id == selected, filled: true) {
+                            CategoryChip(category: kid.category, selected: kid.id == selected, usesSystemSurface: true) {
                                 pick(kid, level: level + 1, in: path)
                             }
                         }
                     }
                 }
             }
-            Button { model.splitBooking = booking } label: {
+            Button { model.openSplit(booking) } label: {
                 Label("Umsatz aufteilen (Splitbuchung) …", systemImage: "arrow.triangle.branch").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered).controlSize(.large)
@@ -562,7 +687,7 @@ struct CategoryGridCard: View {
             Text("In der Liste: C kategorisieren · R Regel erstellen")
                 .appFont(.caption2).foregroundStyle(Theme.tertiary)
         }
-        .card()
+        .flatSection()
         .onChange(of: booking.id) { _, _ in openPath = nil }
     }
 }
@@ -594,7 +719,7 @@ struct CategorySuggestionBox: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.canvas))
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.systemSurface))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
             .strokeBorder(Theme.accent, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
     }
@@ -643,12 +768,14 @@ struct CategorySuggestionBox: View {
 struct CategoryChip: View {
     let category: GiroCrabCore.Category
     var selected: Bool
-    var filled = false
+    var usesSystemSurface = false
     /// Label override (e.g. the path below the top-level category); default: the name.
     var title: String?
     let action: () -> Void
 
     var body: some View {
+        let fill = usesSystemSurface ? Theme.systemSurface : Theme.card
+        let border = usesSystemSurface ? Theme.systemSeparator : Theme.border
         Button(action: action) {
             HStack(spacing: 5) {
                 Image(systemName: category.sfSymbol).appFont(.subheadline)
@@ -662,8 +789,8 @@ struct CategoryChip: View {
             // coloured text on an accent fill is unreadable with light accents (yellow).
             .foregroundStyle(Theme.text)
             .fontWeight(selected ? .semibold : nil)
-            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(selected ? Theme.selection : (filled ? Theme.canvas : Theme.card)))
-            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(selected ? Theme.accent : Theme.border, lineWidth: selected ? 1.5 : 1))
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(selected ? Theme.selection : fill))
+            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(selected ? Theme.accent : border, lineWidth: selected ? 1.5 : 1))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -735,7 +862,7 @@ struct RawDataCard: View {
                 .padding(.top, 8)
             }
         }
-        .card()
+        .flatSection()
     }
 
     /// `hides`: what the bug report screenshot covers (#301); raw data is personal.
@@ -753,17 +880,31 @@ struct RawDataCard: View {
 struct MultiSelectionCard: View {
     @Environment(AppModel.self) private var model
 
+    private static func code(_ b: Booking) -> String { b.currency.isEmpty ? "EUR" : b.currency.uppercased() }
+
     var body: some View {
         let many = model.selectedBookings
         let income = many.filter { $0.amountCents > 0 }.reduce(Int64(0)) { $0 + $1.amountCents }
         let expense = many.filter { $0.amountCents < 0 }.reduce(Int64(0)) { $0 + $1.amountCents }
-        VStack(alignment: .leading, spacing: 12) {
+        let currencies = Array(Set(many.map(Self.code))).sorted()
+        let currency = currencies.first ?? "EUR"
+        VStack(alignment: .leading, spacing: 8) {
             Label("\(many.count) Buchungen ausgewählt", systemImage: "checkmark.circle")
                 .appFont(.headline)
             VStack(alignment: .leading, spacing: 4) {
-                LabeledContent("Summe") { Text(Money.format(income + expense)).sensitive(.amounts) }
-                if income != 0 { LabeledContent("Einnahmen") { Text(Money.format(income)).sensitive(.amounts) } }
-                if expense != 0 { LabeledContent("Ausgaben") { Text(Money.format(expense)).sensitive(.amounts) } }
+                if currencies.count > 1 {
+                    // Never one number over several currencies (#569): one sum per currency.
+                    ForEach(currencies, id: \.self) { code in
+                        LabeledContent("Summe \(code)") {
+                            Text(Money.format(many.filter { Self.code($0) == code }.reduce(Int64(0)) { $0 + $1.amountCents }, currency: code))
+                                .sensitive(.amounts)
+                        }
+                    }
+                } else {
+                    LabeledContent("Summe") { Text(Money.format(income + expense, currency: currency)).sensitive(.amounts) }
+                    if income != 0 { LabeledContent("Einnahmen") { Text(Money.format(income, currency: currency)).sensitive(.amounts) } }
+                    if expense != 0 { LabeledContent("Ausgaben") { Text(Money.format(expense, currency: currency)).sensitive(.amounts) } }
+                }
             }
             .appFont(.callout, monospacedDigit: true)
             MultiSelectionTags(bookings: many)
@@ -791,6 +932,6 @@ struct MultiSelectionCard: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card()
+        .flatSection()
     }
 }

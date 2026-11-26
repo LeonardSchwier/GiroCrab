@@ -12,9 +12,19 @@ use crate::connectors::fints_directory::FinTsBankInfo;
 use crate::connectors::fints_presets::FinTsPreset;
 use crate::export::{ExportCsvBalanceLine, ExportCsvColumns, ExportCsvRow};
 use crate::mandates::MandateCsvImport;
-use crate::models::{ConnectorKind, Holding};
+use crate::models::{AccountKind, AccountKindSection, ConnectorKind, Holding};
 use crate::payment_input::{GiroCodeMatrix, PaymentDetails};
+use crate::planning::SplitDraft;
 use crate::{BankDescriptor, CoreError};
+
+#[uniffi::export(async_runtime = "tokio")]
+async fn check_bitcoin_core(
+    datadir: String,
+    rpc_url: String,
+    wallet: String,
+) -> Result<String, CoreError> {
+    crate::connectors::bitcoin_core::check_bitcoin_core(datadir, rpc_url, wallet).await
+}
 
 #[uniffi::export]
 fn core_version() -> String {
@@ -49,6 +59,11 @@ fn clear_banking_block() {
 #[uniffi::export]
 fn connector_kind_key(kind: ConnectorKind) -> String {
     crate::banking_gate::connector_kind_key(kind)
+}
+
+#[uniffi::export]
+fn account_kind_section(kind: AccountKind) -> AccountKindSection {
+    crate::connectors::account_kind_section(kind)
 }
 
 #[uniffi::export]
@@ -101,6 +116,11 @@ fn bic_for_iban(iban: String) -> Option<String> {
 }
 
 #[uniffi::export]
+fn bank_name_for_iban(iban: String) -> Option<String> {
+    crate::connectors::fints_directory::bank_name_for_iban(iban)
+}
+
+#[uniffi::export]
 fn validate_iban(iban: String) -> bool {
     crate::connectors::validate_iban(iban)
 }
@@ -149,6 +169,29 @@ fn inspect_rah10_keyfile(bytes: Vec<u8>, password: String) -> Result<Rah10Keyfil
 #[uniffi::export]
 fn portal_schema_dump(json_bodies: Vec<String>, dom_rows_json: String) -> String {
     crate::importers::portal_import::portal_schema_dump(json_bodies, dom_rows_json)
+}
+
+/// A part typed into the split sheet: an amount or a percentage of `total_cents` (#1663).
+#[uniffi::export]
+fn parse_split_part_to_cents(text: String, total_cents: i64) -> Result<i64, CoreError> {
+    crate::money::parse_split_part(&text, total_cents)
+}
+
+/// `numerator / denominator` of `total_cents`, rounded toward zero (#1663); `None` when it
+/// cannot be computed.
+#[uniffi::export]
+fn split_share_cents(total_cents: i64, numerator: i64, denominator: i64) -> Option<i64> {
+    crate::money::share_cents(total_cents, numerator, denominator)
+}
+
+#[uniffi::export]
+fn calculate_split_draft(booking_cents: i64, split_off_texts: Vec<String>) -> SplitDraft {
+    crate::planning::calculate_split_draft(booking_cents, &split_off_texts)
+}
+
+#[uniffi::export]
+fn split_amounts_match(booking_cents: i64, amounts: Vec<i64>) -> bool {
+    crate::planning::split_amounts_match(booking_cents, amounts)
 }
 
 #[uniffi::export]

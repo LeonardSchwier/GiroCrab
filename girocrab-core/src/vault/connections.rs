@@ -1,13 +1,22 @@
 //! Managing bank logins: edit, de-duplicate, optional stored PIN, session
 //! hand-over from the in-app browser login.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::connectors::trade_republic::normalize_phone;
 use crate::error::{CoreError, CoreResult};
 use crate::i18n::{tr, trf};
 use crate::models::ConnectorKind;
+use crate::secret::{SecretJson, SecretString, wipe};
 use crate::vault::Vault;
+
+/// Result of reapplying the bank's filing and matching rules to stored documents.
+#[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DocumentResortResult {
+    pub resorted: u32,
+    pub linked: u32,
+}
 
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -41,17 +50,15 @@ pub(crate) fn pin_key(connection_id: i64) -> String {
 /// Forgets stored sessions (cookies, PSD2 session) of a login; keeps FinTS
 /// system data.
 pub(crate) fn clear_session_inner(db: &Connection, connection_id: i64) -> CoreResult<()> {
-    let state: Option<String> = db
+    // Unlike `connection_state`, a deleted or missing connection is no error here.
+    let state: Option<SecretJson> = db
         .query_row(
             "SELECT state_json FROM bank_connections WHERE id = ?1",
             [connection_id],
             |r| r.get(0),
         )
         .optional()?;
-    let mut v: serde_json::Value = state
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::json!({}));
-    if let Some(o) = v.as_object_mut() {
+    update_state(db, connection_id, &state.unwrap_or_default(), |o| {
         for k in [
             "cookies",
             "session_token",
@@ -59,13 +66,57 @@ pub(crate) fn clear_session_inner(db: &Connection, connection_id: i64) -> CoreRe
             "valid_until",
             "saved_unix",
             "source",
+            "refresh_token",
         ] {
-            o.remove(k);
+            if let Some(mut old) = o.remove(k) {
+                wipe(&mut old);
+            }
         }
-    }
+    })
+}
+
+/// Stored connector state of a connection that is not deleted.
+fn connection_state(db: &Connection, connection_id: i64) -> CoreResult<SecretJson> {
+    db.query_row(
+        "SELECT state_json FROM bank_connections WHERE id = ?1 AND deleted_ms IS NULL",
+        [connection_id],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| CoreError::NotFound {
+        what: trf("Bankzugang {0}", &[&connection_id]),
+    })
+}
+
+/// Changes single keys of any connector's state and keeps the others. A state
+/// that is not a JSON object starts over empty. `edit` wipes what it removes.
+fn update_state(
+    db: &Connection,
+    connection_id: i64,
+    state: &SecretJson,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> CoreResult<()> {
+    let updated = state.with_value(|v| {
+        if !v.is_object() {
+            wipe(v);
+            *v = serde_json::json!({});
+        }
+        if let Some(o) = v.as_object_mut() {
+            edit(o);
+        }
+        SecretJson::encode(v)
+    })?;
+    store_state(db, connection_id, &updated)
+}
+
+pub(crate) fn store_state(
+    db: &Connection,
+    connection_id: i64,
+    state: &SecretJson,
+) -> CoreResult<()> {
     db.execute(
         "UPDATE bank_connections SET state_json = ?1 WHERE id = ?2",
-        params![v.to_string(), connection_id],
+        params![state, connection_id],
     )?;
     Ok(())
 }
@@ -113,22 +164,21 @@ fn merge_duplicate_account(conn: &Connection, keep: i64, dup: i64) -> CoreResult
                  ON k.account_id = ?1 AND k.external_id = o.external_id
               WHERE o.account_id = ?2",
         )?;
-        let r = st
-            .query_map(params![keep, dup], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        r
+
+        st.query_map(params![keep, dup], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
     };
     for (k, o, same_amount, cat, src, rule, checked, note, salary) in pairs {
         conn.execute(
@@ -148,12 +198,18 @@ fn merge_duplicate_account(conn: &Connection, keep: i64, dup: i64) -> CoreResult
             [k],
             |r| r.get(0),
         )?;
+        let source_had_splits: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM transaction_splits WHERE transaction_id = ?1)",
+            [o],
+            |r| r.get(0),
+        )?;
         if same_amount && !keep_has_splits {
             conn.execute(
                 "UPDATE transaction_splits SET transaction_id = ?1 WHERE transaction_id = ?2",
                 params![k, o],
             )?;
         }
+        crate::refunds::fold_booking(conn, o, k, same_amount, source_had_splits)?;
         // a loan link of `keep` wins (transaction_id is the key)
         conn.execute(
             "UPDATE OR IGNORE loan_links SET transaction_id = ?1 WHERE transaction_id = ?2",
@@ -238,10 +294,9 @@ fn deduplicate_inner(conn: &Connection) -> CoreResult<u32> {
     let rows: Vec<(i64, String, String)> = {
         let mut st =
             conn.prepare("SELECT id, connector, login_name FROM bank_connections WHERE deleted_ms IS NULL ORDER BY id")?;
-        let r = st
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        r
+
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?
     };
     let mut removed = 0u32;
     let mut keepers: Vec<(String, String, i64)> = Vec::new();
@@ -263,10 +318,9 @@ fn deduplicate_inner(conn: &Connection) -> CoreResult<u32> {
                 let mut st =
                     // includes soft-deleted rows
                     conn.prepare("SELECT id, external_ref FROM accounts WHERE connection_id = ?1")?;
-                let r = st
-                    .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                r
+
+                st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?
             };
             for (acc_id, ext) in accs {
                 let target: Option<i64> = conn
@@ -353,19 +407,17 @@ impl Vault {
         login_name: String,
     ) -> Result<(), CoreError> {
         let db = self.db()?;
-        let (kind, old_name): (String, String) = db
+        let (kind, old_name, old_login): (String, String, String) = db
             .query_row(
-                "SELECT connector, display_name FROM bank_connections WHERE id = ?1 AND deleted_ms IS NULL",
+                "SELECT connector, display_name, login_name FROM bank_connections WHERE id = ?1 AND deleted_ms IS NULL",
                 [connection_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?
             .ok_or_else(|| CoreError::NotFound {
                 what: trf("Bankzugang {0}", &[&connection_id]),
             })?;
-        let kind = ConnectorKind::from_str(&kind).ok_or_else(|| CoreError::InvalidInput {
-            message: kind.clone(),
-        })?;
+        let kind = ConnectorKind::from_str(&kind).ok_or_else(|| CoreError::invalid(kind))?;
         let login = normalize_login(kind, &login_name);
         let generic = crate::connectors::descriptor(kind).name;
         let name = if display_name.trim().is_empty() {
@@ -377,6 +429,11 @@ impl Vault {
             "UPDATE bank_connections SET display_name = ?1, login_name = ?2 WHERE id = ?3",
             params![name, login, connection_id],
         )?;
+        // A stored session (cookies, refresh token) belongs to the old login:
+        // keeping it would fetch that login's data under the new one.
+        if login != old_login {
+            clear_session_inner(&db, connection_id)?;
+        }
         // The sidebar shows `accounts.bank_name`: follow the rename where it
         // still carries the old or generic name (never a name the bank sent).
         db.execute(
@@ -406,32 +463,24 @@ impl Vault {
         connection_id: i64,
         cookies: String,
     ) -> Result<(), CoreError> {
-        if !cookies.contains('=') {
-            return Err(CoreError::InvalidInput {
-                message: tr("Keine Sitzungs-Cookies übergeben").into(),
-            });
+        let cookies = SecretString::new(cookies);
+        if !cookies.expose().contains('=') {
+            return Err(CoreError::invalid(tr("Keine Sitzungs-Cookies übergeben")));
         }
         let db = self.db()?;
-        let state: String = db
-            .query_row(
-                "SELECT state_json FROM bank_connections WHERE id = ?1 AND deleted_ms IS NULL",
-                [connection_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| CoreError::NotFound {
-                what: trf("Bankzugang {0}", &[&connection_id]),
-            })?;
-        let mut v: serde_json::Value =
-            serde_json::from_str(&state).unwrap_or(serde_json::json!({}));
-        v["cookies"] = serde_json::json!(cookies);
-        v["saved_unix"] = serde_json::json!(chrono::Utc::now().timestamp());
-        v["source"] = serde_json::json!("browser");
-        db.execute(
-            "UPDATE bank_connections SET state_json = ?1 WHERE id = ?2",
-            params![v.to_string(), connection_id],
-        )?;
-        Ok(())
+        let state = connection_state(&db, connection_id)?;
+        update_state(&db, connection_id, &state, |o| {
+            let saved_unix = jiff::Timestamp::now().as_second();
+            for (key, value) in [
+                ("cookies", cookies.expose().into()),
+                ("saved_unix", saved_unix.into()),
+                ("source", "browser".into()),
+            ] {
+                if let Some(mut old) = o.insert(key.into(), value) {
+                    wipe(&mut old);
+                }
+            }
+        })
     }
 
     /// Forgets stored sessions (cookies, PSD2 session); keeps FinTS system data.
@@ -440,32 +489,77 @@ impl Vault {
         clear_session_inner(&db, connection_id)
     }
 
+    /// Reapplies the connection's document rules without replacing booking links.
+    pub fn resort_portal_documents(
+        &self,
+        connection_id: i64,
+    ) -> Result<DocumentResortResult, CoreError> {
+        let db = self.db()?;
+        let tx = db.unchecked_transaction()?;
+        let key: Option<String> = tx
+            .query_row(
+                "SELECT connector FROM bank_connections WHERE id = ?1 AND deleted_ms IS NULL",
+                [connection_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let (resorted, linked) = match key {
+            Some(key) => crate::connectors::document_resort::resort(&tx, connection_id, &key)?,
+            None => (0, 0),
+        };
+        tx.commit()?;
+        Ok(DocumentResortResult { resorted, linked })
+    }
+
+    /// Clears the Trade Republic history cursors so the next sync starts from the beginning.
+    pub fn reset_trade_republic_history(&self, connection_id: i64) -> Result<(), CoreError> {
+        let db = self.db()?;
+        let connector: String = db.query_row(
+            "SELECT connector FROM bank_connections WHERE id = ?1 AND deleted_ms IS NULL",
+            [connection_id],
+            |r| r.get(0),
+        )?;
+        if connector != ConnectorKind::TradeRepublic.as_str() {
+            return Err(CoreError::invalid(tr("Kein Trade-Republic-Zugang.")));
+        }
+        let state = connection_state(&db, connection_id)?;
+        update_state(&db, connection_id, &state, |o| {
+            for key in [
+                "trade_history_v3_before",
+                "trade_history_v3_complete",
+                "trade_history_v3_retry",
+                "trade_retry_rows_v1",
+                "transaction_history_cursor_v1",
+                "doc_listing_cursor_v1",
+                // the Activity Log is listed to its end once more
+                "doc_listing_complete_v1",
+            ] {
+                if let Some(mut value) = o.remove(key) {
+                    wipe(&mut value);
+                }
+            }
+            o.insert("doc_listing_open_v1".into(), serde_json::json!(true));
+        })
+    }
+
     pub fn connection_status(&self, connection_id: i64) -> Result<ConnectionStatus, CoreError> {
         let db = self.db()?;
-        let state: String = db
-            .query_row(
-                "SELECT state_json FROM bank_connections WHERE id = ?1 AND deleted_ms IS NULL",
-                [connection_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| CoreError::NotFound {
-                what: trf("Bankzugang {0}", &[&connection_id]),
-            })?;
-        let v: serde_json::Value = serde_json::from_str(&state).unwrap_or(serde_json::json!({}));
+        let state = connection_state(&db, connection_id)?;
         let has_pin: bool = db.query_row(
             "SELECT count(*) FROM settings WHERE key = ?1 AND value != ''",
             [pin_key(connection_id)],
             |r| r.get::<_, i64>(0),
         )? > 0;
-        let has_session = v["cookies"]
-            .as_str()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-            || v["session_id"]
+        let (has_session, session_saved_unix, consent_valid_until) = state.with_value(|v| {
+            let filled = |key: &str| v[key].as_str().is_some_and(|s| !s.is_empty());
+            // A stored refresh token (Kontist) also lets a sync run without the password.
+            let has_session = filled("cookies") || filled("session_id") || filled("refresh_token");
+            let valid_until = v["valid_until"]
                 .as_str()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
+                .filter(|s| !s.is_empty() && has_session)
+                .map(str::to_string);
+            (has_session, v["saved_unix"].as_i64(), valid_until)
+        });
         let (accounts, bookings, revoked): (i64, i64, i64) = db.query_row(
             "SELECT (SELECT count(*) FROM accounts WHERE connection_id = ?1 AND deleted_ms IS NULL),
                     (SELECT count(*) FROM transactions t JOIN accounts a ON a.id = t.account_id
@@ -478,13 +572,10 @@ impl Vault {
             connection_id,
             has_pin,
             has_session,
-            session_saved_unix: v["saved_unix"].as_i64(),
+            session_saved_unix,
             account_count: accounts as u32,
             booking_count: bookings as u32,
-            consent_valid_until: v["valid_until"]
-                .as_str()
-                .filter(|s| !s.is_empty() && has_session)
-                .map(str::to_string),
+            consent_valid_until,
             revoked_account_count: revoked as u32,
         })
     }
@@ -501,7 +592,9 @@ impl Vault {
 
 /// comdirect bank code of a login: from the first comdirect IBAN among its
 /// accounts (characters 5–12), else the stored bank code. The account's code
-/// decides: comdirect's API logins all carry 20041111.
+/// comes first: comdirect's API logins all carry 20041111. Only a first
+/// guess – if comdirect rejects it for this login (9210), the FinTS connector
+/// tries its other codes and keeps the one that works.
 fn comdirect_blz(
     conn: &Connection,
     connection_id: i64,
@@ -526,6 +619,28 @@ fn comdirect_blz(
 /// taken over again (`<prefix><old reference>`); the sync ignores it (#537).
 pub(crate) const SWITCH_MARK: &str = "moneymoney-db:switch:";
 
+/// Repair for vaults switched before #1134 was fixed: the switch marked open
+/// card holds like bookings (`mm-switch-pending-hold-…`). They count as posted, no
+/// hold cleanup reaches them and the bank's real booking comes next to them.
+/// Drops them like a settled hold (category and note go with it); the
+/// tombstones keep their ids, so other devices drop them on merge. Transfer
+/// bookings of the app the switch had marked (`mm-switch-pending-<e2e>`) stay:
+/// the bank's booking takes them over by fingerprint, with category and note.
+/// Returns how many were dropped.
+pub(crate) fn drop_switched_holds(conn: &Connection) -> CoreResult<usize> {
+    let ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM transactions
+              WHERE external_id LIKE 'mm-switch-pending-hold-%' AND deleted_ms IS NULL",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for &id in &ids {
+        crate::sync_merge::soft_delete_booking(conn, id)?;
+    }
+    Ok(ids.len())
+}
+
 #[uniffi::export]
 impl Vault {
     /// Switches a comdirect login between comdirect's own API and FinTS
@@ -534,6 +649,7 @@ impl Vault {
     /// and live bookings are marked so the next fetch takes them over by
     /// IBAN and by booking (amount, date ±2 days, counterparty) instead of
     /// adding them a second time – the same path as after a database import.
+    /// Open card holds are dropped: the new way reports them again (#1134).
     /// Returns the new connector key.
     pub fn switch_comdirect_access(&self, connection_id: i64) -> Result<String, CoreError> {
         let db = self.db()?;
@@ -555,15 +671,13 @@ impl Vault {
             .as_deref()
             .is_some_and(|b| crate::connectors::fints_directory::COMDIRECT_BLZ.contains(&b));
         if !from_api && !is_comdirect_fints {
-            return Err(CoreError::InvalidInput {
-                message: tr("Nur comdirect-Zugänge lassen sich zwischen FinTS und der comdirect-Schnittstelle umstellen.").into(),
-            });
+            return Err(CoreError::invalid(tr(
+                "Nur comdirect-Zugänge lassen sich zwischen FinTS und der comdirect-Schnittstelle umstellen.",
+            )));
         }
         let (kind, new_key, new_code) = if from_api {
             let blz = comdirect_blz(&tx, connection_id, &bank_code)?.ok_or_else(|| {
-                CoreError::InvalidInput {
-                    message: tr("Keine comdirect-IBAN gefunden: Die Bankleitzahl für FinTS lässt sich nicht bestimmen.").into(),
-                }
+                CoreError::invalid(tr("Keine comdirect-IBAN gefunden: Die Bankleitzahl für FinTS lässt sich nicht bestimmen."))
             })?;
             (
                 ConnectorKind::FinTsGeneric,
@@ -589,10 +703,9 @@ impl Vault {
             |r| r.get(0),
         )?;
         if clash {
-            return Err(CoreError::InvalidInput {
-                message: tr("Für diesen Anmeldenamen gibt es den Zugang auf diesem Weg schon.")
-                    .into(),
-            });
+            return Err(CoreError::invalid(tr(
+                "Für diesen Anmeldenamen gibt es den Zugang auf diesem Weg schon.",
+            )));
         }
         let symbol = crate::connectors::descriptor(kind).sf_symbol;
         tx.execute(
@@ -680,6 +793,7 @@ impl Vault {
                       WHERE transactions.id = ?1",
                     params![live, stale],
                 )?;
+                crate::refunds::move_booking(&tx, stale, live)?;
             }
             tx.execute(
                 "UPDATE transactions SET external_id = 'switch-stale-' || id || ':' || substr(external_id, 11)
@@ -690,28 +804,49 @@ impl Vault {
                 crate::sync_merge::soft_delete_booking(&tx, stale)?;
             }
         }
+        // Open card holds (#1134): the new way reports the ones still open on
+        // its first fetch. Marked like bookings they would count as posted and
+        // stay for good, as no hold cleanup looks at `mm-*`. Their id is freed
+        // first: switching back brings the same hold id again, and a deleted id
+        // stays deleted in `store_fetch`.
+        let holds: Vec<i64> = tx
+            .prepare(
+                "SELECT t.id FROM transactions t JOIN accounts a ON a.id = t.account_id
+                  WHERE a.connection_id = ?1 AND t.deleted_ms IS NULL AND t.external_id LIKE 'pending-hold-%'",
+            )?
+            .query_map([connection_id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in holds {
+            tx.execute(
+                "UPDATE transactions SET external_id = 'switch-stale-' || id || ':' || external_id
+                  WHERE id = ?1",
+                [id],
+            )?;
+            crate::sync_merge::soft_delete_booking(&tx, id)?;
+        }
         // Live bookings: re-adoptable like imported ones (`mm-*`, with a
         // fingerprint). Tombstones keep their ids for multi-device merges.
+        // Optimistic transfer bookings (`pending-<e2e>`) stay as they are:
+        // they go when the bank's booking arrives, whichever way fetches it.
         let rows: Vec<(i64, String, i64, String, String, String)> = {
             let mut st = tx.prepare(
                 "SELECT t.id, t.booking_date, t.amount_cents, t.counterparty_iban, t.counterparty, t.purpose
                    FROM transactions t JOIN accounts a ON a.id = t.account_id
                   WHERE a.connection_id = ?1 AND t.deleted_ms IS NULL AND t.external_id NOT LIKE 'mm-%'
-                    AND t.external_id NOT LIKE 'switch-stale-%'",
+                    AND t.external_id NOT LIKE 'switch-stale-%' AND t.external_id NOT LIKE 'pending-%'",
             )?;
-            let r = st
-                .query_map([connection_id], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                })?
-                .collect::<Result<_, _>>()?;
-            r
+
+            st.query_map([connection_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?
         };
         for (id, date, cents, iban, name, purpose) in rows {
             let fp = crate::importers::moneymoney_import::fingerprint(
@@ -733,6 +868,313 @@ impl Vault {
 mod tests {
     use super::*;
     use crate::models::BookingFilter;
+
+    #[test]
+    fn duplicate_account_fold_preserves_refund_parts_only_for_matching_amounts() {
+        for (same_amount, whole) in [(true, false), (false, false), (true, true), (false, true)] {
+            let dir = crate::test_support::TempDir::new("refund-duplicate-account");
+            let v = Vault::open(dir.join("v.db").to_string_lossy().into(), vec![6; 32]).unwrap();
+            let keep = v
+                .create_offline_account(
+                    "Keep".into(),
+                    crate::models::AccountKind::Cash,
+                    "EUR".into(),
+                    0,
+                )
+                .unwrap();
+            let dup = v
+                .create_offline_account(
+                    "Duplicate".into(),
+                    crate::models::AccountKind::Cash,
+                    "EUR".into(),
+                    0,
+                )
+                .unwrap();
+            let add = |acc, amount| {
+                v.save_manual_booking(
+                    acc,
+                    None,
+                    crate::offline::ManualBookingSetup {
+                        booking_date: "2026-01-01".into(),
+                        amount_cents: amount,
+                        counterparty: String::new(),
+                        purpose: String::new(),
+                        category_id: None,
+                        note: String::new(),
+                    },
+                )
+                .unwrap()
+            };
+            let k = add(keep, if same_amount { -100 } else { -200 });
+            let o = add(dup, -100);
+            let r = add(keep, 60);
+            {
+                let db = v.db().unwrap();
+                db.execute(
+                    "UPDATE transactions SET external_id='original' WHERE id IN (?1,?2)",
+                    params![k, o],
+                )
+                .unwrap();
+            }
+            if whole {
+                v.link_refund(r, String::new(), o, String::new()).unwrap();
+            }
+            v.set_transaction_splits(
+                o,
+                (if whole {
+                    vec![-100, 20, -20]
+                } else {
+                    vec![-60, -40]
+                })
+                .into_iter()
+                .map(|amount| crate::models::TransactionSplitInput {
+                    uuid: None,
+                    category_id: None,
+                    amount_cents: amount,
+                    note: String::new(),
+                })
+                .collect(),
+            )
+            .unwrap();
+            let uuid = v.list_transaction_splits(o).unwrap()[0].uuid.clone();
+            if !whole {
+                v.link_refund(r, String::new(), o, uuid.clone()).unwrap();
+            }
+            {
+                let db = v.db().unwrap();
+                let tx = db.unchecked_transaction().unwrap();
+                merge_duplicate_account(&tx, keep, dup).unwrap();
+                tx.execute("DELETE FROM accounts WHERE id=?1", [dup])
+                    .unwrap();
+                tx.commit().unwrap();
+            }
+            let links = v.refund_links(r).unwrap();
+            if same_amount {
+                assert_eq!(links[0].original_id, k);
+                assert_eq!(
+                    links[0].original_part,
+                    if whole { String::new() } else { uuid }
+                );
+                assert_eq!(links[0].allocated_cents, if whole { 0 } else { 60 });
+            } else {
+                assert!(links.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_account_fold_keeps_unlink_and_provenance_on_unaffected_endpoints() {
+        let dir = crate::test_support::TempDir::new("refund-duplicate-provenance");
+        let v = Vault::open(dir.join("v.db").to_string_lossy().into(), vec![6; 32]).unwrap();
+        let keep = v
+            .create_offline_account(
+                "Keep".into(),
+                crate::models::AccountKind::Cash,
+                "EUR".into(),
+                0,
+            )
+            .unwrap();
+        let dup = v
+            .create_offline_account(
+                "Duplicate".into(),
+                crate::models::AccountKind::Cash,
+                "EUR".into(),
+                0,
+            )
+            .unwrap();
+        let add = |account, cents| {
+            v.save_manual_booking(
+                account,
+                None,
+                crate::offline::ManualBookingSetup {
+                    booking_date: "2026-01-01".into(),
+                    amount_cents: cents,
+                    counterparty: String::new(),
+                    purpose: String::new(),
+                    category_id: None,
+                    note: String::new(),
+                },
+            )
+            .unwrap()
+        };
+        let canonical = add(keep, -100);
+        let source = add(dup, -100);
+        let target = add(keep, -100);
+        let refund = add(keep, 100);
+        v.db()
+            .unwrap()
+            .execute(
+                "UPDATE transactions SET external_id='original' WHERE id IN (?1,?2)",
+                params![canonical, source],
+            )
+            .unwrap();
+        v.link_refund(refund, String::new(), source, String::new())
+            .unwrap();
+        crate::importers::portal_import::hand_over(&v.db().unwrap(), source, target).unwrap();
+        let token: i64 = v
+            .db()
+            .unwrap()
+            .query_row("SELECT MAX(changed_ms)+1000 FROM refund_links", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        {
+            let db = v.db().unwrap();
+            db.execute(
+                "UPDATE refund_links SET moved=0,changed_ms=?2,deleted_ms=?2,unlink_id='peer-unlink' WHERE original_id=?1",
+                params![source, token],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE transactions SET deleted_ms=?2 WHERE id=?1",
+                params![canonical, token],
+            )
+            .unwrap();
+            let tx = db.unchecked_transaction().unwrap();
+            merge_duplicate_account(&tx, keep, dup).unwrap();
+            tx.execute("DELETE FROM accounts WHERE id=?1", [dup])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(v.refund_links(refund).unwrap()[0].inactive);
+        let mapped:i64=v.db().unwrap().query_row("SELECT moved_from_original_id FROM refund_links WHERE original_id=?1 AND deleted_ms IS NULL",[target],|r|r.get(0)).unwrap();
+        assert_eq!(mapped, canonical);
+        v.restore_refund(
+            refund,
+            String::new(),
+            canonical,
+            String::new(),
+            "peer-unlink".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.refund_links(refund)
+                .unwrap()
+                .iter()
+                .map(|l| l.allocated_cents)
+                .sum::<i64>(),
+            100
+        );
+    }
+
+    #[test]
+    fn session_hand_over_and_clear_keep_the_other_state() {
+        let dir = crate::test_support::TempDir::new("girocrab-session");
+        let path = dir.join("v.db");
+        let v = Vault::open(path.to_string_lossy().to_string(), vec![6u8; 32]).unwrap();
+        let c = v
+            .add_bank_connection(ConnectorKind::TradeRepublic, String::new(), "+49170".into())
+            .unwrap();
+        let stored = |v: &Vault| -> serde_json::Value {
+            let db = v.db().unwrap();
+            connection_state(&db, c).unwrap().decode().unwrap()
+        };
+        v.db()
+            .unwrap()
+            .execute(
+                "UPDATE bank_connections SET state_json = '{\"doc_items\":[\"a\"]}' WHERE id = ?1",
+                [c],
+            )
+            .unwrap();
+        assert!(v.set_connection_session(c, "no-cookie".into()).is_err());
+
+        v.set_connection_session(c, "tr_session=s".into()).unwrap();
+        let status = v.connection_status(c).unwrap();
+        assert!(status.has_session && status.session_saved_unix.is_some());
+        let state = stored(&v);
+        assert_eq!(
+            (state["cookies"].as_str(), state["source"].as_str()),
+            (Some("tr_session=s"), Some("browser"))
+        );
+        assert_eq!(state["doc_items"], serde_json::json!(["a"]));
+
+        v.clear_connection_session(c).unwrap();
+        assert!(!v.connection_status(c).unwrap().has_session);
+        assert_eq!(stored(&v), serde_json::json!({"doc_items": ["a"]}));
+    }
+
+    #[test]
+    fn restarting_trade_republic_history_preserves_docs_and_session() {
+        let dir = crate::test_support::TempDir::new("girocrab-tr-reset-state");
+        let v = Vault::open(
+            dir.join("v.db").to_string_lossy().to_string(),
+            vec![5u8; 32],
+        )
+        .unwrap();
+        let c = v
+            .add_bank_connection(ConnectorKind::TradeRepublic, String::new(), "login".into())
+            .unwrap();
+        let original = SecretJson::from(serde_json::json!({
+            "cookies": "tr_session=test",
+            "doc_items": ["already-downloaded"],
+            "trade_history_v3_complete": true,
+            "transaction_history_cursor_v1": "next-page",
+            "doc_listing_complete_v1": true
+        }));
+        store_state(&v.db().unwrap(), c, &original).unwrap();
+
+        v.reset_trade_republic_history(c).unwrap();
+
+        let state = connection_state(&v.db().unwrap(), c).unwrap();
+        state.with_value(|state| {
+            assert_eq!(state["cookies"], "tr_session=test");
+            assert_eq!(
+                state["doc_items"],
+                serde_json::json!(["already-downloaded"])
+            );
+            assert!(state["trade_history_v3_complete"].is_null());
+            assert!(state["transaction_history_cursor_v1"].is_null());
+            assert!(state["doc_listing_complete_v1"].is_null());
+            assert_eq!(state["doc_listing_open_v1"], true);
+        });
+    }
+
+    #[test]
+    fn a_stored_refresh_token_counts_as_session() {
+        let dir = crate::test_support::TempDir::new("girocrab-refresh-session");
+        let path = dir.join("v.db");
+        let v = Vault::open(path.to_string_lossy().to_string(), vec![6u8; 32]).unwrap();
+        let c = v
+            .add_bank_connection(ConnectorKind::Kontist, String::new(), "a@b.de".into())
+            .unwrap();
+        assert!(!v.connection_status(c).unwrap().has_session);
+        v.db()
+            .unwrap()
+            .execute(
+                "UPDATE bank_connections SET state_json = '{\"refresh_token\":\"r\"}' WHERE id = ?1",
+                [c],
+            )
+            .unwrap();
+        assert!(v.connection_status(c).unwrap().has_session);
+        v.clear_connection_session(c).unwrap();
+        assert!(!v.connection_status(c).unwrap().has_session);
+    }
+
+    #[test]
+    fn a_new_login_drops_the_stored_session_a_rename_keeps_it() {
+        let dir = crate::test_support::TempDir::new("girocrab-login-change");
+        let path = dir.join("v.db");
+        let v = Vault::open(path.to_string_lossy().to_string(), vec![6u8; 32]).unwrap();
+        let c = v
+            .add_bank_connection(ConnectorKind::Kontist, String::new(), "a@b.de".into())
+            .unwrap();
+        let store = |v: &Vault| {
+            v.db()
+                .unwrap()
+                .execute(
+                    "UPDATE bank_connections SET state_json = '{\"refresh_token\":\"r\"}' WHERE id = ?1",
+                    [c],
+                )
+                .unwrap();
+        };
+        store(&v);
+        v.update_bank_connection(c, "Firma".into(), "a@b.de".into())
+            .unwrap();
+        assert!(v.connection_status(c).unwrap().has_session);
+        v.update_bank_connection(c, "Firma".into(), "x@y.de".into())
+            .unwrap();
+        assert!(!v.connection_status(c).unwrap().has_session);
+    }
 
     /// Direct debit, standing order and planned data hang on the duplicate
     /// account: merging must neither fail on the foreign keys nor lose them.
@@ -907,24 +1349,28 @@ mod tests {
                 c,
                 "DE10200411550123456789",
                 "DE10200411550123456789",
+                "",
                 "EUR",
                 crate::models::AccountKind::Checking,
+                &[],
             )
             .unwrap();
             assert_eq!(adopted, Some(acc));
             // … and the booking, although FinTS sends another id and text
-            assert!(crate::importers::moneymoney_import::adopt_import(
-                &db,
-                acc,
-                "fints-77",
-                "2026-11-04",
-                -8600,
-                "",
-                "VATTENFALL EUROPE SALES GMBH",
-                "EREF+123 Abschlag Strom",
-                "LASTSCHRIFT",
-            )
-            .unwrap());
+            assert!(
+                crate::importers::moneymoney_import::adopt_import(
+                    &db,
+                    acc,
+                    "fints-77",
+                    "2026-11-04",
+                    -8600,
+                    "",
+                    "VATTENFALL EUROPE SALES GMBH",
+                    "EREF+123 Abschlag Strom",
+                    "LASTSCHRIFT",
+                )
+                .unwrap()
+            );
             let (ext, note, source): (String, String, String) = db
                 .query_row(
                     "SELECT external_id, note, category_source FROM transactions WHERE id = ?1",
@@ -1132,11 +1578,7 @@ mod tests {
                 db.execute("INSERT INTO accounts(connection_id, group_id, external_ref, name, kind) VALUES (?1, ?2, ?3, 'Darlehen', 'loan')", params![conn, g, n]).unwrap();
                 let id = db.last_insert_rowid();
                 db.execute("INSERT INTO transactions(account_id, external_id, booking_date, amount_cents) VALUES (?1, 'x', '2026-11-01', ?2)", params![id, sub]).unwrap();
-                if sub == 1 {
-                    a1 = id
-                } else {
-                    a2 = id
-                }
+                if sub == 1 { a1 = id } else { a2 = id }
             }
         }
         // same external_id in two accounts must not collide
@@ -1199,8 +1641,7 @@ mod tests {
 
     #[test]
     fn deduplicate_leaves_soft_deleted_twin_alone() {
-        let p =
-            std::env::temp_dir().join(format!("girocrab-dedup-del-{}.db", uuid::Uuid::new_v4()));
+        let p = crate::test_support::thread_temp_path("dedup-del.db");
         let v = Vault::open(p.to_string_lossy().to_string(), vec![4u8; 32]).unwrap();
         {
             let db = v.db().unwrap();
@@ -1225,7 +1666,9 @@ mod tests {
             1
         );
         assert_eq!(
-            q("SELECT count(*) FROM accounts a JOIN bank_connections c ON c.id = a.connection_id WHERE c.deleted_ms IS NULL AND a.deleted_ms IS NULL"),
+            q(
+                "SELECT count(*) FROM accounts a JOIN bank_connections c ON c.id = a.connection_id WHERE c.deleted_ms IS NULL AND a.deleted_ms IS NULL"
+            ),
             1
         );
         let _ = std::fs::remove_file(p);
@@ -1297,8 +1740,10 @@ mod tests {
             c,
             "dep-1",
             "",
+            "",
             "EUR",
             crate::models::AccountKind::Brokerage,
+            &[],
         )
         .unwrap();
         assert_eq!(adopted, Some(depot));
@@ -1332,23 +1777,27 @@ mod tests {
                 c,
                 iban,
                 iban,
+                "",
                 "EUR",
                 crate::models::AccountKind::Checking,
+                &[],
             )
             .unwrap();
             assert_eq!(adopted, Some(giro));
-            assert!(crate::importers::moneymoney_import::adopt_import(
-                &db,
-                giro,
-                "fints-77",
-                "2026-11-03",
-                -8600,
-                "",
-                "VATTENFALL",
-                "Abschlag",
-                "LASTSCHRIFT",
-            )
-            .unwrap());
+            assert!(
+                crate::importers::moneymoney_import::adopt_import(
+                    &db,
+                    giro,
+                    "fints-77",
+                    "2026-11-03",
+                    -8600,
+                    "",
+                    "VATTENFALL",
+                    "Abschlag",
+                    "LASTSCHRIFT",
+                )
+                .unwrap()
+            );
             let ext: String = db
                 .query_row(
                     "SELECT external_id FROM transactions WHERE id = ?1",
@@ -1409,8 +1858,17 @@ mod tests {
             let db = a.db().unwrap();
             let iban = "DE10200411550123456789";
             let take = |ext: &str, iban: &str, kind| {
-                crate::importers::moneymoney_db::adopt_account(&db, c, ext, iban, "EUR", kind)
-                    .unwrap()
+                crate::importers::moneymoney_db::adopt_account(
+                    &db,
+                    c,
+                    ext,
+                    iban,
+                    "",
+                    "EUR",
+                    kind,
+                    &[],
+                )
+                .unwrap()
             };
             assert_eq!(
                 take("A1B2C3", iban, crate::models::AccountKind::Checking),
@@ -1420,18 +1878,20 @@ mod tests {
                 take("dep-1", "", crate::models::AccountKind::Brokerage),
                 Some(depot)
             );
-            assert!(crate::importers::moneymoney_import::adopt_import(
-                &db,
-                giro,
-                "rest-1",
-                "2026-11-03",
-                -8600,
-                "",
-                "Vattenfall",
-                "Abschlag",
-                "",
-            )
-            .unwrap());
+            assert!(
+                crate::importers::moneymoney_import::adopt_import(
+                    &db,
+                    giro,
+                    "rest-1",
+                    "2026-11-03",
+                    -8600,
+                    "",
+                    "Vattenfall",
+                    "Abschlag",
+                    "",
+                )
+                .unwrap()
+            );
             let ext: String = db
                 .query_row(
                     "SELECT external_id FROM transactions WHERE id = ?1",
@@ -1535,11 +1995,110 @@ mod tests {
             c,
             "dep-1",
             "",
+            "",
             "EUR",
             crate::models::AccountKind::Brokerage,
+            &[],
         )
         .unwrap();
         assert_eq!(adopted, Some(depot));
+    }
+
+    /// The other way reports the depot under another reference (FinTS:
+    /// `<number>-Depot`, REST: its depot id) and without IBAN; a deleted
+    /// leftover of its kind on the login must not stop the takeover.
+    #[test]
+    fn the_other_way_takes_over_the_marked_depot_under_a_new_reference() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-new-ref");
+        let (v, c, _, depot, _) = comdirect_vault(dir.path(), "v.db");
+        v.switch_comdirect_access(c).unwrap();
+        let db = v.db().unwrap();
+        let adopted = crate::importers::moneymoney_db::adopt_account(
+            &db,
+            c,
+            "123456700-Depot",
+            "",
+            "",
+            "EUR",
+            crate::models::AccountKind::Brokerage,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(adopted, Some(depot));
+        // the takeover replaced the marker: a second depot of the same fetch
+        // does not land in the same account
+        let external_ref: String = db
+            .query_row(
+                "SELECT external_ref FROM accounts WHERE id = ?1",
+                [depot],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(external_ref, "123456700-Depot");
+        let second = crate::importers::moneymoney_db::adopt_account(
+            &db,
+            c,
+            "987654300-Depot",
+            "",
+            "",
+            "EUR",
+            crate::models::AccountKind::Brokerage,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(second, Some(depot));
+    }
+
+    /// Two marked depots on the login: which one is which is unknown, so
+    /// neither is taken over.
+    #[test]
+    fn two_marked_depots_are_not_guessed() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-two-depots");
+        let (v, c, _, _, _) = comdirect_vault(dir.path(), "v.db");
+        add_account(&v, c, "dep-2", "brokerage", false);
+        v.switch_comdirect_access(c).unwrap();
+        let db = v.db().unwrap();
+        let adopted = crate::importers::moneymoney_db::adopt_account(
+            &db,
+            c,
+            "123456700-Depot",
+            "",
+            "",
+            "EUR",
+            crate::models::AccountKind::Brokerage,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(adopted, None);
+    }
+
+    /// The switch marks archived accounts too; a closed depot must not take
+    /// over the reference of a new one.
+    #[test]
+    fn an_archived_marked_depot_is_not_taken_over() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-archived");
+        let (v, c, _, depot, _) = comdirect_vault(dir.path(), "v.db");
+        v.db()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET archived_unix = 1 WHERE id = ?1",
+                [depot],
+            )
+            .unwrap();
+        v.switch_comdirect_access(c).unwrap();
+        let db = v.db().unwrap();
+        let adopted = crate::importers::moneymoney_db::adopt_account(
+            &db,
+            c,
+            "123456700-Depot",
+            "",
+            "",
+            "EUR",
+            crate::models::AccountKind::Brokerage,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(adopted, Some(depot));
     }
 
     /// A marked twin that still has bookings is not thrown away: its key is
@@ -1613,5 +2172,502 @@ mod tests {
             !stale_id.starts_with("mm-"),
             "no takeover candidate any more: {stale_id}"
         );
+    }
+
+    #[test]
+    fn connection_switch_retargets_only_unique_signed_survivor_parts() {
+        for amounts in [
+            vec![-6000, -2600],
+            vec![-3400, -2600, -2600],
+            vec![-4300, -4300],
+            vec![2600, -11200],
+        ] {
+            let dir = crate::test_support::TempDir::new("refund-switch-survivor");
+            let (v, c, giro, _, live) = comdirect_vault(dir.path(), "v.db");
+            let (stale, refund) = {
+                let db = v.db().unwrap();
+                db.execute(
+                    "INSERT INTO transactions(account_id,external_id,booking_date,amount_cents)
+                    VALUES (?1,'mm-switch-rest-1','2026-11-03',-8600)",
+                    [giro],
+                )
+                .unwrap();
+                let stale = db.last_insert_rowid();
+                db.execute(
+                    "INSERT INTO transactions(account_id,external_id,booking_date,amount_cents)
+                    VALUES (?1,'refund','2026-11-03',2600)",
+                    [giro],
+                )
+                .unwrap();
+                (stale, db.last_insert_rowid())
+            };
+            let parts = |amounts: &[i64]| {
+                amounts
+                    .iter()
+                    .map(|amount| crate::models::TransactionSplitInput {
+                        uuid: None,
+                        amount_cents: *amount,
+                        category_id: None,
+                        note: String::new(),
+                    })
+                    .collect()
+            };
+            v.set_transaction_splits(stale, parts(&[-6000, -2600]))
+                .unwrap();
+            v.set_transaction_splits(live, parts(&amounts)).unwrap();
+            let old = v.list_transaction_splits(stale).unwrap()[1].uuid.clone();
+            let matches = v
+                .list_transaction_splits(live)
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.amount_cents == -2600)
+                .collect::<Vec<_>>();
+            let expected = (matches.len() == 1).then(|| matches[0].uuid.clone());
+            v.link_refund(refund, String::new(), stale, old.clone())
+                .unwrap();
+            assert_eq!(v.switch_comdirect_access(c).unwrap(), "fints:20041155");
+            let links = v.refund_links(refund).unwrap();
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].original_id, live);
+            assert_eq!(
+                links[0].original_part,
+                expected.as_ref().unwrap_or(&old).clone()
+            );
+            assert_eq!(
+                links[0].allocated_cents,
+                if expected.is_some() { 2600 } else { 0 }
+            );
+            assert_eq!(links[0].inactive, expected.is_none());
+        }
+    }
+
+    // ---------------------------------------------------------------- card holds (#1134)
+
+    /// A card payment of 25,00 € the bank reports as hold `id` (no counterparty,
+    /// short text) or, with a `camt:` id, as the posted booking.
+    fn card(id: &str, date: &str, purpose: &str) -> crate::connectors::RemoteTransaction {
+        crate::connectors::RemoteTransaction {
+            account_ref: "A1B2C3".into(),
+            external_id: id.into(),
+            booking_date: date.into(),
+            amount_cents: -2500,
+            currency: "EUR".into(),
+            purpose: purpose.into(),
+            ..Default::default()
+        }
+    }
+
+    /// One fetch of the giro account over `kind`, with the complete hold list
+    /// of that way (`hold_prefix`).
+    fn fetch_giro(
+        v: &Vault,
+        kind: ConnectorKind,
+        c: i64,
+        transactions: Vec<crate::connectors::RemoteTransaction>,
+    ) {
+        let hold_prefix = if kind == ConnectorKind::Comdirect {
+            "pending-hold-comdirect-"
+        } else {
+            "pending-hold-fints-"
+        };
+        crate::connectors::store_fetch(
+            v,
+            kind,
+            c,
+            crate::connectors::FetchResult {
+                accounts: vec![crate::connectors::RemoteAccount {
+                    external_ref: "A1B2C3".into(),
+                    name: "Girokonto".into(),
+                    owner: String::new(),
+                    iban: "DE10200411550123456789".into(),
+                    account_number: String::new(),
+                    currency: "EUR".into(),
+                    kind: crate::models::AccountKind::Checking,
+                    balance_cents: 0,
+                    balance_date: "2026-11-20".into(),
+                }],
+                transactions,
+                hold_prefix: Some(hold_prefix.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// Live bookings of the account: (external id, booking date, purpose).
+    fn live_rows(v: &Vault, account: i64) -> Vec<(String, String, String)> {
+        let db = v.db().unwrap();
+        let mut st = db
+            .prepare(
+                "SELECT external_id, booking_date, purpose FROM transactions
+                  WHERE account_id = ?1 AND deleted_ms IS NULL ORDER BY id",
+            )
+            .unwrap();
+        st.query_map([account], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    const HOLD_TEXT: &str = "SHOP, Berlin";
+
+    /// The reported case: switching while a card payment is a hold left it as
+    /// a posted booking (`mm-switch-pending-…`) next to the hold the new way
+    /// reports, one more per switch. Now the hold is dropped on the switch,
+    /// and switching back and forth with the same hold open keeps exactly one.
+    #[test]
+    fn switching_with_an_open_hold_keeps_exactly_one_hold() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-hold");
+        let (v, c, giro, _, _) = comdirect_vault(dir.path(), "v.db");
+        let rest_hold = card("pending-hold-comdirect-h1", "2026-11-19", HOLD_TEXT);
+        let fints_hold = card("pending-hold-fints-h1", "2026-11-18", HOLD_TEXT);
+        // an optimistic transfer booking of the app itself
+        {
+            let db = v.db().unwrap();
+            db.execute(
+                "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, purpose)
+                 VALUES (?1, 'pending-e2e-1', '2026-11-19', -5000, 'Miete')",
+                [giro],
+            )
+            .unwrap();
+        }
+        fetch_giro(&v, ConnectorKind::Comdirect, c, vec![rest_hold.clone()]);
+        let holds = |v: &Vault| -> Vec<String> {
+            live_rows(v, giro)
+                .into_iter()
+                .map(|r| r.0)
+                .filter(|e| e.contains("pending-hold-"))
+                .collect()
+        };
+        assert_eq!(holds(&v), vec!["pending-hold-comdirect-h1"]);
+
+        for round in 0..2 {
+            assert_eq!(v.switch_comdirect_access(c).unwrap(), "fints:20041155");
+            assert!(
+                holds(&v).is_empty(),
+                "round {round}: hold dropped on the switch"
+            );
+            fetch_giro(&v, ConnectorKind::FinTsGeneric, c, vec![fints_hold.clone()]);
+            assert_eq!(
+                holds(&v),
+                vec!["pending-hold-fints-h1"],
+                "round {round}: FinTS"
+            );
+
+            assert_eq!(v.switch_comdirect_access(c).unwrap(), "comdirect");
+            assert!(
+                holds(&v).is_empty(),
+                "round {round}: hold dropped on the way back"
+            );
+            // the same hold id as before the first switch is stored again
+            fetch_giro(&v, ConnectorKind::Comdirect, c, vec![rest_hold.clone()]);
+            assert_eq!(
+                holds(&v),
+                vec!["pending-hold-comdirect-h1"],
+                "round {round}: API"
+            );
+        }
+        // the app's own transfer booking was neither marked nor dropped
+        assert!(live_rows(&v, giro).iter().any(|r| r.0 == "pending-e2e-1"));
+        // the dropped holds went as tombstones (other devices drop them too)
+        let db = v.db().unwrap();
+        let tombstones: i64 = db
+            .query_row(
+                "SELECT count(*) FROM transactions
+                  WHERE external_id LIKE 'switch-stale-%pending-hold-%' AND deleted_ms IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstones, 4);
+    }
+
+    /// Device B: a copy of A's vault.
+    fn second_device(dir: &std::path::Path, a: &Vault) -> std::sync::Arc<Vault> {
+        let b_path = dir.join("b.db").to_string_lossy().to_string();
+        a.write_snapshot(b_path.clone()).unwrap();
+        Vault::open(b_path, vec![9u8; 32]).unwrap()
+    }
+
+    /// One iCloud round: A's snapshot into B, then B's into A.
+    fn sync_both(dir: &std::path::Path, a: &Vault, b: &Vault, step: &str) {
+        let a_snap = dir
+            .join(format!("a-{step}.db"))
+            .to_string_lossy()
+            .to_string();
+        a.write_snapshot(a_snap.clone()).unwrap();
+        b.merge_other_vault(a_snap, vec![9u8; 32]).unwrap();
+        let b_snap = dir
+            .join(format!("b-{step}.db"))
+            .to_string_lossy()
+            .to_string();
+        b.write_snapshot(b_snap.clone()).unwrap();
+        a.merge_other_vault(b_snap, vec![9u8; 32]).unwrap();
+    }
+
+    /// Rows with external id `ext`, live or deleted.
+    fn rows_with_id(v: &Vault, ext: &str, live: bool) -> i64 {
+        v.db()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM transactions WHERE external_id = ?1 AND (deleted_ms IS NULL) = ?2",
+                params![ext, live],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Two devices know the same open hold, device A switches. The merge
+    /// pairs A's dropped hold with B's by fingerprint; the pair keeps the
+    /// freed id, so the hold the bank reports again after switching back is
+    /// live on both devices, not held deleted under its own id.
+    #[test]
+    fn a_hold_dropped_on_one_device_comes_back_on_both_after_switching_back() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-hold-sync");
+        let (a, c, _, _, _) = comdirect_vault(dir.path(), "a.db");
+        let hold = card("pending-hold-comdirect-h1", "2026-11-19", HOLD_TEXT);
+        fetch_giro(&a, ConnectorKind::Comdirect, c, vec![hold.clone()]);
+        let b = second_device(dir.path(), &a);
+        let id = "pending-hold-comdirect-h1";
+
+        a.switch_comdirect_access(c).unwrap();
+        sync_both(dir.path(), &a, &b, "switch");
+        for (name, v) in [("A", &a), ("B", &b)] {
+            assert_eq!(rows_with_id(v, id, true), 0, "{name}: hold dropped");
+            assert_eq!(
+                rows_with_id(v, id, false),
+                0,
+                "{name}: the hold's own id is free"
+            );
+        }
+
+        assert_eq!(a.switch_comdirect_access(c).unwrap(), "comdirect");
+        fetch_giro(&a, ConnectorKind::Comdirect, c, vec![hold]);
+        sync_both(dir.path(), &a, &b, "back");
+        for (name, v) in [("A", &a), ("B", &b)] {
+            assert_eq!(rows_with_id(v, id, true), 1, "{name}: the hold is back");
+        }
+    }
+
+    /// The posted payment can carry the date, amount and text of the hold a
+    /// switch dropped on the other device. The merge pairs the dropped hold
+    /// with the hold, never with the booking: the booking stays, the hold is
+    /// gone on both devices.
+    #[test]
+    fn a_dropped_hold_never_deletes_a_posted_booking_on_merge() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-hold-posted-sync");
+        let (a, c, _, _, _) = comdirect_vault(dir.path(), "a.db");
+        let hold = card("pending-hold-comdirect-h1", "2026-11-19", HOLD_TEXT);
+        fetch_giro(&a, ConnectorKind::Comdirect, c, vec![hold]);
+        let b = second_device(dir.path(), &a);
+
+        a.switch_comdirect_access(c).unwrap();
+        // B, not switched yet, fetches the posted payment
+        fetch_giro(
+            &b,
+            ConnectorKind::Comdirect,
+            c,
+            vec![card("REF1", "2026-11-19", HOLD_TEXT)],
+        );
+        sync_both(dir.path(), &a, &b, "posted");
+        for (name, v) in [("A", &a), ("B", &b)] {
+            assert_eq!(rows_with_id(v, "REF1", true), 1, "{name}: booking stays");
+            assert_eq!(
+                rows_with_id(v, "pending-hold-comdirect-h1", true),
+                0,
+                "{name}: hold gone"
+            );
+        }
+    }
+
+    /// The same for a hold an older switch had marked and the repair dropped:
+    /// its tombstone must not take the posted booking of another device along.
+    #[test]
+    fn a_dropped_marked_hold_never_deletes_a_posted_booking_on_merge() {
+        let dir = crate::test_support::TempDir::new("girocrab-marked-hold-posted-sync");
+        let (a, _, giro, _, _) = comdirect_vault(dir.path(), "a.db");
+        let b = second_device(dir.path(), &a);
+        let add = |v: &Vault, ext: &str| {
+            v.db()
+                .unwrap()
+                .execute(
+                    "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, currency, purpose)
+                     VALUES (?1, ?2, '2026-11-19', -2500, 'EUR', ?3)",
+                    params![giro, ext, HOLD_TEXT],
+                )
+                .unwrap();
+        };
+        add(&a, "mm-switch-pending-hold-fints-h3");
+        assert_eq!(drop_switched_holds(&a.db().unwrap()).unwrap(), 1);
+        add(&b, "camt:REF3");
+
+        sync_both(dir.path(), &a, &b, "posted");
+        for (name, v) in [("A", &a), ("B", &b)] {
+            assert_eq!(
+                rows_with_id(v, "camt:REF3", true),
+                1,
+                "{name}: booking stays"
+            );
+            assert_eq!(
+                rows_with_id(v, "mm-switch-pending-hold-fints-h3", true),
+                0,
+                "{name}: marked hold gone"
+            );
+        }
+    }
+
+    /// After the switch the bank posts the payment: one row with the
+    /// booking's own date and text, no hold left behind.
+    #[test]
+    fn a_hold_posted_after_the_switch_leaves_one_booking() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-hold-posted");
+        let (v, c, giro, _, _) = comdirect_vault(dir.path(), "v.db");
+        fetch_giro(
+            &v,
+            ConnectorKind::Comdirect,
+            c,
+            vec![card("pending-hold-comdirect-h1", "2026-11-19", HOLD_TEXT)],
+        );
+        v.switch_comdirect_access(c).unwrap();
+        let posted = card(
+            "camt:REF1",
+            "2026-11-20",
+            "SHOP, Berlin 19.11. 18:05 comdirect Visa-Debitkarte 1234",
+        );
+        fetch_giro(&v, ConnectorKind::FinTsGeneric, c, vec![posted.clone()]);
+        let cards: Vec<_> = live_rows(&v, giro)
+            .into_iter()
+            .filter(|r| r.0 != "mm-switch-rest-1")
+            .collect();
+        assert_eq!(
+            cards,
+            vec![(posted.external_id, posted.booking_date, posted.purpose)]
+        );
+    }
+
+    /// An older build on device A marked an open transfer of the app on its
+    /// switch (`mm-switch-pending-<e2e>`); device B still has it unmarked.
+    /// The merge pairs both forms of the one transfer: one row on each device.
+    #[test]
+    fn both_forms_of_a_transfer_of_the_app_stay_one_row_on_merge() {
+        let dir = crate::test_support::TempDir::new("girocrab-marked-transfer-sync");
+        let (a, _, giro, _, _) = comdirect_vault(dir.path(), "a.db");
+        let b = second_device(dir.path(), &a);
+        let add = |v: &Vault, ext: &str| {
+            v.db()
+                .unwrap()
+                .execute(
+                    "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, currency,
+                                              counterparty, counterparty_iban, purpose)
+                     VALUES (?1, ?2, '2026-11-19', -5000, 'EUR', 'Vermieter', 'DE02120300000000202051', 'Miete')",
+                    params![giro, ext],
+                )
+                .unwrap();
+        };
+        add(&a, "mm-switch-pending-e2e-1");
+        add(&b, "pending-e2e-1");
+
+        sync_both(dir.path(), &a, &b, "transfer");
+        for (name, v) in [("A", &a), ("B", &b)] {
+            let n: i64 = v
+                .db()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM transactions
+                      WHERE purpose = 'Miete' AND deleted_ms IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{name}: one row for the transfer");
+        }
+    }
+
+    /// Vaults switched by an older build: their marked holds go on open (and
+    /// after a merge), marked bookings and marked transfer bookings of the app
+    /// stay; running it again changes nothing.
+    #[test]
+    fn marked_holds_of_an_older_switch_are_dropped_on_open() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-hold-repair");
+        let path = dir.join("v.db").to_string_lossy().to_string();
+        let giro = {
+            let (v, _, giro, _, booking) = comdirect_vault(dir.path(), "v.db");
+            let db = v.db().unwrap();
+            db.execute(
+                "UPDATE transactions SET external_id = 'mm-switch-rest-1' WHERE id = ?1",
+                [booking],
+            )
+            .unwrap();
+            for ext in [
+                "mm-switch-pending-hold-fints-h1",
+                "mm-switch-pending-hold-comdirect-h1",
+            ] {
+                db.execute(
+                    "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, purpose,
+                                              category_source, note)
+                     VALUES (?1, ?2, '2026-11-18', -2500, 'SHOP, Berlin', 'manual', 'Einkauf')",
+                    params![giro, ext],
+                )
+                .unwrap();
+            }
+            // a transfer of the app, still open when the older build switched
+            db.execute(
+                "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, purpose,
+                                          category_source, note)
+                 VALUES (?1, 'mm-switch-pending-e2e-1', '2026-11-18', -5000, 'Miete', 'manual', 'Wohnung')",
+                [giro],
+            )
+            .unwrap();
+            giro
+        };
+        let v = Vault::open(path, vec![9u8; 32]).unwrap();
+        assert_eq!(
+            live_rows(&v, giro)
+                .into_iter()
+                .map(|r| r.0)
+                .collect::<Vec<_>>(),
+            vec!["mm-switch-rest-1", "mm-switch-pending-e2e-1"]
+        );
+        let db = v.db().unwrap();
+        assert_eq!(drop_switched_holds(&db).unwrap(), 0);
+    }
+
+    /// A vault the repair has not reached yet (another device, before the
+    /// merge): a booking must not take over a marked hold and keep its date
+    /// and text. A marked booking and a marked transfer booking of the app
+    /// are still taken over.
+    #[test]
+    fn a_booking_never_takes_over_a_marked_hold() {
+        let dir = crate::test_support::TempDir::new("girocrab-switch-hold-twin");
+        let (v, _, giro, _, _) = comdirect_vault(dir.path(), "v.db");
+        let db = v.db().unwrap();
+        let add = |ext: &str| {
+            db.execute(
+                "INSERT INTO transactions(account_id, external_id, booking_date, amount_cents, purpose)
+                 VALUES (?1, ?2, '2026-11-19', -2500, 'SHOP, Berlin 19.11. comdirect Visa-Debitkarte')",
+                params![giro, ext],
+            )
+            .unwrap();
+        };
+        let take = |ext: &str| {
+            crate::importers::moneymoney_import::adopt_import(
+                &db,
+                giro,
+                ext,
+                "2026-11-20",
+                -2500,
+                "",
+                "SHOP",
+                "SHOP, Berlin 19.11. comdirect Visa-Debitkarte 1234",
+                "",
+            )
+            .unwrap()
+        };
+        add("mm-switch-pending-hold-comdirect-h1");
+        assert!(!take("camt:REF1"), "a marked hold is no twin");
+        add("mm-switch-rest-9");
+        assert!(take("camt:REF2"), "a marked booking still is");
+        add("mm-switch-pending-e2e-1");
+        assert!(take("camt:REF3"), "and a marked transfer of the app");
     }
 }

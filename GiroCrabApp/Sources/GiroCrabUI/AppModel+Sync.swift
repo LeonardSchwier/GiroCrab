@@ -10,8 +10,7 @@ extension AppModel {
     func requestSync(_ connection: BankConnection) {
         withFreshBankingPolicy { [self] in
             if let gate = bankingGate(for: connection) {
-                statementsAccountID = nil
-                postboxConnectionID = nil
+                clearSyncTargets()
                 if syncBatchTotal > 1, !gate.all {
                     // A lock published while "Alle abrufen" runs: skip this
                     // login, go on with the rest, name it in the closing notice.
@@ -28,8 +27,28 @@ extension AppModel {
     }
 
     private func requestSyncChecked(_ connection: BankConnection) {
+        // Bitcoin Core on a Mac without a node (the vault came over iCloud): not fetched here,
+        // its balance comes from the Mac running the node
+        if connection.connector == .bitcoinCore, !isDemo,
+           !BitcoinCoreDatadir.nodeOnThisMac(configured: settingEntry(BitcoinCoreDatadir.key)?.value) {
+            toast = String(localized: "\(connection.displayName): wird per iCloud-Sync vom Mac mit Bitcoin Core aktualisiert.")
+            syncNextInQueue()
+            return
+        }
+        // Bitcoin Core: the data directory Bitcoin-Qt uses, unless one is set (stored, so it
+        // shows in the connection's settings and can be changed there)
+        if connection.connector == .bitcoinCore, !isDemo, settingEntry(BitcoinCoreDatadir.key)?.hasValue != true,
+           let dir = BitcoinCoreDatadir.detected() {
+            saveSetting(BitcoinCoreDatadir.key, dir)
+        }
         if connection.connector == .advanzia, !isDemo, !Self.isMagicDemoLogin(connection.loginName) {
             startAdvanzia(connection); return
+        }
+        // Finpension: no sync, the export file is imported from the connection's sheet.
+        if usesFileImport(connection) {
+            resetSyncBatch()
+            toast = String(localized: "\(connection.displayName): Bitte den Export in den Einstellungen der Verbindung importieren.")
+            return
         }
         // Amex / Amazon Visa: embedded web-portal login (no API keys needed).
         if usesPortal(connection) {
@@ -43,7 +62,7 @@ extension AppModel {
             webLoginConnection = connection
             return
         }
-        if !isDemo, let st = connectionStatus(connection.id), (st.hasPin || (connection.connector == .tradeRepublic && st.hasSession)),
+        if !isDemo, let st = connectionStatus(connection.id), (st.hasPin || ([.tradeRepublic, .kontist].contains(connection.connector) && st.hasSession)),
            missingSettings(for: connection).isEmpty {
             startSync(connection, secret: "")
             return
@@ -63,10 +82,41 @@ extension AppModel {
         }
     }
 
+    /// "Abrufen" of a login: all its accounts, also after an earlier
+    /// "<Konto> abrufen" of it ended in an error.
+    func requestFullSync(_ connection: BankConnection) {
+        syncAccountID = nil
+        requestSync(connection)
+    }
+
+    /// "<Konto> abrufen": only this account of its login (#1124). Login
+    /// prompts and retries of this sync keep to it.
+    func requestSyncAccount(_ account: Account) {
+        guard syncingConnectionID == nil, !account.isArchived, let cid = account.connectionId,
+              let connection = connections.first(where: { $0.id == cid }) else { return }
+        if supportsAccountSync(connection) { syncAccountID = account.id }
+        requestSync(connection)
+    }
+
+    /// Logins with their own flow (web portal, file import, Advanzia) fetch
+    /// everything, also for "<Konto> abrufen".
+    func supportsAccountSync(_ connection: BankConnection) -> Bool {
+        !usesPortal(connection) && !usesFileImport(connection) && connection.connector != .advanzia
+    }
+
+    /// Whether the sidebar shows `account` as being fetched: its login syncs,
+    /// and the sync is not limited to another of its accounts (#1572).
+    func isSyncing(_ account: Account) -> Bool {
+        guard let cid = syncingConnectionID, cid == account.connectionId else { return false }
+        return syncingAccountID == nil || syncingAccountID == account.id
+    }
+
     func requestSyncAll() {
-        // portal connections need an interactive login – not part of "sync all"
-        // logins whose accounts are all archived are not asked at all
-        requestSyncBatch { [self] in connections.filter { !usesPortal($0) && !$0.allAccountsArchived } }
+        requestSyncBatch { [self] in
+            connections.filter {
+                !$0.allAccountsArchived && supportsSyncSchedule($0) && syncSchedule($0.id) != AutoSync.never
+            }
+        }
     }
 
     /// "Konten abrufen" in a group's menu: the logins behind the group's
@@ -74,7 +124,7 @@ extension AppModel {
     func groupSyncConnections(_ group: UserGroup) -> [BankConnection] {
         let ids = Set(userGroupSubtree(group.uuid).flatMap(\.accounts)
             .filter { !$0.isArchived }.compactMap(\.connectionId))
-        return connections.filter { ids.contains($0.id) && !usesPortal($0) }
+        return connections.filter { ids.contains($0.id) && !usesPortal($0) && !usesFileImport($0) }
     }
 
     func requestSyncGroup(_ group: UserGroup) {
@@ -84,7 +134,7 @@ extension AppModel {
     /// What a pull-to-refresh starts besides the iCloud merge.
     enum RefreshSyncAction: Equatable {
         case none
-        case connection(Int64)
+        case account(Int64)
         case group(String)
         case all
     }
@@ -95,10 +145,10 @@ extension AppModel {
     func refreshSyncAction() -> RefreshSyncAction {
         switch sidebarSelection {
         case .account(let id):
-            guard let cid = allAccounts.first(where: { $0.id == id })?.connectionId,
-                  let c = connections.first(where: { $0.id == cid }),
-                  !usesPortal(c), !c.allAccountsArchived else { return .none }
-            return .connection(cid)
+            guard let account = accountsByID[id], !account.isArchived,
+                  let c = connections.first(where: { $0.id == account.connectionId }),
+                  !usesPortal(c), !usesFileImport(c) else { return .none }
+            return .account(id)
         case .userGroup(let uuid) where !uuid.isEmpty:
             return .group(uuid)
         case .documents, .wealth:
@@ -126,9 +176,9 @@ extension AppModel {
         if let hook = refreshSyncOverride { hook(action); return }
         switch action {
         case .none: return
-        case .connection(let id):
-            guard let c = connections.first(where: { $0.id == id }) else { return }
-            requestSync(c)
+        case .account(let id):
+            guard let account = accountsByID[id] else { return }
+            requestSyncAccount(account)
         case .group(let uuid):
             guard let g = userGroups.first(where: { $0.uuid == uuid }) else { return }
             requestSyncGroup(g)
@@ -145,7 +195,9 @@ extension AppModel {
         // the banking policy check may delay the start a moment
         try? await Task.sleep(for: .milliseconds(150))
         while !Task.isCancelled, waited < 600 {
+            // an error alert of "Alle abrufen" waits for the user too (#1041)
             let prompting = pendingLogin != nil || setupRequest != nil || webLoginConnection != nil || activeChallenge != nil
+                || errorMessage != nil
             if prompting || (syncingConnectionID == nil && syncQueue.isEmpty) { return }
             try? await Task.sleep(for: .milliseconds(200))
             waited += 1
@@ -171,6 +223,7 @@ extension AppModel {
             syncQueue = Array(allowed.dropFirst())
             syncBatchTotal = allowed.count
             syncBatchSkipped = blocked.map { String(localized: "\($0.displayName) (Sicherheitssperre)") }
+            syncAccountID = nil
             requestSyncChecked(head)
         }
     }
@@ -197,8 +250,7 @@ extension AppModel {
         let s = activeSession
         activeSession = nil
         activeChallenge = nil
-        statementsAccountID = nil
-        postboxConnectionID = nil
+        clearSyncTargets()
         syncGeneration &+= 1
         let generation = syncGeneration
         Task {
@@ -250,8 +302,7 @@ extension AppModel {
     private func skipPrompt(for connection: BankConnection?) {
         // A cancelled "Kontoauszüge abrufen" must never carry over to the next
         // sync – it would send that login's PIN for another bank's account.
-        statementsAccountID = nil
-        postboxConnectionID = nil
+        clearSyncTargets()
         guard syncBatchTotal > 1 else { resetSyncBatch(); return }
         if let name = connection?.displayName { syncBatchSkipped.append(name) }
         syncNextInQueue()
@@ -263,17 +314,47 @@ extension AppModel {
         syncBatchSkipped = []
     }
 
-    /// Toast suffix of a sync with the comdirect PostBox (#838).
-    static func postboxNote(_ s: SyncSummary) -> String {
-        guard let n = s.postboxDocuments else {
-            return String(localized: "PostBox nicht abgerufen. Bitte Client-ID und Client-Secret der comdirect-API prüfen.")
+    /// Errors answered with a prompt (setup form, browser login, FinTS registration)
+    /// instead of a failure: in "Alle abrufen" the batch waits for the prompt, whose
+    /// "Überspringen" goes on with the next login (#1041). The Trade Republic PIN
+    /// prompt (#1128) depends on the login, so `finishSync` handles it before this.
+    nonisolated static func errorOpensPrompt(_ error: Error) -> Bool {
+        if isMissingProductID(error) { return true }
+        guard let ce = error as? CoreError else { return false }
+        switch ce {
+        case .BrowserLoginRequired, .MissingSetting: return true
+        default: return false
         }
-        return n == 0
-            ? String(localized: "keine neuen PostBox-Dokumente")
-            : String(localized: "\(n) neue PostBox-Dokumente")
     }
 
-    /// Toast suffix: new bookings the bank delivered for archived accounts (not stored).
+    /// Toast suffix of a sync with the comdirect Postbox (#838) or the
+    /// Consorsbank Online-Archiv (#1024).
+    static func postboxNote(_ s: SyncSummary, _ c: BankConnection) -> String {
+        if c.connector == .finTsGeneric, c.bankCode == "76030080" {
+            guard let n = s.postboxDocuments else {
+                return String(localized: "Online-Archiv nicht abgerufen. Bitte PIN und Freigabe in der Consorsbank App prüfen.")
+            }
+            return n == 0
+                ? String(localized: "keine neuen Dokumente aus dem Online-Archiv")
+                : String(localized: "\(n) neue Dokumente aus dem Online-Archiv")
+        }
+        guard let n = s.postboxDocuments else {
+            return String(localized: "Postbox nicht abgerufen. Bitte Client-ID und Client-Secret der comdirect-API prüfen.")
+        }
+        return n == 0
+            ? String(localized: "keine neuen Postbox-Dokumente")
+            : String(localized: "\(n) neue Postbox-Dokumente")
+    }
+
+    /// Shown after a sync that left history for the next one.
+    static func historyNote(_ s: SyncSummary) -> String {
+        guard s.historyIncomplete else { return "" }
+        let progress = HistoryProgress(remaining: Int(s.historyRemaining), total: Int(s.historyTotal)).text
+        return " · " + String(localized: "Historie noch nicht vollständig – bitte noch einmal abrufen")
+            + (progress.isEmpty ? "" : " (\(progress))")
+    }
+
+    /// Toast suffix for bookings the bank delivered for archived accounts.
     static func skippedArchivedNote(_ s: SyncSummary) -> String {
         s.transactionsSkippedArchived == 0 ? "" : " · " + String(localized: "\(s.transactionsSkippedArchived) Buchungen archivierter Konten übersprungen")
     }
@@ -300,6 +381,24 @@ extension AppModel {
         resetSyncBatch()
     }
 
+    /// Forgets what the next sync was asked to fetch besides (or instead of)
+    /// the login's bookings: statements, Postbox, one account.
+    func clearSyncTargets() {
+        statementsAccountID = nil
+        postboxConnectionID = nil
+        syncAccountID = nil
+    }
+
+    /// `accountID` when it is an account of exactly this login.
+    private func account(_ accountID: Int64?, of connection: BankConnection) -> Int64? {
+        accountID.flatMap { accountsByID[$0]?.connectionId == connection.id ? $0 : nil }
+    }
+
+    /// Like `account(_:of:)`, and never in a scheduled sync.
+    private func ownAccount(_ accountID: Int64?, of connection: BankConnection) -> Int64? {
+        quietSyncConnectionID == connection.id ? nil : account(accountID, of: connection)
+    }
+
     func startSync(_ connection: BankConnection, secret: String) {
         guard let vault else { return }
         if connection.connector == .advanzia, !isDemo, !Self.isMagicDemoLogin(connection.loginName) {
@@ -309,19 +408,19 @@ extension AppModel {
         pendingLogin = nil
         // Statements only for an account of exactly this login: a stale value
         // would hand this login's PIN to another bank.
-        if let accountID = statementsAccountID,
-           allAccounts.first(where: { $0.id == accountID })?.connectionId != connection.id
-            || quietSyncConnectionID == connection.id {
-            statementsAccountID = nil
-        }
+        if ownAccount(statementsAccountID, of: connection) == nil { statementsAccountID = nil }
         let statementsFor = statementsAccountID
-        // "PostBox jetzt abrufen" only for exactly this login, never in an automatic sync
+        // "Postbox jetzt abrufen" only for exactly this login, never in an automatic sync
         if postboxConnectionID != connection.id || quietSyncConnectionID == connection.id {
             postboxConnectionID = nil
         }
         let postboxNow = postboxConnectionID != nil
+        // kept when another login syncs first (e.g. a scheduled one)
+        let accountOnly = ownAccount(syncAccountID, of: connection)
         let quiet = quietSyncConnectionID == connection.id
         syncingConnectionID = connection.id
+        syncingAccountID = statementsFor ?? accountOnly
+        syncVaultRevision = vaultRevision
         syncGeneration &+= 1
         Task {
             var started: SyncSession?
@@ -331,8 +430,10 @@ extension AppModel {
                     session = try vault.fetchAccountStatements(accountId: accountID, secret: secret, demo: isDemo)
                 } else if postboxNow {
                     session = try vault.fetchComdirectPostbox(connectionId: connection.id, secret: secret, demo: isDemo)
+                } else if let accountID = accountOnly {
+                    session = try vault.beginAccountSync(accountId: accountID, secret: secret, demo: isDemo)
                 } else if quiet {
-                    // no new approval in the background (e.g. the comdirect PostBox, #838)
+                    // no new approval in the background (e.g. the comdirect Postbox, #838)
                     session = try vault.beginQuietSync(connectionId: connection.id, secret: secret, demo: isDemo)
                 } else {
                     session = try vault.beginSync(connectionId: connection.id, secret: secret, demo: isDemo)
@@ -341,6 +442,10 @@ extension AppModel {
                 self.activeSession = session
                 let step = try await session.start()
                 guard self.activeSession === session else { return }  // skipped / cancelled meanwhile
+                // a TAN or skip answered meanwhile owns the sheet, unless the sync ended with .finished
+                if self.activeChallenge?.busy == true {
+                    guard case .finished = step else { return }
+                }
                 self.handle(step, connection: connection)
             } catch {
                 if let started, self.activeSession !== started { return }
@@ -373,40 +478,74 @@ extension AppModel {
         }
         switch step {
         case .needsChallenge(let c):
-            activeChallenge = ActiveChallenge(connection: connection, challenge: c, waiting: false)
+            activeChallenge = ActiveChallenge(connection: connection, challenge: c, waiting: false,
+                                              canSkipOrder: activeSession?.isFetching() ?? false)
             if c.kind == .decoupledPush || c.kind == .progress { schedulePoll(connection: connection, interval: c.pollIntervalSeconds) }
         case .stillWaiting(let c):
             if activeChallenge == nil {
-                activeChallenge = ActiveChallenge(connection: connection, challenge: c, waiting: true)
+                activeChallenge = ActiveChallenge(connection: connection, challenge: c, waiting: true,
+                                                  canSkipOrder: activeSession?.isFetching() ?? false)
             } else {
                 activeChallenge?.challenge = c  // progress steps bring a new text
+                activeChallenge?.canSkipOrder = activeSession?.isFetching() ?? false
+                activeChallenge?.polling = false
                 activeChallenge?.waiting = true
                 activeChallenge?.busy = false
             }
             schedulePoll(connection: connection, interval: c.pollIntervalSeconds)
         case .finished(let s):
-            logSync(connectionID: connection.id, source: syncLogSource(for: connection.id), outcome: .ok,
+            // a scheduled sync of another login leaves a pending "<Konto> abrufen" alone
+            if account(syncAccountID, of: connection) != nil { syncAccountID = nil }
+            // what the bank would not give is no success (#1627)
+            logSync(connectionID: connection.id, source: syncLogSource(for: connection.id),
+                    outcome: s.warnings.isEmpty ? .ok : .partial,
+                    message: connection.connector == .tradeRepublic ? Self.syncLogMessage(s) : (s.warnings + s.hints).joined(separator: " / "),
                     imported: Int(s.transactionsImported))
             activeChallenge = nil
             syncingConnectionID = nil
             activeSession = nil
+            // Only a sync of the whole login in this vault tells the history's state: one account
+            // ("<Konto> abrufen", statements) leaves the history and its documents for later.
+            if syncingAccountID == nil, syncVaultRevision == vaultRevision {
+                historyIncomplete[connection.id] = s.historyIncomplete
+                    ? HistoryProgress(remaining: Int(s.historyRemaining), total: Int(s.historyTotal)) : nil
+            }
+            let statementsFetch = statementsAccountID != nil
             if let accountID = statementsAccountID {
                 statementsAccountID = nil
-                documentsVersion += 1
-                let n = max(0, accountDocuments(accountID).count - statementsCountBefore)
-                toast = n > 0
-                    ? String(localized: "\(connection.displayName): \(n) neue Kontoauszüge")
-                    : String(localized: "\(connection.displayName): keine neuen Kontoauszüge. Falls die Bank keine elektronischen Kontoauszüge per FinTS anbietet, lassen sie sich hier nicht abrufen.")
+                let before = statementsCountBefore
+                let name = connection.displayName
+                let warnings = s.warnings
+                let report = { [self] (unplaced: Int) in
+                    documentsVersion += 1
+                    let n = max(0, accountDocuments(accountID).count - before)
+                    var note = n > 0
+                        ? String(localized: "\(name): \(n) neue Kontoauszüge")
+                        : String(localized: "\(name): keine neuen Kontoauszüge. Falls die Bank keine elektronischen Kontoauszüge per FinTS anbietet, lassen sie sich hier nicht abrufen.")
+                    // a partial download or a failed placement must not look like a finished fetch
+                    if !warnings.isEmpty { note += " · " + warnings.joined(separator: " / ") }
+                    if unplaced > 0 { note += " · " + String(localized: "\(unplaced) Dokumente konnten keinem Konto zugeordnet werden.") }
+                    toast = note
+                }
+                if connection.connector == .bhw {
+                    // BHW: mailbox PDFs reach their account only once their text was read.
+                    Task { @MainActor in
+                        report(await self.placeBhwDocuments().failed)
+                    }
+                } else {
+                    report(0)
+                }
             } else if postboxConnectionID == connection.id {
                 postboxConnectionID = nil
                 documentsVersion += 1
-                toast = syncNotice(connection, s) + " · " + Self.postboxNote(s)
+                toast = syncNotice(connection, s) + " · " + Self.postboxNote(s, connection)
             } else {
                 let quiet = quietSyncConnectionID == connection.id
                 // scheduled syncs only speak up when something changed
-                if !quiet || s.transactionsImported > 0 || !s.newAccounts.isEmpty || !s.revokedAccounts.isEmpty {
-                    var note = syncNotice(connection, s) + Self.skippedArchivedNote(s)
-                    if let n = s.postboxDocuments, n > 0 { note += " · " + Self.postboxNote(s) }
+                if !quiet || s.transactionsImported > 0 || !s.newAccounts.isEmpty || !s.revokedAccounts.isEmpty
+                    || !s.warnings.isEmpty {
+                    var note = syncNotice(connection, s) + Self.skippedArchivedNote(s) + Self.historyNote(s)
+                    if let n = s.postboxDocuments, n > 0 { note += " · " + Self.postboxNote(s, connection) }
                     toast = note
                 }
                 if s.postboxDocuments.map({ $0 > 0 }) ?? false { documentsVersion += 1 }
@@ -414,6 +553,12 @@ extension AppModel {
             let wasQuiet = quietSyncConnectionID == connection.id
             quietSyncConnectionID = nil
             if wasQuiet { reloadAllInBackground() } else { reloadAll() }
+            // A regular BHW sync can bring mailbox PDFs too (automatic statements).
+            if connection.connector == .bhw && !statementsFetch {
+                Task { @MainActor in
+                    if await self.placeBhwDocuments().placed > 0 { self.documentsVersion += 1 }
+                }
+            }
             checkPendingAccountSelection()
             syncNextInQueue()
         }
@@ -436,15 +581,27 @@ extension AppModel {
                 return
             }
             guard let session = self.activeSession else { return }
+            if self.activeChallenge?.canSkipOrder == true { self.activeChallenge?.polling = true }
             do {
                 let step = try await session.poll()
                 guard self.activeSession === session else { return }  // skipped / cancelled meanwhile
+                if self.activeChallenge?.busy == true {
+                    // a TAN or skip answered meanwhile owns the sheet, unless the sync ended with .finished
+                    guard case .finished = step else { return }
+                }
                 self.handle(step, connection: connection)
             } catch {
                 guard self.activeSession === session else { return }
                 self.finishSync(error: error)
             }
         }
+    }
+
+    /// Consorsbank Online-Archiv (#1024): the approval dialog's link switches between the
+    /// app approval and a typed TAN ("TAN" / "APP", handled in `consorsbank_archive.rs`).
+    func switchApproval(_ word: String) {
+        pollTask?.cancel()
+        submitCode(word)
     }
 
     func submitCode(_ code: String) {
@@ -471,6 +628,25 @@ extension AppModel {
             do {
                 let step = try await session.submitCode(code: code)
                 // "Überspringen" while the code was on its way: drop the late answer
+                guard self.activeSession === session else { return }
+                self.handle(step, connection: ch.connection)
+            } catch {
+                guard self.activeSession === session else { return }
+                self.finishSync(error: error)
+            }
+        }
+    }
+
+    /// "TAN auslassen" (#1730): leaves out the order the bank wants a TAN for during the
+    /// fetch; the sync goes on with the rest and reports the order as a warning.
+    func skipOrder() {
+        guard let session = activeSession, let ch = activeChallenge, ch.canSkipOrder, !ch.busy else { return }
+        pollTask?.cancel()
+        activeChallenge?.busy = true
+        activeChallenge?.error = nil
+        Task {
+            do {
+                let step = try await session.skip()
                 guard self.activeSession === session else { return }
                 self.handle(step, connection: ch.connection)
             } catch {
@@ -526,8 +702,7 @@ extension AppModel {
         activeChallenge = nil
         pendingLogin = nil
         syncingConnectionID = nil
-        statementsAccountID = nil
-        postboxConnectionID = nil
+        clearSyncTargets()
         syncGeneration &+= 1
         resetSyncBatch()
         Task { await s?.cancel() }
@@ -552,12 +727,59 @@ extension AppModel {
         }
         statementsAccountID = nil
         postboxConnectionID = nil
+        // syncAccountID stays: the retry and the prompts below keep to the account
         syncingConnectionIDBeforeError = syncingConnectionID
         pollTask?.cancel()
         activeSession = nil
         activeChallenge = nil
         syncingConnectionID = nil
-        resetSyncBatch()
+        // Trade Republic or Kontist on its stored session alone (no PIN given, none stored) whose
+        // session expired (#1128): the core asks for the PIN/password, which only the PIN sheet
+        // takes (for Trade Republic it also offers the browser login). FNZ: a failed direct
+        // login with a saved PIN — rejected sign-in or changed portal — gets the same sheet
+        // with the browser fallback (#1863), otherwise no window could reach it again.
+        if let ce = error as? CoreError, retrySecret?.isEmpty ?? true,
+           let conn = connections.first(where: { $0.id == syncingConnectionIDBeforeError }) {
+            if [.tradeRepublic, .kontist].contains(conn.connector),
+               case .Authentication = ce, connectionStatus(conn.id)?.hasPin != true {
+                toast = describe(error)
+                pendingLogin = PendingLogin(connection: conn)
+                return
+            }
+            if conn.connector == .fnz {
+                var fallback = false
+                if case .Authentication = ce { fallback = true }
+                if case .Protocol = ce { fallback = true }
+                if fallback {
+                    toast = describe(error)
+                    pendingLogin = PendingLogin(connection: conn)
+                    return
+                }
+            }
+        }
+        // "Alle abrufen" (#1041): an error ends only this login. Its alert shows right away;
+        // the batch goes on once it is closed ("Überspringen"), retries this login, or ends.
+        if syncBatchTotal > 1, !Self.errorOpensPrompt(error),
+           let conn = connections.first(where: { $0.id == syncingConnectionIDBeforeError }) {
+            showError(String(localized: "Abruf von „\(conn.displayName)“ fehlgeschlagen"), describe(error)) { [weak self] in
+                guard let self, let c = self.connections.first(where: { $0.id == conn.id }) else { return }
+                self.requestSync(c)   // the batch goes on after it
+            }
+            let alternatives = productIDAlternatives(for: conn, error: error, secret: retrySecret)
+            if syncQueue.isEmpty {
+                errorAlternatives = alternatives
+            } else {
+                // macOS shows at most three buttons: Überspringen, one retry, Alle abbrechen.
+                // A rejected FinTS registration is retried with the other one, not the same.
+                if let alt = alternatives.last { errorRetry = nil; errorAlternatives = [alt] }
+                errorAlternatives.append((String(localized: "Alle abbrechen"), { [weak self] in self?.cancelAllSync() }))
+                errorCloseTitle = String(localized: "Überspringen")
+            }
+            errorOnClose = { [weak self] in self?.syncNextInQueue() }
+            return
+        }
+        // A prompt (browser login, setup form, retry with GiroCrab's registration) keeps
+        // the batch: done, it syncs this login and goes on; cancelled, it skips it.
         if let ce = error as? CoreError, case .BrowserLoginRequired(let m) = ce,
            let conn = connections.first(where: { $0.id == syncingConnectionIDBeforeError }) {
             toast = m
@@ -572,6 +794,7 @@ extension AppModel {
                 requestSync(conn)
                 return
             }
+            resetSyncBatch()
             showError(String(localized: "Abruf von „\(conn.displayName)“ fehlgeschlagen"),
                       String(localized: "Diese Version enthält keine FinTS-Registrierung von GiroCrab. Tragen Sie Ihre eigene Registrierung ein."))
             errorAlternatives = [(String(localized: "Eigene Registrierung eintragen …"), { [weak self] in self?.enterOwnProductID() })]
@@ -584,6 +807,7 @@ extension AppModel {
             setupRequest = SetupRequest(connection: conn, keys: keys)
             return
         }
+        resetSyncBatch()
         if let conn = connections.first(where: { $0.id == syncingConnectionIDBeforeError }) {
             showError(String(localized: "Abruf von „\(conn.displayName)“ fehlgeschlagen"), describe(error)) { [weak self] in
                 guard let self, let c = self.connections.first(where: { $0.id == conn.id }) else { return }

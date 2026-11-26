@@ -17,13 +17,22 @@ use crate::error::{CoreError, CoreResult};
 use crate::i18n::trf;
 
 pub mod advanzia;
+pub mod airplus;
 pub mod amazon_documents;
+pub mod axashareplan;
 pub mod bank_directory;
+pub mod berghauscie;
+pub mod bhw;
+pub mod bitcoin;
+pub mod bitcoin_core;
 pub mod broker_documents;
 pub mod bunq;
 pub mod comdirect;
 pub(crate) mod comdirect_postbox;
+pub(crate) mod consorsbank_archive;
 pub mod demo;
+mod document_matching;
+pub(crate) mod document_resort;
 pub mod dpop;
 pub mod easybank;
 pub mod enable_banking;
@@ -36,27 +45,38 @@ pub mod fints_directory;
 pub mod fints_presets;
 pub mod fnz;
 pub mod fordmoney;
+pub mod goandgrow;
+pub mod hanseatic;
 pub mod ibkr;
+pub mod kontist;
+pub mod monefit;
 pub mod opel;
 pub mod paypal;
 pub mod paypal_nvp;
 pub mod quirion;
 pub mod scalable;
 pub mod schwaebisch_hall;
+pub mod sharinbox;
 pub mod template;
 pub mod trade_republic;
 pub mod uberspace;
+pub mod unioninvestment;
 pub mod volkswagen_bank;
 
 pub(crate) mod account_selection;
 pub use account_selection::ConnectionAccountChoice;
 mod catalog;
+pub(crate) mod history;
+mod html;
+mod paging;
 mod persist;
 mod sync_session;
 mod transfer_session;
 mod types;
 
 pub use catalog::*;
+pub use history::HistoryRange;
+pub(crate) use paging::{Paged, paginate};
 pub use persist::*;
 pub use sync_session::*;
 pub use transfer_session::*;
@@ -72,10 +92,12 @@ pub(crate) const USER_AGENT: &str = concat!(
 
 pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
 
-/// Client builder with [`USER_AGENT`] and a timeout for the whole request.
+/// Client builder with [`USER_AGENT`], a 15 s connection timeout and a separate
+/// timeout for the whole request.
 pub(crate) fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(15))
         .timeout(timeout)
 }
 
@@ -88,14 +110,17 @@ pub(crate) fn http_client() -> CoreResult<reqwest::Client> {
 /// Redirect policy for clients that send credentials (login forms, tokens, API
 /// keys): follows a redirect only inside the same host, so a bank or portal
 /// answer (or a man in the middle) cannot make the client replay a login body,
-/// session token or refresh token to a different host. A cross-host redirect
-/// ends the chain; the 3xx answer is then returned as it is.
+/// session token or refresh token to a different host. Scheme and port must stay
+/// the same too (no https -> http downgrade, no other service on the host). A
+/// redirect to another origin ends the chain; the 3xx answer is then returned as it is.
 pub(crate) fn same_host_redirects() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        let same = attempt
-            .previous()
-            .last()
-            .is_some_and(|prev| prev.host_str() == attempt.url().host_str());
+        let next = attempt.url();
+        let same = attempt.previous().last().is_some_and(|prev| {
+            prev.scheme() == next.scheme()
+                && prev.host_str() == next.host_str()
+                && prev.port_or_known_default() == next.port_or_known_default()
+        });
         if same && attempt.previous().len() < 10 {
             attempt.follow()
         } else {
@@ -106,13 +131,7 @@ pub(crate) fn same_host_redirects() -> reqwest::redirect::Policy {
 
 /// [`http_client`] with [`same_host_redirects`], for connectors that post credentials.
 pub(crate) fn http_client_same_host() -> CoreResult<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .user_agent(concat!(
-            "GiroCrab/",
-            env!("CARGO_PKG_VERSION"),
-            " (open source; +https://github.com/)"
-        ))
-        .timeout(std::time::Duration::from_secs(60))
+    Ok(client_builder(Duration::from_secs(60))
         .cookie_store(true)
         .redirect(same_host_redirects())
         .build()?)
@@ -134,17 +153,15 @@ pub(crate) fn ensure_secure_fints_url(url: &str) -> CoreResult<()> {
         if fints_presets::is_valid_fints_url(url.trim()) {
             return Ok(());
         }
-        return Err(CoreError::Protocol {
-            message: "FinTS URL is not a public https address".to_string(),
-        });
+        return Err(CoreError::protocol(
+            "FinTS URL is not a public https address",
+        ));
     }
     #[cfg(test)]
     if lower.starts_with("http://127.0.0.1") || lower.starts_with("http://localhost") {
         return Ok(());
     }
-    Err(CoreError::Protocol {
-        message: "FinTS URL must use https://".to_string(),
-    })
+    Err(CoreError::protocol("FinTS URL must use https://"))
 }
 
 /// Upper bound for JSON / text / FinTS responses.
@@ -161,24 +178,47 @@ fn too_large(limit: usize) -> CoreError {
     }
 }
 
-/// Reads a response body, but never more than `limit` bytes (no OOM on a
-/// huge or endless body): larger bodies are an error.
+/// Why [`read_body_checked`] stopped: the body is over the limit (asking
+/// again gives the same), or the connection broke while reading (worth a retry).
+pub(crate) enum BodyError {
+    TooLarge(CoreError),
+    Read(CoreError),
+}
+
+impl From<BodyError> for CoreError {
+    fn from(e: BodyError) -> Self {
+        match e {
+            BodyError::TooLarge(e) | BodyError::Read(e) => e,
+        }
+    }
+}
+
+/// [`read_body_limited`] that tells an oversized body from a broken read.
 #[allow(clippy::disallowed_methods)]
-pub(crate) async fn read_body_limited(
+pub(crate) async fn read_body_checked(
     mut resp: reqwest::Response,
     limit: usize,
-) -> CoreResult<Vec<u8>> {
+) -> Result<Vec<u8>, BodyError> {
     if resp.content_length().is_some_and(|n| n > limit as u64) {
-        return Err(too_large(limit));
+        return Err(BodyError::TooLarge(too_large(limit)));
     }
     let mut out = Vec::new();
-    while let Some(chunk) = resp.chunk().await? {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| BodyError::Read(e.into()))? {
         if out.len() + chunk.len() > limit {
-            return Err(too_large(limit));
+            return Err(BodyError::TooLarge(too_large(limit)));
         }
         out.extend_from_slice(&chunk);
     }
     Ok(out)
+}
+
+/// Reads a response body, but never more than `limit` bytes (no OOM on a
+/// huge or endless body): larger bodies are an error.
+pub(crate) async fn read_body_limited(
+    resp: reqwest::Response,
+    limit: usize,
+) -> CoreResult<Vec<u8>> {
+    Ok(read_body_checked(resp, limit).await?)
 }
 
 /// [`read_body_limited`] with [`MAX_TEXT_BYTES`], decoded as UTF-8 (lossy).
@@ -196,9 +236,7 @@ pub(crate) async fn read_json_or_null(resp: reqwest::Response) -> serde_json::Va
     }
 }
 
-pub(crate) fn today() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
-}
+pub(crate) use crate::dates::today_iso as today;
 
 #[cfg(test)]
 mod tests;

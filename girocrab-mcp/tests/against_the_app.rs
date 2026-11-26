@@ -4,15 +4,16 @@
 
 mod common;
 
-use common::{adapter_at, call, text, ShortDir};
-use girocrab_core::local_api::server::LocalApiServer;
-use girocrab_core::local_api::{ShareScope, API_VERSION};
+use common::{ShortDir, adapter_at, call, text};
 use girocrab_core::Vault;
-use serde_json::{json, Value};
+use girocrab_core::local_api::server::LocalApiServer;
+use girocrab_core::local_api::{API_VERSION, ShareScope};
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A demo vault sharing its first account, served on a socket in `dir`.
 struct App {
@@ -31,13 +32,15 @@ fn serve(dir: &ShortDir) -> App {
         .set_local_api_scope(ShareScope {
             enabled: true,
             account_ids: vec![shared_account],
+            allow_edits: true,
             ..Default::default()
         })
         .unwrap();
     let token = vault.create_local_api_token().unwrap();
     // One level deeper: the server creates its folder itself, with mode 0700.
     let socket = dir.0.join("api").join("s.sock");
-    let server = LocalApiServer::start(vault.clone(), socket.to_string_lossy().into()).unwrap();
+    let server =
+        LocalApiServer::start(vault.clone(), socket.to_string_lossy().into(), None).unwrap();
     App {
         vault,
         server,
@@ -88,6 +91,76 @@ fn tools_read_what_the_user_shares_and_stop_with_the_app() {
 }
 
 #[test]
+fn categories_and_tags_are_set_only_while_edits_are_allowed() {
+    let dir = ShortDir::new();
+    let app = serve(&dir);
+    let mut mcp = adapter_at(&app.socket, Ok(app.token.clone()));
+    let page = call(
+        &mut mcp,
+        "list_transactions",
+        json!({ "uncategorized_only": true, "limit": 1 }),
+    );
+    let booking = &page["structuredContent"]["transactions"][0];
+    assert_eq!(booking["category_source"], "none");
+    let id = booking["id"].clone();
+    let categories = call(&mut mcp, "list_categories", json!({}));
+    let category = categories["structuredContent"]["items"][0]["id"].clone();
+
+    let set = call(
+        &mut mcp,
+        "set_category",
+        json!({ "transaction_ids": [id], "category_id": category }),
+    );
+    assert_eq!(set["isError"], false, "{}", text(&set));
+    assert_eq!(set["structuredContent"]["results"][0]["status"], "changed");
+    let tagged = call(
+        &mut mcp,
+        "set_tags",
+        json!({ "transaction_ids": [id], "add": ["Dienstreise"] }),
+    );
+    assert_eq!(
+        tagged["structuredContent"]["created_tags"][0],
+        "Dienstreise"
+    );
+    let tags = call(&mut mcp, "list_tags", json!({}));
+    let tag = tags["structuredContent"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "Dienstreise")
+        .expect("the new tag is listed")
+        .clone();
+    assert_eq!(tag["booking_count"], 1);
+    let page = call(&mut mcp, "list_transactions", json!({ "limit": 500 }));
+    let booking = page["structuredContent"]["transactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == id)
+        .unwrap()
+        .clone();
+    assert_eq!(booking["category_id"], category);
+    assert_eq!(booking["category_source"], "manual");
+    assert_eq!(booking["tags"], json!(["Dienstreise"]));
+
+    let scope = app.vault.local_api_scope().unwrap();
+    app.vault
+        .set_local_api_scope(ShareScope {
+            allow_edits: false,
+            ..scope
+        })
+        .unwrap();
+    let refused = call(
+        &mut mcp,
+        "set_tags",
+        json!({ "transaction_ids": [id], "remove": ["Dienstreise"] }),
+    );
+    assert_eq!(refused["isError"], true);
+    assert!(text(&refused).contains("turned off"), "{}", text(&refused));
+    app.server.stop();
+}
+
+#[test]
 fn the_adapter_speaks_the_cores_protocol() {
     assert_eq!(girocrab_mcp::API_VERSION, API_VERSION);
     let dir = ShortDir::new();
@@ -100,8 +173,17 @@ fn the_adapter_speaks_the_cores_protocol() {
         .handle(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
         .unwrap()["result"]["tools"]
         .clone();
+    let categories: Value = serde_json::from_str(
+        &app.vault
+            .local_api_request(r#"{"v":1,"method":"categories"}"#),
+    )
+    .unwrap();
+    let category = categories["result"][0]["id"].clone();
     let sample = |name: &str, schema: &Value| -> Value {
         match name {
+            "category_id" => category.clone(),
+            "add" => json!(["Probe"]),
+            "remove" => json!(["Andere"]),
             "date_from" => json!("2026-01-01"),
             "date_to" => json!("2026-06-30"),
             "direction" => json!("all"),
@@ -157,13 +239,39 @@ fn the_apps_connection_limit_is_waited_out() {
     let dir = ShortDir::new();
     let app = serve(&dir);
     // Other programs hold every connection the app allows (MAX_CLIENTS = 4 in
-    // the core's server.rs).
+    // the core's server.rs). A connection counts as held only once the server
+    // answered on it: a connect alone may still be in the backlog, or get
+    // `busy` while the server has not yet let go of an earlier connection
+    // (the server then closes it, and a slot frees up later). No fixed sleeps,
+    // so a slow runner only makes this take longer (#1032).
     let hold = || -> Vec<UnixStream> {
-        let held = (0..4)
-            .map(|_| UnixStream::connect(&app.socket).unwrap())
-            .collect();
-        std::thread::sleep(Duration::from_millis(200));
-        held
+        let request = format!(
+            "{}\n",
+            json!({ "v": API_VERSION, "token": app.token, "method": "info", "params": {} })
+        );
+        let give_up = Instant::now() + Duration::from_secs(20);
+        (0..4)
+            .map(|_| {
+                loop {
+                    let mut stream = UnixStream::connect(&app.socket).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    // Fails if the server already answered `busy` and closed (it
+                    // does not read first); that answer is still there to read.
+                    let _ = stream.write_all(request.as_bytes());
+                    let mut line = String::new();
+                    BufReader::new(&stream).read_line(&mut line).unwrap();
+                    let answer: Value = serde_json::from_str(&line).unwrap();
+                    if answer.get("result").is_some() {
+                        break stream; // served: this connection holds a slot
+                    }
+                    assert_eq!(answer["error"]["code"], "busy", "{answer}");
+                    assert!(Instant::now() < give_up, "connections never freed up");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+            .collect()
     };
     let held = hold();
     let release = std::thread::spawn(move || {

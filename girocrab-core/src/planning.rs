@@ -11,6 +11,9 @@ use crate::iban::normalize_iban;
 use crate::models::*;
 use crate::vault::Vault;
 
+mod split_ids;
+pub(crate) use split_ids::migrate as stable_split_ids;
+
 pub(crate) const PLANNING_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS transaction_splits (
     id             INTEGER PRIMARY KEY,
@@ -30,6 +33,33 @@ CREATE TABLE IF NOT EXISTS transfer_templates (
     default_amount_cents INTEGER,
     default_purpose      TEXT    NOT NULL DEFAULT ''
 );";
+
+/// Whether a booking in `currency` enters the sums (category totals, history, KPI tiles) of a
+/// selection of `account_count` accounts (#1049, as in `balances::chosen` and #569): one account
+/// counts in its own currency, several (or all) only EUR; amounts in other currencies are never
+/// added to them. An empty currency is EUR.
+pub(crate) fn counts_in_sums(account_count: usize, currency: &str) -> bool {
+    account_count == 1 || currency.is_empty() || currency.eq_ignore_ascii_case("EUR")
+}
+
+/// SQL condition on `t` that is `counts_in_sums` for the whole selection.
+pub(crate) fn sums_condition(account_count: usize) -> &'static str {
+    if account_count == 1 {
+        ""
+    } else {
+        " AND t.currency COLLATE NOCASE IN ('', 'EUR')"
+    }
+}
+
+/// Whether any live booking is in a currency other than EUR: the cheap check that lets the
+/// "Zusätzlich" queries return at once for the many vaults that have none.
+pub(crate) fn has_other_currencies(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM transactions WHERE deleted_ms IS NULL AND upper(currency) NOT IN ('', 'EUR'))",
+        [],
+        |r| r.get(0),
+    )
+}
 
 /// Bookings as (category_id, amount_cents, booking_date) rows where a split
 /// booking contributes its split amounts instead of the parent category.
@@ -53,9 +83,7 @@ pub(crate) fn effective_sql(extra: &str, condition: &str) -> String {
 
 fn month_range(year: i32, month: u32) -> Result<(String, String), CoreError> {
     if !(1..=12).contains(&month) {
-        return Err(CoreError::InvalidInput {
-            message: tr("Ungültiger Monat.").into(),
-        });
+        return Err(CoreError::invalid(tr("Ungültiger Monat.")));
     }
     Ok((
         format!("{year:04}-{month:02}-01"),
@@ -74,9 +102,7 @@ impl Vault {
         budget_cents: Option<i64>,
     ) -> Result<(), CoreError> {
         if budget_cents.is_some_and(|b| b <= 0) {
-            return Err(CoreError::InvalidInput {
-                message: tr("Das Budget muss größer als 0 sein.").into(),
-            });
+            return Err(CoreError::invalid(tr("Das Budget muss größer als 0 sein.")));
         }
         let db = self.db()?;
         let n = db.execute(
@@ -106,7 +132,8 @@ impl Vault {
             let mut stmt = db.prepare(&format!(
                 "SELECT category_id, SUM(amount_cents) FROM {}
                  WHERE booking_date >= ?1 AND booking_date <= ?2 GROUP BY category_id",
-                effective_sql("", "")
+                // budgets are amounts in EUR: other currencies are never added to them (#1049)
+                effective_sql("", sums_condition(0))
             ))?;
             for row in stmt.query_map(params![from, to], |r| {
                 Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
@@ -197,63 +224,26 @@ impl Vault {
 
     // ------------------------------------------------------------- splits
 
-    /// Replaces the splits of a booking. An empty list removes the split.
-    /// The amounts must add up to the booking amount.
+    /// Replaces the splits of a booking. An empty list removes the split, except on a booking of
+    /// 0 € (it exists only through its parts; that is rejected). The amounts must add up to the
+    /// booking amount.
     pub fn set_transaction_splits(
         &self,
         transaction_id: i64,
         splits: Vec<TransactionSplitInput>,
     ) -> Result<(), CoreError> {
         let mut db = self.db()?;
-        let amount: i64 = db
-            .query_row(
-                "SELECT amount_cents FROM transactions WHERE id = ?1 AND deleted_ms IS NULL",
-                [transaction_id],
-                |r| r.get(0),
-            )
-            .map_err(|_| CoreError::NotFound {
-                what: trf("Buchung {0}", &[&transaction_id]),
-            })?;
-        if !splits.is_empty() {
-            if splits.len() < 2 || splits.iter().any(|s| s.amount_cents == 0) {
-                return Err(CoreError::InvalidInput {
-                    message: tr(
-                        "Eine Splitbuchung braucht mindestens zwei Teilbeträge ungleich 0.",
-                    )
-                    .into(),
-                });
-            }
-            // checked: an overflowing (wrapping) sum must not pass as "equal"
-            let sum = splits
-                .iter()
-                .try_fold(0i64, |acc, s| acc.checked_add(s.amount_cents))
-                .ok_or_else(|| CoreError::InvalidInput {
-                    message: tr("Die Teilbeträge sind zu groß.").into(),
-                })?;
-            if sum != amount {
-                return Err(CoreError::InvalidInput {
-                    message: trf(
-                        "Die Teilbeträge ({0} ¢) ergeben nicht den Buchungsbetrag ({1} ¢).",
-                        &[&sum, &amount],
-                    ),
-                });
-            }
+        let amount = split_booking_amount(&db, transaction_id)?;
+        validate_splits(amount, &splits)?;
+        // a 0-€ booking exists only through its parts: removing them all would leave an empty
+        // booking that no editor can save again (CodeRabbit #1851)
+        if amount == 0 && splits.is_empty() {
+            return Err(CoreError::invalid(tr(
+                "Eine Splitbuchung braucht mindestens zwei Teilbeträge ungleich 0.",
+            )));
         }
         let tx = db.transaction()?;
-        tx.execute(
-            "DELETE FROM transaction_splits WHERE transaction_id = ?1",
-            [transaction_id],
-        )?;
-        for s in &splits {
-            tx.execute(
-                "INSERT INTO transaction_splits(transaction_id, category_id, amount_cents, note) VALUES (?1, ?2, ?3, ?4)",
-                params![transaction_id, s.category_id, s.amount_cents, s.note.trim()],
-            )?;
-        }
-        tx.execute(
-            "UPDATE transactions SET splits_ms = ?1 WHERE id = ?2",
-            params![crate::dates::now_ms(), transaction_id],
-        )?;
+        store_splits(&tx, transaction_id, &splits)?;
         tx.commit()?;
         Ok(())
     }
@@ -263,23 +253,7 @@ impl Vault {
         transaction_id: i64,
     ) -> Result<Vec<TransactionSplit>, CoreError> {
         let db = self.db()?;
-        let mut stmt = db.prepare(
-            "SELECT s.id, s.transaction_id, s.category_id, s.amount_cents, s.note FROM transaction_splits s
-             JOIN transactions t ON t.id = s.transaction_id AND t.deleted_ms IS NULL
-             WHERE s.transaction_id = ?1 ORDER BY s.id",
-        )?;
-        let rows = stmt
-            .query_map([transaction_id], |r| {
-                Ok(TransactionSplit {
-                    id: r.get(0)?,
-                    transaction_id: r.get(1)?,
-                    category_id: r.get(2)?,
-                    amount_cents: r.get(3)?,
-                    note: r.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        read_transaction_splits(&db, transaction_id)
     }
 
     // ----------------------------------------------------------- cashflow
@@ -288,22 +262,26 @@ impl Vault {
     /// current period last; empty periods are included with zeros).
     /// `account_ids` limits the sums to these accounts, so the cashflow card can
     /// follow the sidebar selection (#731); `None` or empty = all accounts.
-    #[uniffi::method(default(account_ids = None))]
+    /// `respect_in_total`: the card as an overall money figure (#337) — only
+    /// accounts of the effective total set contribute. Default `false` keeps
+    /// the proof semantics of a directly requested selection (single account).
+    #[uniffi::method(default(account_ids = None, respect_in_total = false))]
     pub fn cashflow_by_period(
         &self,
         granularity: PeriodGranularity,
         count: u32,
         account_ids: Option<Vec<i64>>,
+        respect_in_total: bool,
     ) -> Result<Vec<PeriodCashflow>, CoreError> {
-        use chrono::{Datelike, Local};
-        let today = Local::now().date_naive();
+        let today = crate::dates::today();
         crate::planning::cashflow_for(
             self,
             granularity,
             count,
             account_ids.as_deref().unwrap_or_default(),
-            today.year(),
-            today.month(),
+            today.year().into(),
+            today.month() as u32,
+            respect_in_total,
         )
     }
 
@@ -337,14 +315,14 @@ impl Vault {
         let rname = template.recipient_name.trim().to_string();
         let iban = normalize_iban(&template.recipient_iban);
         if name.is_empty() || rname.is_empty() || iban.is_empty() {
-            return Err(CoreError::InvalidInput {
-                message: tr("Name, Empfänger und IBAN der Vorlage dürfen nicht leer sein.").into(),
-            });
+            return Err(CoreError::invalid(tr(
+                "Name, Empfänger und IBAN der Vorlage dürfen nicht leer sein.",
+            )));
         }
         if template.default_amount_cents.is_some_and(|c| c <= 0) {
-            return Err(CoreError::InvalidInput {
-                message: tr("Der Vorlagenbetrag muss größer als 0 sein.").into(),
-            });
+            return Err(CoreError::invalid(tr(
+                "Der Vorlagenbetrag muss größer als 0 sein.",
+            )));
         }
         let db = self.db()?;
         let bic = template.recipient_bic.trim().to_uppercase();
@@ -385,6 +363,7 @@ pub(crate) fn cashflow_for(
     account_ids: &[i64],
     year: i32,
     month: u32,
+    respect_in_total: bool,
 ) -> Result<Vec<PeriodCashflow>, CoreError> {
     let count = count.clamp(1, 60) as i32;
     let per_year = match granularity {
@@ -430,14 +409,36 @@ pub(crate) fn cashflow_for(
         PeriodGranularity::Year => format!("{first}-01-01"),
     };
     // Same bookings, transfer detection and flow classification as the booking
-    // list and its KPI tiles (`list_transactions` / `SelectionFlow`).
+    // list and its KPI tiles (`list_transactions` / `SelectionFlow`). In a
+    // totals context (#337) the card is an overall money figure: only accounts
+    // of the effective total set (own switch, group, archiving) contribute —
+    // a directly requested selection (single account) is a proof view and
+    // keeps its sums.
+    // one guard for both reads, so a merge committing in between can never
+    // combine old eligibility with new booking amounts
+    let db = v.db()?;
+    let allowed: Option<std::collections::HashSet<i64>> = if respect_in_total {
+        Some(crate::user_groups::total_account_ids(&db)?)
+    } else {
+        None
+    };
     let filter = BookingFilter {
         account_ids: account_ids.to_vec(),
         date_from: Some(from),
         ..Default::default()
     };
     let mut acc: HashMap<String, (i64, i64)> = HashMap::new();
-    v.visit_bookings(&*v.db()?, &filter, |_, b| {
+    v.visit_bookings(&db, &filter, |_, b| {
+        // other currencies are never added to the sums, unless one account is
+        // selected (#1049); in a totals context only the effective total set
+        // contributes (#337) — a directly requested account is a proof view
+        if !allowed
+            .as_ref()
+            .is_none_or(|set| set.contains(&b.account_id))
+            || !counts_in_sums(account_ids.len(), &b.currency)
+        {
+            return;
+        }
         let (date, amt) = (&b.booking_date, b.amount_cents);
         // Non-ASCII / malformed dates are skipped instead of panicking on a slice.
         let key = match granularity {
@@ -474,9 +475,393 @@ pub(crate) fn cashflow_for(
         .collect())
 }
 
+impl Vault {
+    /// Read the exact booking amount and its stored splits for the split editor.
+    pub fn split_editor_data(
+        &self,
+        transaction_id: i64,
+    ) -> Result<(i64, Vec<TransactionSplit>), CoreError> {
+        let db = self.db()?;
+        let amount = split_booking_amount(&db, transaction_id)?;
+        Ok((amount, read_transaction_splits(&db, transaction_id)?))
+    }
+}
+
+fn split_booking_amount(db: &rusqlite::Connection, transaction_id: i64) -> Result<i64, CoreError> {
+    db.query_row(
+        "SELECT amount_cents FROM transactions WHERE id = ?1 AND deleted_ms IS NULL",
+        [transaction_id],
+        |row| row.get(0),
+    )
+    .map_err(|_| CoreError::NotFound {
+        what: trf("Buchung {0}", &[&transaction_id]),
+    })
+}
+
+fn read_transaction_splits(
+    db: &rusqlite::Connection,
+    transaction_id: i64,
+) -> Result<Vec<TransactionSplit>, CoreError> {
+    let mut stmt = db.prepare(
+        "SELECT s.id, s.transaction_id, s.category_id, s.amount_cents, s.note, s.uuid FROM transaction_splits s
+         JOIN transactions t ON t.id = s.transaction_id AND t.deleted_ms IS NULL
+         WHERE s.transaction_id = ?1 ORDER BY s.position, s.id",
+    )?;
+    Ok(stmt
+        .query_map([transaction_id], |r| {
+            Ok(TransactionSplit {
+                id: r.get(0)?,
+                uuid: r.get(5)?,
+                transaction_id: r.get(1)?,
+                category_id: r.get(2)?,
+                amount_cents: r.get(3)?,
+                note: r.get(4)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?)
+}
+
+#[derive(Debug, PartialEq, Eq, uniffi::Enum)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SplitDraftProblem {
+    Unreadable,
+    ZeroPart,
+    OutOfRange,
+}
+
+#[derive(Debug, PartialEq, Eq, uniffi::Record)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SplitDraft {
+    /// Parsed inputs in ledger sign, for displaying an entered percentage as money.
+    pub split_off_cents: Vec<Option<i64>>,
+    /// Remainder in ledger sign, even when the draft has a zero part or an invalid running sum.
+    pub rest_cents: Option<i64>,
+    pub rest_is_negative: bool,
+    pub problem: Option<SplitDraftProblem>,
+    /// Ledger amounts in save order. Only present when the vault's amount rules pass.
+    pub amounts_to_save: Option<Vec<i64>>,
+}
+
+/// Interpret the split-off fields and allocate the remainder to the first part.
+/// An empty field previews as zero. An untouched draft has no validation hint.
+pub fn calculate_split_draft(booking_cents: i64, split_off_texts: &[String]) -> SplitDraft {
+    let split_off_cents = split_off_texts
+        .iter()
+        .map(|text| {
+            if text.trim().is_empty() {
+                Some(0)
+            } else {
+                crate::money::parse_split_part_in_ledger_sign(text, booking_cents).ok()
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut draft = SplitDraft {
+        split_off_cents,
+        rest_cents: None,
+        rest_is_negative: false,
+        problem: None,
+        amounts_to_save: None,
+    };
+    let Some(split_off) = draft
+        .split_off_cents
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+    else {
+        draft.problem = Some(SplitDraftProblem::Unreadable);
+        return draft;
+    };
+
+    // The remainder depends on the mathematical sum. The vault checks intermediate
+    // i64 sums separately, starting with the remainder in save order.
+    let rest = i128::from(booking_cents) - split_off.iter().copied().map(i128::from).sum::<i128>();
+    draft.rest_cents = i64::try_from(rest).ok();
+    draft.rest_is_negative = draft
+        .rest_cents
+        .is_some_and(|rest| rest != 0 && (rest < 0) != (booking_cents < 0));
+    if split_off_texts.iter().all(|text| text.trim().is_empty()) {
+        return draft;
+    }
+
+    let Some(rest) = draft.rest_cents else {
+        draft.problem = Some(SplitDraftProblem::OutOfRange);
+        return draft;
+    };
+    let amounts = std::iter::once(rest).chain(split_off).collect::<Vec<_>>();
+    match check_split_amounts(booking_cents, amounts.iter().copied()) {
+        Ok(()) => draft.amounts_to_save = Some(amounts),
+        Err(SplitAmountError::ZeroPart) => draft.problem = Some(SplitDraftProblem::ZeroPart),
+        Err(_) => draft.problem = Some(SplitDraftProblem::OutOfRange),
+    }
+    draft
+}
+
+/// Whether the stored amounts still add up to the booking, for the editor's warning.
+pub fn split_amounts_match(booking_cents: i64, amounts: impl IntoIterator<Item = i64>) -> bool {
+    amounts.into_iter().map(i128::from).sum::<i128>() == i128::from(booking_cents)
+}
+
+enum SplitAmountError {
+    ZeroPart,
+    Overflow,
+    WrongTotal(i64),
+}
+
+fn check_split_amounts(
+    amount: i64,
+    mut amounts: impl ExactSizeIterator<Item = i64> + Clone,
+) -> Result<(), SplitAmountError> {
+    if amounts.len() < 2 || amounts.clone().any(|part| part == 0) {
+        return Err(SplitAmountError::ZeroPart);
+    }
+    let sum = amounts
+        .try_fold(0i64, i64::checked_add)
+        .ok_or(SplitAmountError::Overflow)?;
+    if sum != amount {
+        return Err(SplitAmountError::WrongTotal(sum));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_splits(
+    amount: i64,
+    splits: &[TransactionSplitInput],
+) -> Result<(), CoreError> {
+    if splits.is_empty() {
+        return Ok(());
+    }
+    check_split_amounts(amount, splits.iter().map(|s| s.amount_cents)).map_err(|err| match err {
+        SplitAmountError::ZeroPart => CoreError::invalid(tr(
+            "Eine Splitbuchung braucht mindestens zwei Teilbeträge ungleich 0.",
+        )),
+        SplitAmountError::Overflow => CoreError::invalid(tr("Die Teilbeträge sind zu groß.")),
+        SplitAmountError::WrongTotal(sum) => CoreError::invalid(trf(
+            "Die Teilbeträge ({0} ¢) ergeben nicht den Buchungsbetrag ({1} ¢).",
+            &[&sum, &amount],
+        )),
+    })
+}
+
+/// Replaces the splits of booking `id`, retaining the identities of kept parts,
+/// and stamps `splits_ms`. The amounts are the caller's to check.
+pub(crate) fn store_splits(
+    conn: &rusqlite::Connection,
+    id: i64,
+    lines: &[TransactionSplitInput],
+) -> Result<(), CoreError> {
+    // a part never names a deleted category: its row stays, so the foreign key alone lets it
+    // pass (CodeRabbit #1855)
+    for category in lines.iter().filter_map(|l| l.category_id) {
+        let live: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM categories WHERE id = ?1 AND deleted_ms IS NULL)",
+            )?
+            .query_row([category], |r| r.get(0))?;
+        if !live {
+            return Err(CoreError::NotFound {
+                what: trf("Kategorie {0}", &[&category]),
+            });
+        }
+    }
+    let existing = conn
+        .prepare_cached("SELECT uuid FROM transaction_splits WHERE transaction_id=?1")?
+        .query_map([id], |r| r.get::<_, String>(0))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    let mut kept = std::collections::HashSet::new();
+    let mut uuids = Vec::with_capacity(lines.len());
+    for line in lines {
+        let uuid = match &line.uuid {
+            Some(uuid) if existing.contains(uuid) && kept.insert(uuid.clone()) => uuid.clone(),
+            Some(_) => {
+                return Err(CoreError::invalid(tr(
+                    "Die Teilbuchung existiert nicht oder wurde mehrfach angegeben.",
+                )));
+            }
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        uuids.push(uuid);
+    }
+    let referenced = conn
+        .prepare_cached(
+            "SELECT s.uuid,s.amount_cents,EXISTS(SELECT 1 FROM refund_links l WHERE (l.deleted_ms IS NULL OR (NOT l.moved AND l.unlink_id != '')) AND ((l.refund_id=s.transaction_id AND l.refund_part=s.uuid) OR (l.original_id=s.transaction_id AND l.original_part=s.uuid))) FROM transaction_splits s WHERE s.transaction_id=?1",
+        )?
+        .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    // all removed parts compete for an inheritance, referenced or not (ADR 0004): another removed
+    // part of the same amount makes it ambiguous
+    let mut removed = std::collections::HashMap::<i64, Vec<(String, bool)>>::new();
+    for (uuid, amount, referenced) in referenced {
+        if !kept.contains(&uuid) {
+            removed.entry(amount).or_default().push((uuid, referenced));
+        }
+    }
+    let mut added = std::collections::HashMap::<i64, Vec<usize>>::new();
+    for (position, line) in lines.iter().enumerate().filter(|(_, l)| l.uuid.is_none()) {
+        added.entry(line.amount_cents).or_default().push(position);
+    }
+    for (amount, old) in removed {
+        if let ([(uuid, true)], Some(new)) = (old.as_slice(), added.get(&amount))
+            && let [position] = new.as_slice()
+        {
+            uuids[*position] = uuid.clone();
+            kept.insert(uuid.clone());
+        }
+    }
+    for uuid in existing.difference(&kept) {
+        conn.execute("DELETE FROM transaction_splits WHERE uuid=?1", [uuid])?;
+    }
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO transaction_splits(transaction_id, category_id, amount_cents, note, uuid, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(uuid) DO UPDATE SET category_id=excluded.category_id, amount_cents=excluded.amount_cents, note=excluded.note, position=excluded.position",
+    )?;
+    for (position, (line, uuid)) in lines.iter().zip(uuids).enumerate() {
+        insert.execute(params![
+            id,
+            line.category_id,
+            line.amount_cents,
+            line.note.trim(),
+            uuid,
+            position as i64
+        ])?;
+    }
+    conn.prepare_cached(
+        "UPDATE transactions SET splits_ms = MAX(splits_ms + 1, ?2) WHERE id = ?1",
+    )?
+    .execute(params![id, crate::dates::now_ms()])?;
+    Ok(())
+}
+
+/// Gives the parts of booking `id` UUIDs derived from the booking's sync key and each part's
+/// content (category, amount, note, occurrence) with the recipe of the schema 39 backfill: an
+/// import that creates the same parts on two devices, or before and after the upgrade on
+/// another device, gives them the same identities. A UUID already taken
+/// elsewhere keeps the random one; a UUID a refund link names (live or undoable) is kept, so the
+/// link still finds its part after a reimport.
+pub(crate) fn derive_split_uuids(conn: &rusqlite::Connection, id: i64) -> Result<(), CoreError> {
+    let identity = split_ids::booking_identity(conn, id)?;
+    let parts: Vec<(String, i64, String, Option<String>)> = conn
+        .prepare_cached(
+            "SELECT s.uuid, s.amount_cents, s.note, c.uuid FROM transaction_splits s
+               LEFT JOIN categories c ON c.id = s.category_id
+              WHERE s.transaction_id = ?1 ORDER BY s.position, s.id",
+        )?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut occurrences = HashMap::new();
+    for (uuid, amount, note, category) in parts {
+        let occurrence = occurrences
+            .entry((category.clone(), amount, note.clone()))
+            .or_insert(0u64);
+        let stable = split_ids::part_uuid(&identity, &category, amount, &note, *occurrence);
+        *occurrence += 1;
+        conn.execute(
+            "UPDATE OR IGNORE transaction_splits SET uuid = ?2 WHERE transaction_id = ?1 AND uuid = ?3
+               AND NOT EXISTS (SELECT 1 FROM refund_links l
+                                WHERE (l.refund_id = ?1 AND l.refund_part = ?3)
+                                   OR (l.original_id = ?1 AND l.original_part = ?3))",
+            params![id, stable, uuid],
+        )?;
+    }
+    Ok(())
+}
+
+/// A booking turned into a split booking by an import keeps no category of its
+/// own (its splits carry them, #654), unless the user set it.
+pub(crate) fn clear_split_category(conn: &rusqlite::Connection, id: i64) -> Result<(), CoreError> {
+    conn.prepare_cached(
+        "UPDATE transactions SET category_id = NULL, category_source = 'none', rule_id = NULL, category_ms = ?2
+          WHERE id = ?1 AND category_id IS NOT NULL AND category_source != 'manual'",
+    )?
+    .execute(params![id, crate::dates::now_ms()])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draft(booking_cents: i64, texts: &[&str]) -> SplitDraft {
+        calculate_split_draft(
+            booking_cents,
+            &texts.iter().map(|text| (*text).into()).collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn split_draft_reports_input_problems_and_keeps_the_odd_cent() {
+        let blank = draft(8_743, &[" "]);
+        assert_eq!(blank.rest_cents, Some(8_743));
+        assert_eq!(blank.problem, None);
+        assert_eq!(blank.amounts_to_save, None);
+        assert_eq!(
+            draft(8_743, &["half"]).problem,
+            Some(SplitDraftProblem::Unreadable)
+        );
+        assert_eq!(
+            draft(8_743, &["50%", ""]).problem,
+            Some(SplitDraftProblem::ZeroPart)
+        );
+        assert_eq!(
+            draft(8_743, &["87,43"]).problem,
+            Some(SplitDraftProblem::ZeroPart)
+        );
+        assert_eq!(
+            draft(8_743, &["43,71"]).amounts_to_save,
+            Some(vec![4_372, 4_371])
+        );
+        assert_eq!(
+            draft(-8_743, &["50%"]).amounts_to_save,
+            Some(vec![-4_372, -4_371])
+        );
+
+        let counter = draft(-5_900, &["200"]);
+        assert!(counter.rest_is_negative);
+        assert_eq!(counter.rest_cents, Some(14_100));
+        assert_eq!(counter.amounts_to_save, Some(vec![14_100, -20_000]));
+    }
+
+    #[test]
+    fn split_draft_checks_the_vaults_signed_addition_order() {
+        let overflowing = draft(1, &["92233720368547758,07", "-92233720368547758,08"]);
+        assert_eq!(overflowing.rest_cents, Some(2));
+        assert_eq!(overflowing.problem, Some(SplitDraftProblem::OutOfRange));
+        assert_eq!(overflowing.amounts_to_save, None);
+        assert_eq!(
+            draft(1, &["92233720368547758", "92233720368547758"]).problem,
+            Some(SplitDraftProblem::OutOfRange)
+        );
+
+        // The vault accepts this signed order even though subtracting the sum of the
+        // later parts in i64 would overflow.
+        let (v, dir) = vault();
+        let id = tx(&v, "extreme-split", "2026-01-01", i64::MIN, None);
+        for text in ["100%", "92233720368547758,08"] {
+            let draft = draft(i64::MIN, &[text, "0,01"]);
+            let amounts = draft.amounts_to_save.unwrap();
+            assert_eq!(amounts, vec![1, i64::MIN, -1]);
+            v.set_transaction_splits(
+                id,
+                amounts
+                    .into_iter()
+                    .map(|amount_cents| TransactionSplitInput {
+                        uuid: None,
+                        category_id: None,
+                        amount_cents,
+                        note: String::new(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        }
+        let (amount, parts) = v.split_editor_data(id).unwrap();
+        assert_eq!(amount, i64::MIN);
+        assert!(split_amounts_match(
+            amount,
+            parts.iter().map(|part| part.amount_cents)
+        ));
+        drop(v);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn vault() -> (std::sync::Arc<Vault>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -513,6 +898,233 @@ mod tests {
         )
         .unwrap();
         c.last_insert_rowid()
+    }
+
+    #[test]
+    fn editing_splits_retains_uuids_rows_and_winner_order() {
+        let (v, dir) = vault();
+        let id = tx(&v, "identity", "2025-01-01", -100, None);
+        let input = |uuid, amount| TransactionSplitInput {
+            uuid,
+            category_id: None,
+            amount_cents: amount,
+            note: " note ".into(),
+        };
+        assert!(v.list_transaction_splits(id).unwrap().is_empty());
+        v.set_transaction_splits(id, vec![input(None, -40), input(None, -60)])
+            .unwrap();
+        let before = v.list_transaction_splits(id).unwrap();
+        v.set_transaction_splits(
+            id,
+            vec![
+                input(Some(before[1].uuid.clone()), -50),
+                input(Some(before[0].uuid.clone()), -30),
+                input(None, -20),
+            ],
+        )
+        .unwrap();
+        let after = v.list_transaction_splits(id).unwrap();
+        assert_eq!(
+            (after[0].id, &after[0].uuid),
+            (before[1].id, &before[1].uuid)
+        );
+        assert_eq!(
+            (after[1].id, &after[1].uuid),
+            (before[0].id, &before[0].uuid)
+        );
+        assert!(after.iter().all(|p| p.note == "note"));
+        assert!(before.iter().all(|p| p.uuid != after[2].uuid));
+        let bad = vec![
+            input(Some(before[0].uuid.clone()), -40),
+            input(Some(before[0].uuid.clone()), -60),
+        ];
+        assert!(v.set_transaction_splits(id, bad).is_err());
+        assert!(
+            v.set_transaction_splits(
+                id,
+                vec![input(Some("missing".into()), -40), input(None, -60)]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            v.list_transaction_splits(id)
+                .unwrap()
+                .iter()
+                .map(|p| &p.uuid)
+                .collect::<Vec<_>>(),
+            after.iter().map(|p| &p.uuid).collect::<Vec<_>>()
+        );
+        v.set_transaction_splits(
+            id,
+            vec![
+                input(Some(after[2].uuid.clone()), -70),
+                input(Some(after[0].uuid.clone()), -30),
+            ],
+        )
+        .unwrap();
+        assert_eq!(v.list_transaction_splits(id).unwrap().len(), 2);
+        assert_eq!(
+            v.db()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM transaction_splits WHERE uuid=?1",
+                    [&before[0].uuid],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        v.set_transaction_splits(id, vec![]).unwrap();
+        assert!(v.list_transaction_splits(id).unwrap().is_empty());
+        drop(v);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// CodeRabbit (#1853): an import's parts get content-derived UUIDs, the same each time
+    /// the same parts are imported for the same booking.
+    #[test]
+    fn imported_parts_get_content_derived_uuids() {
+        let (v, dir) = vault();
+        let id = tx(&v, "import", "2025-01-01", -100, None);
+        let part = |amount, note: &str| TransactionSplitInput {
+            uuid: None,
+            category_id: None,
+            amount_cents: amount,
+            note: note.into(),
+        };
+        let lines = vec![part(-40, "a"), part(-40, "a"), part(-20, "b")];
+        let import = || {
+            let db = v.db().unwrap();
+            store_splits(&db, id, &lines).unwrap();
+            derive_split_uuids(&db, id).unwrap();
+            drop(db);
+            v.list_transaction_splits(id)
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.amount_cents, p.uuid))
+                .collect::<Vec<_>>()
+        };
+        let first = import();
+        v.db()
+            .unwrap()
+            .execute("DELETE FROM transaction_splits", [])
+            .unwrap();
+        assert_eq!(import(), first);
+        assert!(
+            first
+                .iter()
+                .all(|(_, u)| uuid::Uuid::parse_str(u).unwrap().get_version_num() == 5)
+        );
+        // the recipe of the schema 39 backfill: migrated and freshly imported parts agree
+        {
+            let db = v.db().unwrap();
+            let identity = split_ids::booking_identity(&db, id).unwrap();
+            assert_eq!(
+                first[2].1,
+                split_ids::part_uuid(&identity, &None, -20, "b", 0)
+            );
+            assert_eq!(
+                first[1].1,
+                split_ids::part_uuid(&identity, &None, -40, "a", 1)
+            );
+        }
+        // a part a refund link names keeps its UUID when a reimport would derive another one
+        let linked = first[2].1.clone();
+        let refund = tx(&v, "refund", "2025-01-05", 20, None);
+        let changed = vec![part(-40, "a"), part(-40, "a"), part(-20, "b neu")];
+        let keep: Vec<_> = v
+            .list_transaction_splits(id)
+            .unwrap()
+            .into_iter()
+            .zip(changed)
+            .map(|(old, mut new)| {
+                new.uuid = Some(old.uuid);
+                new
+            })
+            .collect();
+        {
+            let db = v.db().unwrap();
+            db.execute(
+                "INSERT INTO refund_links(refund_id, refund_part, original_id, original_part,
+                     refund_cents, original_cents, created_ms, changed_ms)
+                 VALUES (?1, '', ?2, ?3, 20, 20, 1, 1)",
+                params![refund, id, linked],
+            )
+            .unwrap();
+            store_splits(&db, id, &keep).unwrap();
+            derive_split_uuids(&db, id).unwrap();
+        }
+        assert_eq!(v.list_transaction_splits(id).unwrap()[2].uuid, linked);
+        drop(v);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// ADR 0004: A (−40, linked) and B (−40, unlinked) become one new −40 part, C goes from −20
+    /// to −60. Two removed parts of that amount: no inheritance, A's link goes inactive.
+    #[test]
+    fn unreferenced_removed_parts_still_make_uuid_inheritance_ambiguous() {
+        let (v, dir) = vault();
+        let id = tx(&v, "inherit", "2025-01-01", -100, None);
+        let part = |uuid, amount| TransactionSplitInput {
+            uuid,
+            category_id: None,
+            amount_cents: amount,
+            note: String::new(),
+        };
+        v.set_transaction_splits(id, vec![part(None, -40), part(None, -40), part(None, -20)])
+            .unwrap();
+        let parts = v.list_transaction_splits(id).unwrap();
+        let refund = tx(&v, "inherit-refund", "2025-01-05", 40, None);
+        v.db()
+            .unwrap()
+            .execute(
+                "INSERT INTO refund_links(refund_id, refund_part, original_id, original_part,
+                     refund_cents, original_cents, created_ms, changed_ms)
+                 VALUES (?1, '', ?2, ?3, 40, 40, 1, 1)",
+                params![refund, id, parts[0].uuid],
+            )
+            .unwrap();
+        v.set_transaction_splits(
+            id,
+            vec![part(None, -40), part(Some(parts[2].uuid.clone()), -60)],
+        )
+        .unwrap();
+        let after = v.list_transaction_splits(id).unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(
+            after
+                .iter()
+                .all(|p| p.uuid != parts[0].uuid && p.uuid != parts[1].uuid)
+        );
+        drop(v);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// CodeRabbit (#1855): a part never names a soft-deleted category.
+    #[test]
+    fn parts_never_name_a_deleted_category() {
+        let (v, dir) = vault();
+        let gone = cat(&v, "Test-Weg", None);
+        let id = tx(&v, "deleted-cat", "2025-01-01", -100, None);
+        v.db()
+            .unwrap()
+            .execute("UPDATE categories SET deleted_ms = 1 WHERE id = ?1", [gone])
+            .unwrap();
+        let part = |category, amount| TransactionSplitInput {
+            uuid: None,
+            category_id: category,
+            amount_cents: amount,
+            note: String::new(),
+        };
+        assert!(
+            v.set_transaction_splits(id, vec![part(Some(gone), -40), part(None, -60)])
+                .is_err()
+        );
+        assert!(v.list_transaction_splits(id).unwrap().is_empty());
+        v.set_transaction_splits(id, vec![part(None, -40), part(None, -60)])
+            .unwrap();
+        drop(v);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -554,10 +1166,11 @@ mod tests {
             .category_history(ins, vec![], Some("2025-02-01".into()), None)
             .unwrap();
         assert_eq!(h.len(), 1);
-        assert!(v
-            .category_history(ins, vec![-1], None, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            v.category_history(ins, vec![-1], None, None)
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -569,14 +1182,16 @@ mod tests {
         v.set_category_budget(b, Some(5_000)).unwrap();
         let id = tx(&v, "1", "2025-05-02", -3_000, Some(a));
         let inp = |c, amount| TransactionSplitInput {
+            uuid: None,
             category_id: Some(c),
             amount_cents: amount,
             note: String::new(),
         };
         // wrong sum / single part rejected
-        assert!(v
-            .set_transaction_splits(id, vec![inp(a, -1_000), inp(b, -1_000)])
-            .is_err());
+        assert!(
+            v.set_transaction_splits(id, vec![inp(a, -1_000), inp(b, -1_000)])
+                .is_err()
+        );
         assert!(v.set_transaction_splits(id, vec![inp(a, -3_000)]).is_err());
         v.set_transaction_splits(id, vec![inp(a, -1_000), inp(b, -2_000)])
             .unwrap();
@@ -605,6 +1220,7 @@ mod tests {
         let b = cat(&v, "Test-B", None);
         let id = tx(&v, "1", "2025-05-02", 5_900, Some(a));
         let inp = |c, amount| TransactionSplitInput {
+            uuid: None,
             category_id: Some(c),
             amount_cents: amount,
             note: String::new(),
@@ -615,12 +1231,14 @@ mod tests {
         assert_eq!(parts.iter().map(|p| p.amount_cents).sum::<i64>(), 5_900);
         assert!(parts.iter().any(|p| p.amount_cents == -14_100));
         // signed sum off, or a zero part: still rejected
-        assert!(v
-            .set_transaction_splits(id, vec![inp(a, 20_000), inp(b, -14_000)])
-            .is_err());
-        assert!(v
-            .set_transaction_splits(id, vec![inp(a, 5_900), inp(b, 0)])
-            .is_err());
+        assert!(
+            v.set_transaction_splits(id, vec![inp(a, 20_000), inp(b, -14_000)])
+                .is_err()
+        );
+        assert!(
+            v.set_transaction_splits(id, vec![inp(a, 5_900), inp(b, 0)])
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -661,19 +1279,19 @@ mod tests {
         tx(&v, "2", "2025-02-10", -30_000, None);
         tx(&v, "3", "2025-05-10", -10_000, None);
         tx(&v, "4", "2024-12-31", -5_000, None);
-        let m = cashflow_for(&v, PeriodGranularity::Month, 3, &[], 2025, 2).unwrap();
+        let m = cashflow_for(&v, PeriodGranularity::Month, 3, &[], 2025, 2, false).unwrap();
         assert_eq!(
             m.iter().map(|p| p.key.as_str()).collect::<Vec<_>>(),
             ["2024-12", "2025-01", "2025-02"]
         );
         assert_eq!((m[1].income_cents, m[2].expense_cents), (100_000, 30_000));
-        let q = cashflow_for(&v, PeriodGranularity::Quarter, 2, &[], 2025, 5).unwrap();
+        let q = cashflow_for(&v, PeriodGranularity::Quarter, 2, &[], 2025, 5, false).unwrap();
         assert_eq!(q[0].key, "2025-Q1");
         assert_eq!(
             (q[0].income_cents, q[0].expense_cents, q[1].expense_cents),
             (100_000, 30_000, 10_000)
         );
-        let y = cashflow_for(&v, PeriodGranularity::Year, 2, &[], 2025, 5).unwrap();
+        let y = cashflow_for(&v, PeriodGranularity::Year, 2, &[], 2025, 5, false).unwrap();
         assert_eq!(
             (y[0].key.as_str(), y[0].expense_cents, y[1].expense_cents),
             ("2024", 5_000, 40_000)
@@ -691,11 +1309,13 @@ mod tests {
             id,
             vec![
                 TransactionSplitInput {
+                    uuid: None,
                     category_id: Some(food),
                     amount_cents: -1_000,
                     note: String::new(),
                 },
                 TransactionSplitInput {
+                    uuid: None,
                     category_id: Some(fun),
                     amount_cents: -2_000,
                     note: String::new(),
@@ -729,23 +1349,26 @@ mod tests {
             .unwrap();
         assert!(unc.transactions.iter().all(|t| t.id != id));
         // overflowing parts are rejected instead of wrapping to the booking amount
-        assert!(v
-            .set_transaction_splits(
+        assert!(
+            v.set_transaction_splits(
                 id,
                 vec![
                     TransactionSplitInput {
+                        uuid: None,
                         category_id: Some(food),
                         amount_cents: i64::MAX,
                         note: String::new(),
                     },
                     TransactionSplitInput {
+                        uuid: None,
                         category_id: Some(fun),
                         amount_cents: i64::MAX,
                         note: String::new(),
                     },
                 ],
             )
-            .is_err());
+            .is_err()
+        );
         let csv = v.export_bookings_csv(f).unwrap();
         assert!(csv.starts_with(
             "\u{FEFF}Datum;Konto;Name;IBAN;Verwendungszweck;Kategorie;Betrag;Währung;Tags\r\n"
@@ -756,10 +1379,9 @@ mod tests {
 
     #[test]
     fn cashflow_ignores_transfers_between_own_accounts() {
-        use chrono::{Datelike, Local};
         let (v, dir) = vault();
-        let today = Local::now().date_naive();
-        let date = today.format("%Y-%m-%d").to_string();
+        let today = crate::dates::today();
+        let date = crate::dates::iso(today);
         {
             let c = v.db().unwrap();
             c.execute(
@@ -780,8 +1402,9 @@ mod tests {
             PeriodGranularity::Month,
             1,
             &[],
-            today.year(),
-            today.month(),
+            today.year().into(),
+            today.month() as u32,
+            false,
         )
         .unwrap();
         assert_eq!(cf.last().unwrap().expense_cents, 1_000);
@@ -818,7 +1441,8 @@ mod tests {
             )
             .unwrap();
         let expense = |ids: &[i64]| {
-            cashflow_for(&v, PeriodGranularity::Month, 1, ids, 2025, 2).unwrap()[0].expense_cents
+            cashflow_for(&v, PeriodGranularity::Month, 1, ids, 2025, 2, false).unwrap()[0]
+                .expense_cents
         };
         assert_eq!(expense(&[]), 10_000);
         assert_eq!(expense(&[first]), 3_000);

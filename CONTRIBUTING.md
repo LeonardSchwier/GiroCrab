@@ -32,7 +32,12 @@ built dependencies and the xcframework; `--deep` also runs `cargo clean` and rem
 Database schema changes are a new migration step plus a fixture vault, see
 [Schema & migrations](docs/ARCHITECTURE.md#schema--migrations).
 
+For lasting architecture decisions, see [how to submit an ADR](docs/adr/README.md#process).
+
 ## Adding a bank in 3 steps
+
+The [ADR 0001 proposal](docs/adr/0001-connector-architecture.md) describes the
+division of work between the connector, core and front end.
 
 1. **Copy the template.** `cp girocrab-core/src/connectors/template.rs girocrab-core/src/connectors/<bank>.rs`
    and implement `begin` (login / challenge), `respond` (TAN/poll) and `fetch` (accounts + bookings).
@@ -44,7 +49,8 @@ Database schema changes are a new migration step plus a fixture vault, see
    in `sync_session.rs` / `transfer_session.rs`, and storing fetched data is `persist.rs`.
    File importers (database, CSV/CAMT/MT940, portal imports) are not connectors: see
    `girocrab-core/src/importers/`.
-   Add the Swift display name/colour in `GiroCrabUI/Formatting.swift`.
+   For curated PSD2 presets, add the bank to `psd2_catalog()` in `connectors/bank_directory.rs`.
+   Add the Swift display name/colour in `GiroCrabUI/Formatting.swift` and run `bash scripts/lint-connectors.sh`.
 3. **Test it with fake data.** Unit-test your parser with invented fixtures, then check the UI via
    `GIROCRAB_DEMO_SEED=1`. Run `cargo fmt`, `cargo clippy` and `cargo test -p girocrab-core`.
    Optional: `git config core.hooksPath .githooks` runs `cargo fmt --check` before every push, like CI does,
@@ -98,8 +104,7 @@ automatically get a monogram, never a logo.
 ## Testing with demo data
 
 `GIROCRAB_DEMO_SEED=1 cargo run` (or `cargo run -- --demo-seed`) opens a throw-away vault with
-5 fictional accounts, exactly 52 invented bookings and 2 ETF depot positions
-(`girocrab-core/src/demo.rs`). Change the data
+fictional accounts, invented bookings and demo depot positions (`girocrab-core/src/demo.rs`). Change the data
 there only with invented names and amounts.
 
 ## Mit KI-Unterstützung beitragen (In 4 Schritten zum PR) / Contributing with AI Agents
@@ -124,6 +129,8 @@ Erstelle einen neuen Branch, committe die Änderungen mit den AI-Attribution-Tra
 
 New issue authors get this hint once as a comment (`.github/workflows/issue-ai-invite.yml`).
 
+**Kein KI-Abo nötig / No AI subscription required:** Die automatischen Mitbau-Links setzen ein Claude-Abo (Pro/Max) oder API-Zugang für Claude Code voraus (in der kostenlosen Claude-Desktop-App ist der lokale Projektzugriff deaktiviert). Du kannst aber jederzeit auch ohne KI-Abo über normale GitHub-Issues, Screenshots/Skizzen oder klassische Fork-PRs beitragen.
+
 ### 🌟 Community Success Story: Vom anonymisierten Browser-Mitschnitt (HAR) zum eigenen Bank-Connector (#42)
 
 `@zcarsten` hat ohne Rust-Vorkenntnisse einen Connector für seine Bank gebaut – mit einem Browser-Mitschnitt und einer KI:
@@ -134,6 +141,16 @@ New issue authors get this hint once as a comment (`.github/workflows/issue-ai-i
 4. **Teilen:** Noch nicht bereit für einen Pull Request? Kein Problem – hänge den erzeugten `.patch` (`git diff > bank.patch`) einfach direkt im GitHub-Issue an, wie in #42 / PR #642. Wir helfen beim Rest.
 
 **From an anonymized browser capture (HAR) to your own bank connector (#42).** `@zcarsten` built a connector without prior Rust experience: record the bank portal in the browser DevTools (Network tab, export `.har`), anonymize names, IBANs, balances and credentials in the file *before* sharing it, then let Claude Code / Codex build the connector against `girocrab-core/src/connectors/template.rs` and `CLAUDE.md`. If you don't feel ready for a pull request yet, attach the generated `.patch` / `git diff` to the GitHub issue (as in #42 / PR #642) and we'll take it from there.
+
+## Größere Vorhaben & Vorab-Spezifikation / Larger features & architecture alignment
+
+**DE**
+- **Erst abstimmen, dann Code & Tokens einsetzen:** Bei größeren Themen (Plattform-Parität wie Android/Windows/Linux, übergreifende Architektur-Änderungen oder mehrstufige Features) bitte **vor** dem ersten Code-PR ein Architektur-/Tracking-Issue eröffnen: Ist-Stand, vorgeschlagener Stufen-Schnitt, offene Designfragen und geplante Teil-PRs kurz skizzieren. Das spart allen Beteiligten unnötige Review-Schleifen und Agenten-Tokens.
+- **Ablageort für Spezifikationen:** Architektur-Vorschläge und Meilenstein-Pläne werden im **GitHub-Issue** abgestimmt; dauerhafte Architektur-Dokumentation gehört unter `docs/`. Bitte keine externen Planungs- oder Agenten-Verzeichnisse (wie `.cursor/` oder Top-Level-Spec-Frameworks ohne Code) als PR einreichen; im Projekt geteilte Skills unter `.claude/skills/` sind erlaubt, lokale `.claude/`-Dateien (z. B. `settings.local.json`) bitte nicht – unsere Triage-Pipeline ist auf lauffähige, testbare Teil-PRs ausgelegt und hält oder schließt reine Planungs-Bäume automatisch.
+
+**EN**
+- **Align before writing code or spending agent tokens:** For larger efforts (platform parity across Android/Windows/Linux, cross-cutting refactors, or multi-stage features), open an architecture/tracking issue **before** sending code PRs: outline the current gap, proposed stages, open design questions, and small PR slices.
+- **Where specs live:** Discuss proposals and task breakdowns in **GitHub Issues**; lasting architecture docs belong in `docs/`. Do not open PRs that add standalone planning or agent framework trees without runnable changes – our automated triage pipeline expects small, testable slices and closes tool-specific planning trees automatically.
 
 ## Picking up an issue
 
@@ -148,11 +165,16 @@ To avoid two people building the same thing (it has happened, e.g. account group
    and merged on its own.
 4. **Link your PR** with `Closes #123` (or `Refs #123` if it is only part of it).
 5. **Let go if plans change.** If you can't continue, comment `/unassign` (or tell us on the issue) so it can be reassigned.
+6. **Close resolved issues.** If you opened an issue and your question is answered or the problem is fixed, please close it yourself via **Close issue** with a brief closing comment. For issues opened by someone else, leave a short note (e.g. *"Solved via #123, can be closed"*) so the author or a maintainer can close it.
 
 ## Pull requests
 
-* Keep PRs focused; describe what and why.
+* **Keep PRs small and focused (one concern per PR):** Oversized PRs touching dozens of files or bundling multiple features and schema versions are automatically held for splitting. For larger features, split into (1) schema + core logic and (2) UI + tests.
 * CI runs `cargo fmt --check`, `cargo clippy`, `cargo test -p girocrab-core` and a Swift build.
+* CI also runs **Fix-Proof** ([docs/fix-proof.md](docs/fix-proof.md)): new or changed Rust tests run once without
+  your production change and once with it. A `fix:` PR needs at least one test that fails without the fix and
+  passes with it. Check before pushing: `python3 -I tools/fix_proof.py check --base upstream/main`. If a fix cannot
+  be tested automatically, write `Fix-Proof: skip – <reason>` in the PR body.
 * Work through the checklist below. Tick what applies, write "n/a: <why>" for the rest.
 * By contributing you agree to license your work under GPL-3.0-or-later.
 
@@ -174,6 +196,7 @@ fehlende Angabe mit ⚠️.
 - [ ] **Dependencies and licences:** `scripts/check-third-party-notices.sh` passes, and `THIRD_PARTY_NOTICES.md` is updated in the same PR when `Cargo.toml`, `Cargo.lock` or `Package.swift` changed.
 - [ ] **Brand neutrality:** `scripts/lint-brand-names.sh` passes.
 - [ ] **New access:** new network, process or file access is named in the PR description.
+- [ ] **No hidden code:** `unsafe` only in `girocrab-core/src/sys.rs`; `scripts/lint-no-obfuscation.sh` passes (rules in `docs/ARCHITECTURE.md`). An exception is a new entry in that script.
 
 #### ⚡ Performance & Responsiveness (Pflicht / mandatory)
 
@@ -186,7 +209,7 @@ fehlende Angabe mit ⚠️.
 - [ ] **Text size:** text styles use `.appFont(...)` (`scripts/lint-fonts.sh`); check visually with `--screenshot <png> --text-size larger` next to `--text-size standard`.
 - [ ] **Linux / serde:** every `uniffi::Record` / `uniffi::Enum` carries the `serde` `cfg_attr`. `scripts/lint-serde-feature.sh` passes and `cargo check -q -p girocrab-core --features serde` builds.
 - [ ] **iOS:** with `#if os(macOS)` or other platform-specific APIs, the iOS target still builds (`xcodebuild -quiet`, iOS scheme).
-- [ ] **Schema:** a new table or column is a new entry at the end of `STEPS` in `girocrab-core/src/schema.rs`, plus the fixture (`cargo run -q -p girocrab-core --example make_fixture_vault`). Check what `vault/merge.rs` (iCloud merge) does with it. Never edit an existing step.
+- [ ] **Schema:** a new table or column is a new entry at the end of `STEPS` in `girocrab-core/src/schema.rs`, plus the fixture (`cargo run -q -p girocrab-core --example make_fixture_vault`). Describe the step in the module comment of `schema.rs` and in the table of `docs/ARCHITECTURE.md` (checked by `scripts/lint-schema-docs.sh`). Check what `vault/merge.rs` (iCloud merge) does with it. Never edit an existing step.
 - [ ] **Strings:** `scripts/xcstrings.py check` passes.
 - [ ] **Swift tests and `UserDefaults`:** tests that use `UserDefaults.standard` carry `// test: serial-defaults` (run serially after the parallel phase, `scripts/swift-test-split.sh`); own suites always with `\(UUID().uuidString)` (`scripts/lint-test-defaults.sh`).
 - [ ] **Before pushing:** `cargo fmt --all`, `cargo clippy -q --workspace --all-targets -- -D warnings`, `scripts/lint-appmodel-internals.sh`.

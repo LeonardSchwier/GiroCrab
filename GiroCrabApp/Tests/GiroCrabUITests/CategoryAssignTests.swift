@@ -44,12 +44,12 @@ final class CategoryAssignTests: XCTestCase {
         let vault = try XCTUnwrap(model.vault)
         let (from, to) = model.periodRange
         let filter = model.currentFilter
-        let flow = try vault.selectionFlow(accountIds: filter.accountIds, dateFrom: from, dateTo: to)
-        let loans = Set(model.allAccounts.filter { $0.kind == .loan }.map(\.id))
-        let accounts = try vault.listAccounts().filter { !loans.contains($0.id) }
+        let flow = try filter.respectInTotal
+            ? vault.selectionFlowForTotals(accountIds: filter.accountIds, dateFrom: from, dateTo: to)
+            : vault.selectionFlow(accountIds: filter.accountIds, dateFrom: from, dateTo: to)
         return Derived(
             totals: try vault.listCategories(dateFrom: from, dateTo: to).map(\.totalCents),
-            uncategorized: accounts.reduce(0) { $0 + Int($1.uncategorizedCount) },
+            uncategorized: Int(try vault.countTransactions(filter: model.uncategorizedCountFilter(model.categorySumFilter))),
             flow: [flow.consumptionCents, flow.investedCents, flow.incomeCents]
         )
     }
@@ -60,6 +60,39 @@ final class CategoryAssignTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertEqual(derived(), want, "the background refresh did not publish", file: file, line: line)
+    }
+
+    #if os(macOS)
+    func testInlinePickerShowsAllLevelsInSidebarOrder() throws {
+        let categories = Array(model.categories.prefix(4))
+        try XCTSkipUnless(categories.count == 4, "The demo needs four categories")
+        let leaf = CategoryNode(category: categories[2])
+        let child = CategoryNode(category: categories[1], children: [leaf])
+        let root = CategoryNode(category: categories[0], children: [child])
+        let sibling = CategoryNode(category: categories[3])
+
+        let rows = BookingCategoryPicker.rows(for: [root, sibling])
+        XCTAssertEqual(rows.map(\.id), categories.map(\.id))
+        XCTAssertEqual(rows.map(\.depth), [0, 1, 2, 0])
+        XCTAssertEqual(rows.map(\.isGroup), [true, true, false, false])
+    }
+    #endif
+
+    func testPickerAppliesCategoryToSelectionWhenClickedBookingAlreadyHasIt() throws {
+        let clicked = try XCTUnwrap(model.bookings.first { $0.categoryId != nil })
+        let category = try XCTUnwrap(clicked.categoryId)
+        let others = model.bookings.filter { $0.categoryId == nil }
+        let selected = try XCTUnwrap(others.first)
+        let outside = try XCTUnwrap(others.dropFirst().first)
+        model.selectedBookingID = clicked.id
+        model.selectedBookingIDs = [clicked.id, selected.id]
+
+        model.setCategoryFromPicker(category, for: clicked)
+
+        XCTAssertEqual(model.bookings.first { $0.id == clicked.id }?.categorySource, clicked.categorySource)
+        XCTAssertEqual(model.bookings.first { $0.id == selected.id }?.categoryId, category)
+        XCTAssertNil(model.bookings.first { $0.id == outside.id }?.categoryId)
+        XCTAssertEqual(model.selectedBookingIDs, [clicked.id, selected.id])
     }
 
     func testAssignmentShowsAtOnceAndRefreshesInBackground() async throws {
@@ -115,6 +148,28 @@ final class CategoryAssignTests: XCTestCase {
         model.selectedBookingIDs = Set(rows.prefix(2).map(\.id))
         XCTAssertEqual(Set(model.categorizeTargets(for: rows[1]).map(\.id)), model.selectedBookingIDs)
         XCTAssertEqual(model.categorizeTargets(for: rows[2]).map(\.id), [rows[2].id])
+    }
+
+    func testNewSubcategoryIsAssignedToTheBookingsFromTheMenu() throws {
+        let rows = Array(model.bookings.prefix(3))
+        XCTAssertEqual(rows.count, 3)
+        let parent = try XCTUnwrap(model.categoryTree.first)
+        let targets = Set(rows.prefix(2).map(\.id))
+        model.selectedBookingIDs = targets
+        let request = NewCategoryRequest(parent: parent.id,
+                                         bookingIDs: model.categorizeTargets(for: rows[0]).map(\.id))
+        // The request still targets the original rows if the selection changes.
+        model.selectedBookingIDs = [rows[2].id]
+        model.createCategory(name: "New menu category", parent: request.parent, symbol: "tag", color: "#123456",
+                             assigning: request.bookingIDs)
+        let new = try XCTUnwrap(model.categories.first { $0.name == "New menu category" })
+        XCTAssertEqual(new.parentId, parent.id)
+        for id in targets {
+            XCTAssertEqual(model.bookings.first { $0.id == id }?.categoryId, new.id)
+        }
+        XCTAssertEqual(model.bookings.first { $0.id == rows[2].id }?.categoryId, rows[2].categoryId)
+        XCTAssertEqual(model.selectedBookingIDs, [rows[2].id])
+        XCTAssertNil(model.errorMessage)
     }
 
     /// Bookings dropped onto a sidebar category get it; foreign drags change nothing.

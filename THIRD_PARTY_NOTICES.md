@@ -12,7 +12,7 @@ The macOS user interface uses only native Apple system frameworks (`SwiftUI`, `A
 | **`base64`** | `0.22.1` | `MIT OR Apache-2.0` | [https://github.com/marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
 | **`base64`** | `0.23.1` | `MIT OR Apache-2.0` | [https://github.com/marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
 | **`cbc`** | `0.2.1` | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/block-modes](https://github.com/RustCrypto/block-modes) |
-| **`chrono`** | `0.4.45` | `MIT OR Apache-2.0` | [https://github.com/chronotope/chrono](https://github.com/chronotope/chrono) |
+| **`jiff`** | `1.0.1` | `Unlicense OR MIT` | [https://github.com/BurntSushi/jiff](https://github.com/BurntSushi/jiff) |
 | **`crypto-primes`** | `0.7.2` | `Apache-2.0 OR MIT` | [https://github.com/entropyxyz/crypto-primes](https://github.com/entropyxyz/crypto-primes) |
 | **`des`** | `0.9.0` | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/block-ciphers](https://github.com/RustCrypto/block-ciphers) |
 | **`futures-util`** | `0.3.34` | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
@@ -20,6 +20,7 @@ The macOS user interface uses only native Apple system frameworks (`SwiftUI`, `A
 | **`hex`** | `0.4.3` | `MIT OR Apache-2.0` | [https://github.com/KokaKiwi/rust-hex](https://github.com/KokaKiwi/rust-hex) |
 | **`hmac`** | `0.13.0` | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/MACs](https://github.com/RustCrypto/MACs) |
 | **`jsonwebtoken`** | `12.0.0` | `MIT` | [https://github.com/Keats/jsonwebtoken](https://github.com/Keats/jsonwebtoken) |
+| **`k256`** (watch-only Bitcoin wallets, BIP32 public derivation) | `0.14.0` | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/elliptic-curves](https://github.com/RustCrypto/elliptic-curves/tree/master/k256) |
 | **`libc`** | `0.2.191` | `MIT OR Apache-2.0` | [https://github.com/rust-lang/libc](https://github.com/rust-lang/libc) |
 | **`miniz_oxide`** | `0.9.1` | `MIT OR Zlib OR Apache-2.0` | [https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide) |
 | **`p256`** | `0.14.0` | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/elliptic-curves](https://github.com/RustCrypto/elliptic-curves/tree/master/p256) |
@@ -30,7 +31,9 @@ The macOS user interface uses only native Apple system frameworks (`SwiftUI`, `A
 | **`regex`** | `1.13.1` | `MIT OR Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
 | **`reqwest`** | `0.13.5` | `MIT OR Apache-2.0` | [https://github.com/seanmonstar/reqwest](https://github.com/seanmonstar/reqwest) |
 | **`rsa`** | `0.10.0` | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/RSA](https://github.com/RustCrypto/RSA) |
+| **`ripemd`** (Bitcoin address hashing) | `0.2.0` | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | **`rusqlite`** | `0.42.0` | `MIT` | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
+| **`rust_decimal`** | `1.43.0` | `MIT` | [https://github.com/paupino/rust-decimal](https://github.com/paupino/rust-decimal) |
 | **`serde`** | `1.0.229` | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
 | **`serde_json`** | `1.0.154` | `MIT OR Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
 | **`sha1`** | `0.11.0` | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
@@ -48,11 +51,12 @@ The macOS user interface uses only native Apple system frameworks (`SwiftUI`, `A
 
 | Crate | Version | License | Repository |
 |---|---|---|---|
+| **`roxmltree`** (dev-dependency of `girocrab-core`: independent XML parser for the payment invariant tests, #947) | `0.20.0` | `MIT OR Apache-2.0` | [https://github.com/RazrFalcon/roxmltree](https://github.com/RazrFalcon/roxmltree) |
 | **`uniffi`** (`uniffi-bindgen`, feature `cli`) | `0.32.2` | `MPL-2.0` | [https://github.com/mozilla/uniffi-rs](https://github.com/mozilla/uniffi-rs) |
 
 ## Linux Direct Dependencies (`GiroCrabLinux`)
 
-The Linux interface (Qt 6 / QML) uses these crates in addition to the core. Crates already listed above (`base64`, `miniz_oxide`, `reqwest`, `serde`, `serde_json`, `tokio`, `zeroize`) are not repeated.
+The Linux interface (Qt 6 / QML) uses these crates in addition to the core. Crates already listed above (`base64`, `jiff`, `miniz_oxide`, `reqwest`, `serde`, `serde_json`, `tokio`, `zeroize`) are not repeated.
 
 | Crate | Version | License | Repository |
 |---|---|---|---|
@@ -92,6 +96,7 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | **`image`** (decodes photoTAN PNG/JPEG, features `png`, `jpeg`) | `0.25.10` | `MIT OR Apache-2.0` | [https://github.com/image-rs/image](https://github.com/image-rs/image) |
 | **`keyring`** (Windows Credential Manager, `windows-native`) | `3.6.3` | `MIT OR Apache-2.0` | [https://github.com/hwchen/keyring-rs](https://github.com/hwchen/keyring-rs) |
 | **`rfd`** (native file dialog for the import, Windows only, no default features) | `0.15.4` | `MIT` | [https://github.com/PolyMeilex/rfd](https://github.com/PolyMeilex/rfd) |
+| **`clipboard-win`** (GiroCode image to the clipboard, Windows only) | `5.4.3` | `BSL-1.0` | [https://github.com/DoumanAsh/clipboard-win](https://github.com/DoumanAsh/clipboard-win) |
 
 ## Swift Packages (`GiroCrabApp`)
 
@@ -108,7 +113,8 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | **OpenSSL** (crate `openssl-src`) | Apache-2.0 | Crypto backend for SQLCipher |
 | **Simple Icons** (via `simpleicons-rs`) | CC0-1.0 (icon data); brand logos remain trademarks of their owners | Merchant/bank icons |
 | **GraphQL query texts in `girocrab-core/src/connectors/scalable.rs`** (4 of 10 identical up to whitespace, the others adapted) | Apache-2.0 | Taken from `ScalableCapital/scalable-cli` v1.3.0 ([https://github.com/ScalableCapital/scalable-cli](https://github.com/ScalableCapital/scalable-cli); LICENSE there: "Copyright 2025 OpenAI"). Used for the Scalable Capital connector; changed and extended by GiroCrab. |
-| **Bundesbank Bankleitzahlendatei** (`tools/gen-bic-directory`) | Public data of Deutsche Bundesbank | BLZ → BIC table |
+| **Bundesbank Bankleitzahlendatei** (`tools/gen-bic-directory`) | Public data of Deutsche Bundesbank | BLZ → BIC and bank name table |
+| **IANA Time Zone Database** (crate `jiff-tzdb`, Android builds only) | Public domain | Zone rules for the local date; Android's own copy lives where `jiff` does not look |
 
 ## Complete Transitive Dependency Tree
 
@@ -120,9 +126,9 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | `adler2` | `2.0.1` | `0BSD OR MIT OR Apache-2.0` | [Repo](https://github.com/oyvindln/adler2) (Jonas Schievink <jonasschievink@gmail.com>, oyvindln <oyvind) |
 | `aes` | `0.9.4` | `MIT OR Apache-2.0` | [Repo](https://github.com/RustCrypto/block-ciphers) (RustCrypto Developers) |
 | `aho-corasick` | `1.1.5` | `Unlicense OR MIT` | [Repo](https://github.com/BurntSushi/aho-corasick) (Andrew Gallant <jamslam@gmail.com>) |
-| `android_system_properties` | `0.1.6` | `MIT OR Apache-2.0` | [Repo](https://github.com/nical/android_system_properties) (Nicolas Silva <nical@fastmail.com>) |
 | `anstyle` | `1.0.14` | `MIT OR Apache-2.0` | [Repo](https://github.com/rust-cli/anstyle.git) |
 | `anyhow` | `1.0.104` | `MIT OR Apache-2.0` | [Repo](https://github.com/dtolnay/anyhow) (David Tolnay <dtolnay@gmail.com>) |
+| `arrayvec` | `0.7.8` | `MIT OR Apache-2.0` | [Repo](https://github.com/bluss/arrayvec) (bluss) |
 | `askama` | `0.16.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/askama-rs/askama) |
 | `askama_derive` | `0.16.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/askama-rs/askama) |
 | `askama_macros` | `0.16.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/askama-rs/askama) |
@@ -151,7 +157,6 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | `cfg-if` | `1.0.5` | `MIT OR Apache-2.0` | [Repo](https://github.com/rust-lang/cfg-if) (Alex Crichton <alex@alexcrichton.com>) |
 | `cfg_aliases` | `0.2.2` | `MIT` | [Repo](https://github.com/katharostech/cfg_aliases) (Zicklag <zicklag@katharostech.com>) |
 | `chacha20` | `0.10.2` | `MIT OR Apache-2.0` | [Repo](https://github.com/RustCrypto/stream-ciphers) (RustCrypto Developers) |
-| `chrono` | `0.4.45` | `MIT OR Apache-2.0` | [Repo](https://github.com/chronotope/chrono) |
 | `cipher` | `0.5.2` | `MIT OR Apache-2.0` | [Repo](https://github.com/RustCrypto/traits) (RustCrypto Developers) |
 | `clap` | `4.6.7` | `MIT OR Apache-2.0` | [Repo](https://github.com/clap-rs/clap) |
 | `clap_builder` | `4.6.7` | `MIT OR Apache-2.0` | [Repo](https://github.com/clap-rs/clap) |
@@ -223,8 +228,6 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | `hyper` | `1.12.0` | `MIT` | [Repo](https://github.com/hyperium/hyper) (Sean McArthur <sean@seanmonstar.com>) |
 | `hyper-rustls` | `0.27.10` | `Apache-2.0 OR ISC OR MIT` | [Repo](https://github.com/rustls/hyper-rustls) |
 | `hyper-util` | `0.1.21` | `MIT` | [Repo](https://github.com/hyperium/hyper-util) (Sean McArthur <sean@seanmonstar.com>) |
-| `iana-time-zone` | `0.1.65` | `MIT OR Apache-2.0` | [Repo](https://github.com/strawlab/iana-time-zone) (Andrew Straw <strawman@astraw.com>, René Kijewski <rene.kije) |
-| `iana-time-zone-haiku` | `0.1.2` | `MIT OR Apache-2.0` | [Repo](https://github.com/strawlab/iana-time-zone) (René Kijewski <crates.io@k6i.de>) |
 | `icu_collections` | `2.4.0` | `Unicode-3.0` | [Repo](https://github.com/unicode-org/icu4x) (The ICU4X Project Developers) |
 | `icu_locale_core` | `2.4.0` | `Unicode-3.0` | [Repo](https://github.com/unicode-org/icu4x) (The ICU4X Project Developers) |
 | `icu_normalizer` | `2.4.0` | `Unicode-3.0` | [Repo](https://github.com/unicode-org/icu4x) (The ICU4X Project Developers) |
@@ -238,6 +241,11 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | `inout` | `0.2.6` | `MIT OR Apache-2.0` | [Repo](https://github.com/RustCrypto/utils) (RustCrypto Developers) |
 | `ipnet` | `2.12.2` | `MIT OR Apache-2.0` | [Repo](https://github.com/krisprice/ipnet) (Kris Price <kris@krisprice.nz>) |
 | `itoa` | `1.0.19` | `MIT OR Apache-2.0` | [Repo](https://github.com/dtolnay/itoa) (David Tolnay <dtolnay@gmail.com>) |
+| `jiff` | `1.0.1` | `Unlicense OR MIT` | [Repo](https://github.com/BurntSushi/jiff) (Andrew Gallant <jamslam@gmail.com>) |
+| `jiff-core` | `1.0.1` | `Unlicense OR MIT` | [Repo](https://github.com/BurntSushi/jiff) (Andrew Gallant <jamslam@gmail.com>) |
+| `jiff-static` | `1.0.1` | `Unlicense OR MIT` | [Repo](https://github.com/BurntSushi/jiff) (Andrew Gallant <jamslam@gmail.com>) |
+| `jiff-tzdb` | `1.0.0` | `Unlicense OR MIT` | [Repo](https://github.com/BurntSushi/jiff) (Andrew Gallant <jamslam@gmail.com>) |
+| `jiff-tzdb-platform` | `1.0.0` | `Unlicense OR MIT` | [Repo](https://github.com/BurntSushi/jiff) (Andrew Gallant <jamslam@gmail.com>) |
 | `jni` | `0.22.4` | `MIT OR Apache-2.0` | [Repo](https://github.com/jni-rs/jni-rs) (jni team) |
 | `jni-macros` | `0.22.4` | `MIT OR Apache-2.0` | [Repo](https://github.com/jni-rs/jni-rs) |
 | `jni-sys` | `0.4.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/jni-rs/jni-sys) (Steven Fackler <sfackler@gmail.com>, Robert Bragg <robert@si) |
@@ -245,6 +253,7 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | `jobserver` | `0.1.35` | `MIT OR Apache-2.0` | [Repo](https://github.com/rust-lang/jobserver-rs) (Alex Crichton <alex@alexcrichton.com>) |
 | `js-sys` | `0.3.107` | `MIT OR Apache-2.0` | [Repo](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys) (The wasm-bindgen Developers) |
 | `jsonwebtoken` | `12.0.0` | `MIT` | [Repo](https://github.com/Keats/jsonwebtoken) (Vincent Prouillet <hello@vincentprouillet.com>) |
+| `k256` | `0.14.0` | `Apache-2.0 OR MIT` | [Repo](https://github.com/RustCrypto/elliptic-curves) (RustCrypto Developers) |
 | `libc` | `0.2.191` | `MIT OR Apache-2.0` | [Repo](https://github.com/rust-lang/libc) |
 | `libm` | `0.2.16` | `MIT` | [Repo](https://github.com/rust-lang/compiler-builtins) (Alex Crichton <alex@alexcrichton.com>, Amanieu d'Antras <ama) |
 | `libsqlite3-sys` | `0.40.0` | `MIT` | [Repo](https://github.com/rusqlite/rusqlite) (The rusqlite developers) |
@@ -281,6 +290,8 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | `pkcs8` | `0.11.0` | `Apache-2.0 OR MIT` | [Repo](https://github.com/RustCrypto/formats) (RustCrypto Developers) |
 | `pkg-config` | `0.3.34` | `MIT OR Apache-2.0` | [Repo](https://github.com/rust-lang/pkg-config-rs) (Alex Crichton <alex@alexcrichton.com>) |
 | `plain` | `0.2.3` | `MIT/Apache-2.0` | [Repo](https://github.com/randomites/plain) (jzr) |
+| `portable-atomic` | `1.15.0` | `Apache-2.0 OR MIT` | [Repo](https://github.com/taiki-e/portable-atomic) |
+| `portable-atomic-util` | `0.2.8` | `Apache-2.0 OR MIT` | [Repo](https://github.com/taiki-e/portable-atomic-util) |
 | `potential_utf` | `0.1.6` | `Unicode-3.0` | [Repo](https://github.com/unicode-org/icu4x) (The ICU4X Project Developers) |
 | `powerfmt` | `0.2.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/jhpratt/powerfmt) (Jacob Pratt <jacob@jhpratt.dev>) |
 | `ppv-lite86` | `0.2.21` | `MIT OR Apache-2.0` | [Repo](https://github.com/cryptocorrosion/cryptocorrosion) (The CryptoCorrosion Contributors) |
@@ -307,9 +318,11 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | `reqwest` | `0.13.5` | `MIT OR Apache-2.0` | [Repo](https://github.com/seanmonstar/reqwest) (Sean McArthur <sean@seanmonstar.com>) |
 | `rfc6979` | `0.6.0` | `Apache-2.0 OR MIT` | [Repo](https://github.com/RustCrypto/signatures) (RustCrypto Developers) |
 | `ring` | `0.17.14` | `Apache-2.0 AND ISC` | [Repo](https://github.com/briansmith/ring) |
+| `ripemd` | `0.2.0` | `MIT OR Apache-2.0` | [Repo](https://github.com/RustCrypto/hashes) (RustCrypto Developers) |
 | `rsa` | `0.10.0` | `MIT OR Apache-2.0` | [Repo](https://github.com/RustCrypto/RSA) (RustCrypto Developers, dignifiedquire <dignifiedquire@gmail.) |
 | `rsqlite-vfs` | `0.2.0` | `MIT` | [Repo](https://github.com/Spxg/sqlite-wasm-rs) |
 | `rusqlite` | `0.42.0` | `MIT` | [Repo](https://github.com/rusqlite/rusqlite) (The rusqlite developers) |
+| `rust_decimal` | `1.43.0` | `MIT` | [Repo](https://github.com/paupino/rust-decimal) (Paul Mason <paul@form1.co.nz>) |
 | `rustc-hash` | `2.1.3` | `Apache-2.0 OR MIT` | [Repo](https://github.com/rust-lang/rustc-hash) (The Rust Project Developers) |
 | `rustc_version` | `0.4.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/djc/rustc-version-rs) |
 | `rustix` | `1.1.6` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [Repo](https://github.com/bytecodealliance/rustix) (Dan Gohman <dev@sunfishcode.online>, Jakub Konka <kubkon@jak) |
@@ -421,12 +434,7 @@ Own Cargo workspace. Shares `girocrab-core`, `serde`, `serde_json`, `base64`, `z
 | `webpki-roots` | `1.0.11` | `CDLA-Permissive-2.0` | [Repo](https://github.com/rustls/webpki-roots) |
 | `weedle2` | `5.0.0` | `MIT` | [Repo](https://github.com/mozilla/uniffi-rs) (Sharad Chand <sharad.d.chand@gmail.com>, Jan-Erik Rediger <j) |
 | `winapi-util` | `0.1.11` | `Unlicense OR MIT` | [Repo](https://github.com/BurntSushi/winapi-util) (Andrew Gallant <jamslam@gmail.com>) |
-| `windows-core` | `0.62.2` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) |
-| `windows-implement` | `0.60.2` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) |
-| `windows-interface` | `0.59.3` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) |
 | `windows-link` | `0.2.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) |
-| `windows-result` | `0.4.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) |
-| `windows-strings` | `0.5.1` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | `0.52.0` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) (Microsoft) |
 | `windows-sys` | `0.61.2` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) |
 | `windows-targets` | `0.52.6` | `MIT OR Apache-2.0` | [Repo](https://github.com/microsoft/windows-rs) (Microsoft) |

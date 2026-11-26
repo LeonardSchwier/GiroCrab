@@ -36,10 +36,9 @@ fn test_ctx() -> ConnectContext {
         connection_id: 1,
         login_name: "user:1".into(),
         secret: SecretString::new("12345".into()),
-        settings: Default::default(),
-        state: serde_json::json!({}),
+        state: serde_json::json!({}).into(),
         since: "2025-01-01".into(),
-        since_by_account: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -99,8 +98,12 @@ fn mock_bank(
 }
 
 const REJECT_9010: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+9800::Der Dialog wurde abgebrochen.'HIRMS:3:2:3+9010::Ungültiger Signaturaufbau: Fehler im Segmentaufbau.'";
+/// Sparkasse's answer to the login's HKTAN (#1641).
+const REJECT_9110: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+9050::Die Nachricht enthält Fehler.+9800::Dialog abgebrochen+9110::Falsche Segmentzusammenstellung (HKTAN, segvers=7, option=913)'";
 const ACCEPT: &str =
     "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'";
+/// Booked balance 1234,56 EUR (HKSAL).
+const BALANCE: &str = "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'HISAL:3:7:3+X+Girokonto+EUR+C:1234,56:EUR:20250102'";
 const STALE_SYSTEM_ID: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+9800::abgebrochen.'HIRMS:3:2:3+9931::Anmeldename falsch.'HIRMS:4:2:3+9010::Fehler.'";
 
 fn two_step_connector(url: &str, state: serde_json::Value) -> FinTsConnector {
@@ -114,6 +117,92 @@ fn two_step_connector(url: &str, state: serde_json::Value) -> FinTsConnector {
 
 fn has_hktan(ids: &[String]) -> bool {
     ids.iter().any(|i| i == "HKTAN")
+}
+
+/// comdirect's answer when the bank code does not belong to the login.
+const WRONG_BLZ: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+9050::Die Nachricht enthaelt Fehler.+9800::Dialog abgebrochen'HIRMS:3:2:3+9210::Bankleitzahl passt nicht zum Benutzer.+9340::Ungueltige Auftragsnachricht: Ungueltige Signatur.'";
+
+fn comdirect_connector(key_blz: &str, url: &str, state: serde_json::Value) -> FinTsConnector {
+    let mut c = two_step_connector(url, state);
+    c.blz = key_blz.into();
+    c
+}
+
+/// Synchronised one-step state: the dialog init is the first request.
+fn synced() -> serde_json::Value {
+    serde_json::json!({"system_id": "123", "sec_func": "999", "tan_method_name": "", "tan_medium": "", "versions": {}, "tan_required": {}})
+}
+
+#[test]
+fn wrong_bank_code_is_told_apart_from_other_9210() {
+    let r = |raw: &str| reply(raw.as_bytes());
+    assert!(super::dialog::blz_mismatch(&r(WRONG_BLZ)));
+    for other in [
+        "HIRMG:2:2+9050::Fehler.'HIRMS:3:2:3+9210::Auftrag abgelehnt.'",
+        "HIRMG:2:2+9050::Fehler.'HIRMS:3:2:3+9340::Bankleitzahl ungueltig.'",
+    ] {
+        assert!(!super::dialog::blz_mismatch(&r(other)), "{other}");
+    }
+}
+
+#[tokio::test]
+async fn comdirect_login_tries_its_other_bank_codes_and_keeps_the_one_that_works() {
+    // IBAN code 20041177, the login is known under 20041111 (the first one tried)
+    let (url, seen) = mock_bank(vec![WRONG_BLZ, ACCEPT]);
+    let mut c = comdirect_connector("20041177", &url, synced());
+    assert!(matches!(c.login(&test_ctx()).await.unwrap(), Phase::Ready));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(c.blz, "20041111");
+    let persisted = serde_json::to_value(&c.st).unwrap();
+    assert_eq!(persisted["login_blz"], "20041111");
+
+    // the next sync logs in under the found code straight away
+    let (url2, seen2) = mock_bank(vec![ACCEPT]);
+    let mut c2 = FinTsConnector::for_key("fints:20041177");
+    let mut ctx = test_ctx();
+    for (k, v) in [
+        ("fints.url.20041177", url2.as_str()),
+        ("fints.product_id", "TESTPRODUCT"),
+    ] {
+        ctx.settings.insert(k.into(), SecretString::new(v.into()));
+    }
+    ctx.state = persisted.into();
+    assert!(matches!(c2.begin(&ctx).await.unwrap(), Phase::Ready));
+    assert_eq!(c2.blz, "20041111");
+    assert_eq!(seen2.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn comdirect_login_gives_up_with_the_first_error_when_no_code_fits() {
+    let (url, seen) = mock_bank(vec![WRONG_BLZ]);
+    let mut c = comdirect_connector("20041177", &url, synced());
+    let err = c.login(&test_ctx()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("Bankleitzahl passt nicht"),
+        "{err}"
+    );
+    // every comdirect code once, then back to the connector's
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        crate::connectors::fints_directory::COMDIRECT_BLZ.len()
+    );
+    assert_eq!(c.blz, "20041177");
+    assert!(c.st.login_blz.is_empty());
+}
+
+#[tokio::test]
+async fn other_banks_and_other_errors_are_not_retried() {
+    // not comdirect: the bank code is the bank's, nothing to try
+    let (url, seen) = mock_bank(vec![WRONG_BLZ, ACCEPT]);
+    let mut c = comdirect_connector("50010517", &url, synced());
+    assert!(c.login(&test_ctx()).await.is_err());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    // comdirect, but a wrong PIN: trying other codes would only repeat it
+    let (url, seen) = mock_bank(vec![STALE_SYSTEM_ID, ACCEPT]);
+    let mut c = comdirect_connector("20041177", &url, synced());
+    assert!(c.login(&test_ctx()).await.is_err());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(c.blz, "20041177");
 }
 
 #[tokio::test]
@@ -194,6 +283,266 @@ async fn failed_single_step_retry_is_not_remembered() {
     assert!(!c.st.single_step);
 }
 
+fn state_with_functions(sec_func: &str, functions: &[(&str, &str)]) -> serde_json::Value {
+    serde_json::json!({"system_id": "123", "sec_func": sec_func, "tan_method_name": "", "tan_medium": "", "versions": {}, "tan_required": {}, "tan_functions": functions})
+}
+
+#[tokio::test]
+async fn dialog_init_9110_falls_back_to_another_tan_function_and_persists() {
+    let (url, seen) = mock_bank(vec![REJECT_9110, ACCEPT]);
+    let state = state_with_functions("913", &[("913", "chipTAN QR"), ("911", "chipTAN optisch")]);
+    let mut c = two_step_connector(&url, state);
+    let phase = c.open_dialog(&test_ctx()).await.unwrap();
+    assert!(matches!(phase, Phase::Ready));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(has_hktan(&seen[0]) && has_hktan(&seen[1]), "{seen:?}");
+    }
+    assert_eq!(c.st.sec_func, "911");
+    assert_eq!(c.st.tan_method_name, "chipTAN optisch");
+    assert!(!c.st.init_without_hktan);
+
+    // The next login starts with the function that worked.
+    let persisted = serde_json::to_value(&c.st).unwrap();
+    let (url2, seen2) = mock_bank(vec![ACCEPT]);
+    let mut c2 = two_step_connector(&url2, persisted);
+    assert_eq!(c2.sec(), "911");
+    c2.open_dialog(&test_ctx()).await.unwrap();
+    assert_eq!(seen2.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn dialog_init_9110_falls_back_to_init_without_hktan_and_persists() {
+    let (url, seen) = mock_bank(vec![REJECT_9110, ACCEPT]);
+    let state = state_with_functions("913", &[("913", "chipTAN QR")]);
+    let mut c = two_step_connector(&url, state);
+    let phase = c.open_dialog(&test_ctx()).await.unwrap();
+    assert!(matches!(phase, Phase::Ready));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            has_hktan(&seen[0]),
+            "first try carries HKTAN: {:?}",
+            seen[0]
+        );
+        assert!(!has_hktan(&seen[1]), "retry has none: {:?}", seen[1]);
+    }
+    // Still two-step: the orders keep their HKTAN.
+    assert_eq!(c.sec(), "913");
+    assert!(c.st.init_without_hktan && !c.st.single_step);
+
+    let persisted = serde_json::to_value(&c.st).unwrap();
+    let (url2, seen2) = mock_bank(vec![ACCEPT]);
+    let mut c2 = two_step_connector(&url2, persisted);
+    c2.open_dialog(&test_ctx()).await.unwrap();
+    let seen2 = seen2.lock().unwrap();
+    assert_eq!(seen2.len(), 1);
+    assert!(!has_hktan(&seen2[0]), "{:?}", seen2[0]);
+}
+
+#[tokio::test]
+async fn dialog_init_9110_reply_with_a_function_list_supplies_the_alternatives() {
+    const WITH_LIST: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+9050::Die Nachricht enthält Fehler.+9800::Dialog abgebrochen+9110::Falsche Segmentzusammenstellung (HKTAN, segvers=7, option=913)'HIRMS:3:2:3+3920::Zugelassene Zwei-Schritt-Verfahren:913:911'";
+    let (url, seen) = mock_bank(vec![WITH_LIST, ACCEPT]);
+    // an older saved state: no function list yet
+    let mut c = two_step_connector(&url, state_with_functions("913", &[]));
+    assert!(matches!(
+        c.open_dialog(&test_ctx()).await.unwrap(),
+        Phase::Ready
+    ));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(has_hktan(&seen[1]), "the other function, with HKTAN");
+    }
+    assert_eq!(c.sec(), "911");
+    assert!(!c.st.init_without_hktan);
+}
+
+#[tokio::test]
+async fn dialog_init_9110_without_hktan_after_failed_alternative_keeps_the_refused_function() {
+    let (url, seen) = mock_bank(vec![REJECT_9110, REJECT_9110, ACCEPT]);
+    let mut state =
+        state_with_functions("913", &[("913", "chipTAN QR"), ("911", "chipTAN optisch")]);
+    state["tan_method_name"] = "chipTAN QR".into();
+    let mut c = two_step_connector(&url, state);
+    assert!(matches!(
+        c.open_dialog(&test_ctx()).await.unwrap(),
+        Phase::Ready
+    ));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert_eq!(c.sec(), "913");
+    assert_eq!(c.st.tan_method_name, "chipTAN QR");
+    assert!(c.st.init_without_hktan);
+}
+
+#[tokio::test]
+async fn dialog_init_9110_failure_restores_a_saved_init_without_hktan() {
+    let (url, _) = mock_bank(vec![REJECT_9110]);
+    let mut state = state_with_functions("913", &[("913", "a"), ("911", "b")]);
+    state["init_without_hktan"] = true.into();
+    let mut c = two_step_connector(&url, state);
+    // the saved flag omits HKTAN, so the bank's 9110 names something else: force the retry
+    // by calling it directly
+    assert!(
+        !c.retry_init_without_refused_hktan(&test_ctx())
+            .await
+            .unwrap()
+            .1
+    );
+    assert_eq!(c.st.sec_func, "913");
+    assert!(c.st.init_without_hktan);
+}
+
+#[tokio::test]
+async fn dialog_init_9110_then_stale_system_id_clears_it_and_reports_that_error() {
+    let (url, seen) = mock_bank(vec![REJECT_9110, STALE_SYSTEM_ID]);
+    let state = state_with_functions("913", &[("913", "chipTAN QR"), ("911", "chipTAN optisch")]);
+    let mut c = two_step_connector(&url, state);
+    let err = c.open_dialog(&test_ctx()).await.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Bank { message, .. } if message.contains("9931")),
+        "the terminal bank error is reported: {err:?}"
+    );
+    assert!(c.st.system_id.is_empty(), "next login synchronises again");
+    // the stale answer to the first alternative ends the retry
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(c.st.sec_func, "913");
+}
+
+#[tokio::test]
+async fn dialog_init_9110_with_no_working_variant_keeps_the_state() {
+    let (url, seen) = mock_bank(vec![REJECT_9110]);
+    let state = state_with_functions("913", &[("913", "chipTAN QR"), ("911", "chipTAN optisch")]);
+    let mut c = two_step_connector(&url, state);
+    let err = c.open_dialog(&test_ctx()).await.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Bank { message, .. } if message.contains("9110")),
+        "the bank's own answer is reported: {err:?}"
+    );
+    // original, the other function, the init without HKTAN
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert_eq!(c.st.sec_func, "913");
+    assert!(c.st.tan_method_name.is_empty());
+    assert!(!c.st.init_without_hktan);
+}
+
+#[tokio::test]
+async fn dialog_init_9110_stops_at_a_9931_reply() {
+    let (url, seen) = mock_bank(vec![REJECT_9110, STALE_SYSTEM_ID]);
+    let state = state_with_functions("913", &[("913", "chipTAN QR"), ("911", "chipTAN optisch")]);
+    let mut c = two_step_connector(&url, state);
+    assert!(c.open_dialog(&test_ctx()).await.is_err());
+    // the original and the other function; the init without HKTAN is not tried
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(c.st.sec_func, "913");
+    assert!(c.st.tan_method_name.is_empty());
+    assert!(!c.st.init_without_hktan);
+}
+
+#[tokio::test]
+async fn dialog_init_9110_about_another_segment_is_not_retried() {
+    const OTHER: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+9800::Dialog abgebrochen+9110::Falsche Segmentzusammenstellung (HKVVB)'";
+    let (url, seen) = mock_bank(vec![OTHER]);
+    let state = state_with_functions("913", &[("913", "a"), ("911", "b")]);
+    let mut c = two_step_connector(&url, state);
+    assert!(c.open_dialog(&test_ctx()).await.is_err());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn dialog_init_9110_in_one_step_is_not_retried() {
+    let (url, seen) = mock_bank(vec![REJECT_9110]);
+    let mut c = two_step_connector(&url, synced());
+    assert!(c.open_dialog(&test_ctx()).await.is_err());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn tan_functions_are_learned_and_fallbacks_follow_the_preference_order() {
+    let mut c = FinTsConnector::new("52090000");
+    let r = reply(b"HITANS:9:6:3+1+1+0+J:N:0:946:2:SECUREGO:Decoupled::SecureGo plus:6:1:x'HIRMS:12:2:3+3920::Zugelassene Zwei-Schritt-Verfahren:910:946:913'");
+    c.learn_bpd(&r);
+    assert_eq!(
+        c.st.tan_functions,
+        [
+            ("910".to_string(), String::new()),
+            ("946".to_string(), "SecureGo plus".to_string()),
+            ("913".to_string(), String::new()),
+        ]
+    );
+    // An init reply without HITANS keeps the names.
+    c.learn_bpd(&reply(
+        b"HIRMS:3:2:3+3920::Zugelassene Zwei-Schritt-Verfahren:910:946:913'",
+    ));
+    assert_eq!(c.st.tan_functions[1].1, "SecureGo plus");
+
+    let codes = |refused: &str| -> Vec<String> {
+        c.tan_function_fallbacks(refused)
+            .into_iter()
+            .map(|(code, _)| code)
+            .collect()
+    };
+    assert_eq!(codes("946"), ["913", "910"]);
+    assert_eq!(codes("913"), ["946", "910"], "app-based first, then 91x");
+    assert!(
+        FinTsConnector::new("52090000")
+            .tan_function_fallbacks("913")
+            .is_empty()
+    );
+}
+
+/// Sparkasse's list for a chipTAN user (#1641): QR first, then the manual method, whose code
+/// can be typed, before the optical and USB ones.
+#[test]
+fn chiptan_functions_prefer_qr_then_manual() {
+    let mut c = FinTsConnector::new("52090000");
+    c.learn_bpd(&reply(
+        b"HIRMS:3:2:3+3920::Zugelassene Zwei-Schritt-Verfahren:913:912:911:910'",
+    ));
+    assert_eq!(c.st.sec_func, "913");
+    let codes: Vec<String> = c
+        .tan_function_fallbacks("913")
+        .into_iter()
+        .map(|(code, _)| code)
+        .collect();
+    assert_eq!(codes, ["910", "911", "912"]);
+}
+
+/// biw Bank (#1876): 906 iTAN-Card has process variant 1 (no HKTAN process 4), 907 variant 2.
+const BIW_HITANS: &str = "HITANS:15:6:4+1+1+1+N:N:1:906:1:CR#3:::iTAN-Card:15:2:TAN:256:N:4:N:0:0:N:N:00:0:N:1:907:2:PPTAN:::flateXSecure:6:2:PPTAN:999:N:1:N:0:0:N:N:00:1:N:9'";
+const BIW_3920: &str = "HIRMS:3:2:3+3920::Zugelassene Zwei-Schritt-Verfahren:906:907'";
+
+#[test]
+fn process_variant_one_method_is_not_chosen_while_another_exists() {
+    let mut c = FinTsConnector::new("10130800");
+    c.learn_bpd(&reply(format!("{BIW_HITANS}{BIW_3920}").as_bytes()));
+    assert_eq!(c.st.sec_func, "907");
+    assert_eq!(c.st.tan_method_name, "flateXSecure");
+    // alone, variant 1 is still used
+    let mut only = FinTsConnector::new("10130800");
+    only.learn_bpd(&reply(
+        format!("{BIW_HITANS}HIRMS:3:2:3+3920::Zugelassene Zwei-Schritt-Verfahren:906'").as_bytes(),
+    ));
+    assert_eq!(only.st.sec_func, "906");
+}
+
+#[tokio::test]
+async fn dialog_init_9200_on_hktan_tries_the_other_function() {
+    const REJECT_9200: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+9050::Teilweise fehlerhaft.'HIRMS:3:2:5+9200::[HKTAN #5] Gewähltes Zwei-Schritt-Verfahren nicht unterstüzt.'";
+    let (url, seen) = mock_bank(vec![REJECT_9200, ACCEPT]);
+    let state = state_with_functions("906", &[("906", "iTAN-Card"), ("907", "flateXSecure")]);
+    let mut c = two_step_connector(&url, state);
+    assert!(matches!(
+        c.open_dialog(&test_ctx()).await.unwrap(),
+        Phase::Ready
+    ));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(c.sec(), "907");
+}
+
 #[test]
 fn secure_url_check_rejects_plain_http() {
     assert!(crate::connectors::ensure_secure_fints_url("https://bank.example/fints").is_ok());
@@ -254,10 +603,9 @@ fn message_has_correct_length_and_structure() {
         connection_id: 1,
         login_name: "user:1".into(),
         secret: SecretString::new("12345".into()),
-        settings: Default::default(),
-        state: serde_json::json!({}),
+        state: serde_json::json!({}).into(),
         since: "2025-01-01".into(),
-        since_by_account: Default::default(),
+        ..Default::default()
     };
     let payload = vec![c.hkidn(&ctx, 3), c.hkvvb(4), c.hktan_process4(5, "HKIDN")];
     let msg = c.build_message(&ctx, &payload, "946", None);
@@ -267,7 +615,9 @@ fn message_has_correct_length_and_structure() {
     let ids: Vec<&str> = segs.iter().map(|s| s.id()).collect();
     assert_eq!(
         ids,
-        vec!["HNHBK", "HNVSK", "HNSHK", "HKIDN", "HKVVB", "HKTAN", "HNSHA", "HNHBS"]
+        vec![
+            "HNHBK", "HNVSK", "HNSHK", "HKIDN", "HKVVB", "HKTAN", "HNSHA", "HNHBS"
+        ]
     );
     assert_eq!(segs[3].get(2, 0), "user:1", "login is escaped and restored");
     assert_eq!(segs[6].get(3, 0), "12345");
@@ -287,15 +637,15 @@ fn message_has_correct_length_and_structure() {
 }
 
 #[test]
-fn card_request_starts_within_the_storage_period() {
+fn request_starts_within_the_storage_period() {
     // 775 days kept: two years back is fine, three years is cut to the limit
-    assert_eq!(card_since("2024-11-15", "2026-11-15", 775), "2024-11-15");
-    assert_eq!(card_since("2023-11-15", "2026-11-15", 775), "2024-10-01");
+    assert_eq!(stored_since("2024-11-15", "2026-11-15", 775), "2024-11-15");
+    assert_eq!(stored_since("2023-11-15", "2026-11-15", 775), "2024-10-01");
     // unknown storage period: unchanged
-    assert_eq!(card_since("2020-01-01", "2026-11-15", 0), "2020-01-01");
+    assert_eq!(stored_since("2020-01-01", "2026-11-15", 0), "2020-01-01");
     // a hostile HIKKUS value must not panic
     assert_eq!(
-        card_since("2020-01-01", "2026-11-15", i64::MAX),
+        stored_since("2020-01-01", "2026-11-15", i64::MAX),
         "2020-01-01"
     );
 }
@@ -305,6 +655,10 @@ fn decoupled_poll_recognises_a_pending_approval() {
     // standard: 3956
     assert!(approval_pending(&reply(
         b"HIRMG:2:2+3060::Bitte beachten Sie die enthaltenen Warnungen.'HIRMS:3:2:3+3956::Starke Kundenauthentifizierung noch ausstehend.'"
+    )));
+    // 3045: SEPA-Instant handover after approval is no longer pending (#1121)
+    assert!(!approval_pending(&reply(
+        b"HIRMG:2:2+3060::Bitte beachten Sie die enthaltenen Warnungen.'HIRMS:3:2:3+3045::SEPA-Instant Payment Statusabfrage HKIPS veranlassen.'"
     )));
     // warnings only, no success code (Deutsche Bank)
     assert!(approval_pending(&reply(
@@ -488,7 +842,7 @@ fn hiekp_details_follow_the_dkb_layout() {
 }
 
 #[test]
-fn hiekp_period_comes_from_its_dates_and_pdf_ids_are_stable() {
+fn hiekp_period_comes_from_its_dates() {
     let r = reply(b"HIEKP:5:2:4+@8@%PDF-1.7+20261001:20261031+20261102'");
     let s = r.all("HIEKP").next().unwrap();
     assert_eq!(
@@ -498,8 +852,6 @@ fn hiekp_period_comes_from_its_dates_and_pdf_ids_are_stable() {
             "2026-11-02".to_string()
         )
     );
-    assert_eq!(fnv1a64_bytes(b"%PDF-1.7"), fnv1a64_bytes(b"%PDF-1.7"));
-    assert_ne!(fnv1a64_bytes(b"%PDF-1.7"), fnv1a64_bytes(b"%PDF-1.6"));
 }
 
 fn reply(raw: &[u8]) -> BankReply {
@@ -534,6 +886,11 @@ fn negotiates_versions_from_bpd() {
     assert_eq!(c.version("HKCAZ"), 1);
     assert_eq!(c.version("HKTAN"), 7);
     assert_eq!(c.version("HKKAZ"), 7);
+    // storage periods: how far back a statement request may start (#1043)
+    assert_eq!((c.st.caz_storage_days, c.st.kaz_storage_days), (450, 90));
+    // a reply with only another version keeps what the version in use said
+    c.learn_bpd(&reply(b"HIKAZS:3:5:3+1+1+0+30:N:N'"));
+    assert_eq!(c.st.kaz_storage_days, 90);
     assert!(!c.bank_supports("HKSPA"));
     assert_eq!(
         c.st.camt_formats[0],
@@ -568,6 +925,7 @@ fn sepa_acc(iban: &str, number: &str) -> SepaAccount {
         account_number: number.into(),
         sub_account: String::new(),
         blz: "20041155".into(),
+        full_kti: false,
     }
 }
 
@@ -636,6 +994,16 @@ fn own_iban_wins_over_account_number_match() {
     assert!(out[1].1.is_none());
 }
 
+/// FinTS Kontoart 70-79 is a Bausparvertrag (#1630), not a savings account.
+#[test]
+fn kind_codes_tell_building_savings_from_savings() {
+    assert_eq!(kind_from_code(10), AccountKind::Savings);
+    assert_eq!(kind_from_code(29), AccountKind::Savings);
+    assert_eq!(kind_from_code(70), AccountKind::BuildingSavings);
+    assert_eq!(kind_from_code(79), AccountKind::BuildingSavings);
+    assert_eq!(kind_from_code(80), AccountKind::Checking);
+}
+
 #[test]
 fn parses_upd_with_allowed_transactions_and_loans() {
     let r = reply(b"HIUPD:5:6:3+0012345601::280:52090000+DE44520900000012345601+KUNDE+1+EUR+Muster+Alex+Girokonto++HKSAL:1+HKCAZ:1+HKKAZ:1'HIUPD:6:6:3+0098765400::280:52090000++KUNDE+40+EUR+Muster+Alex+Baudarlehen++HKSAL:1'");
@@ -654,6 +1022,7 @@ fn parses_upd_with_allowed_transactions_and_loans() {
         account_number: "0098765400".into(),
         sub_account: String::new(),
         blz: "52090000".into(),
+        full_kti: false,
     });
     assert_eq!(kti, "::0098765400::280:52090000");
     // IBAN known: IBAN:BIC – except Consorsbank, which wants the full form.
@@ -663,6 +1032,7 @@ fn parses_upd_with_allowed_transactions_and_loans() {
         account_number: "0123456789".into(),
         sub_account: String::new(),
         blz: blz.into(),
+        full_kti: false,
     };
     assert_eq!(FinTsConnector::kti(&acc("52090000")), "DE00:BICXDEXX");
     assert_eq!(
@@ -836,8 +1206,9 @@ fn order_for(c: &mut FinTsConnector) {
 
 #[test]
 fn reads_vop_parameters_from_bpd() {
-    // HIVPPS as sent by comdirect.
-    let raw = b"HIVPPS:7:1:3+1+1+0+20:J:S:N:N:sepade.pain.002.001.10.xsd:HKIPZ:HKCUI:HKCCS:HKCDE'";
+    // HIVPPS as sent by comdirect, plus a DK code: the name check covers HK orders only.
+    let raw =
+        b"HIVPPS:7:1:3+1+1+0+20:J:S:N:N:sepade.pain.002.001.10.xsd:HKIPZ:HKCUI:HKCCS:HKCDE:DKKKU'";
     let mut c = FinTsConnector::new("20041111");
     c.learn_bpd(&reply(raw));
     assert_eq!(c.st.vop_format, "sepade.pain.002.001.10.xsd");
@@ -885,7 +1256,7 @@ fn standing_order_limits_come_from_the_stored_state() {
                 HICDNS:13:1:3+1+1+0+1:2:90:J:J:J:J:J:J:J:J:J:010612:010515:00:135'";
     let mut c = FinTsConnector::new("20041111");
     c.learn_bpd(&reply(raw));
-    let state = serde_json::to_value(&c.st).unwrap();
+    let state = crate::secret::SecretJson::encode(&c.st).unwrap();
     let create = standing_limits_from_state(&state, A::Create).unwrap();
     assert_eq!((create.min_days_ahead, create.max_days_ahead), (2, 90));
     assert_eq!(create.months, [1, 2, 3]);
@@ -897,7 +1268,7 @@ fn standing_order_limits_come_from_the_stored_state() {
     assert_eq!(change.weekdays, [1, 3, 5]);
     assert!(standing_limits_from_state(&state, A::Delete).is_none());
     // Not a FinTS state, or none of the parameters seen yet.
-    assert!(standing_limits_from_state(&serde_json::json!({}), A::Create).is_none());
+    assert!(standing_limits_from_state(&serde_json::json!({}).into(), A::Create).is_none());
 }
 
 #[test]
@@ -1008,7 +1379,7 @@ fn debit_lead_time_is_checked_per_sequence() {
         max_days_first: 30,
         ..Default::default()
     };
-    let d = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+    let d = |s: &str| jiff::civil::Date::strptime("%Y-%m-%d", s).unwrap();
     let today = d("2026-11-02");
     assert!(check_debit_lead_time(&p, Recurring, today, d("2026-11-04")).is_ok());
     assert!(check_debit_lead_time(&p, First, today, d("2026-11-04")).is_err());
@@ -1116,6 +1487,166 @@ fn evaluates_vop_results() {
 }
 
 #[test]
+fn match_with_3091_needs_no_hkvpa() {
+    // 3091 "VOP-Ausführungsauftrag nicht benötigt": the challenge is simply answered.
+    let r = reply(
+        b"HIRMG:2:2+0010::OK.'HIRMS:3:2:3+3091::VOP-Ausfuehrungsauftrag nicht benoetigt.'HIVPP:5:1:3+@4@ABCD+++++DE89370400440532013000::::RCVC'",
+    );
+    let mut c = FinTsConnector::new("20041111");
+    order_for(&mut c);
+    assert!(c.evaluate_payee(&r).is_none());
+    assert!(!c.vop_with_tan);
+}
+
+/// HKVPP + HKCCS + HKTAN answered with 3091 (no HKVPA needed) and 3955
+/// (approval in the app); HIVPP carries only the VOP-ID (#1507).
+const APP_APPROVAL_3091: &[u8] = b"HIRMG:2:2+3060::Hinweise.'HIRMS:3:2:3+3091::VOP-Ausfuehrungsauftrag nicht benoetigt.'HIRMS:4:2:5+3955::Auftrag empfangen - Bitte Auftrag in Ihrer App freigeben.'HIVPP:5:1:3+@8@VOPID123'";
+
+#[test]
+fn a_3091_without_result_reports_no_deviation() {
+    // FinTS VOP 1.02, E.8.1: a deviation always comes with 3945 (and 3090), and
+    // 3091 means no HKVPA is needed. HIVPP without a result is allowed
+    // (C.10.7.1.1). So: no name-check dialog, the order's challenge is answered.
+    let r = reply(APP_APPROVAL_3091);
+    assert!(reports_no_deviation(&r));
+    let mut c = FinTsConnector::new("20041111");
+    order_for(&mut c);
+    assert!(c.evaluate_payee(&r).is_none());
+    assert!(!c.vop_with_tan);
+    assert_eq!(c.vop_id.as_deref(), Some(&b"VOPID123"[..]));
+}
+
+#[test]
+fn a_missing_result_without_3091_still_asks_the_user() {
+    // No 3091: the bank has not said that nothing is needed.
+    let r = reply(b"HIRMG:2:2+3060::Hinweise.'HIRMS:4:2:5+3955::Bitte in der App freigeben.'HIVPP:5:1:3+@8@VOPID123'");
+    assert!(!reports_no_deviation(&r));
+    let mut c = FinTsConnector::new("20041111");
+    order_for(&mut c);
+    let check = c.evaluate_payee(&r).unwrap();
+    assert_eq!(check.result, PayeeMatch::NotPossible);
+}
+
+#[test]
+fn a_missing_result_with_3945_or_3090_still_asks_the_user() {
+    // 3945: the bank wants the confirmation, whatever HIVPP says.
+    let with_3945 = reply(
+        b"HIRMG:2:2+3060::Hinweise.'HIRMS:3:2:3+3945::Freigabe ohne VOP-Bestaetigung nicht moeglich.+3091::nicht benoetigt.'HIRMS:4:2:5+3955::Bitte in der App freigeben.'HIVPP:5:1:3+@8@VOPID123'",
+    );
+    assert!(!reports_no_deviation(&with_3945));
+    let mut c = FinTsConnector::new("20041111");
+    order_for(&mut c);
+    assert_eq!(
+        c.evaluate_payee(&with_3945).unwrap().result,
+        PayeeMatch::NotPossible
+    );
+
+    // 3090 ("check the result") with the explanatory text, which must be shown.
+    let with_3090 = reply(
+        b"HIRMG:2:2+3060::Hinweise.'HIRMS:3:2:3+3090::Ergebnis Namensabgleich pruefen.+3091::nicht benoetigt.'HIRMS:4:2:5+3955::Bitte in der App freigeben.'HIVPP:5:1:3+@8@VOPID123++++++Bitte pruefen'",
+    );
+    assert!(!reports_no_deviation(&with_3090));
+    let mut c = FinTsConnector::new("20041111");
+    order_for(&mut c);
+    let check = c.evaluate_payee(&with_3090).unwrap();
+    assert_eq!(check.result, PayeeMatch::NotPossible);
+    assert_eq!(check.notice.as_deref(), Some("Bitte pruefen"));
+}
+
+#[test]
+fn a_reported_result_next_to_3091_still_asks_the_user() {
+    // A result the bank does report is never skipped because of 3091.
+    for code in ["RVNA", "RVMC", "RVNM", "PDNG"] {
+        let raw = format!(
+            "HIRMG:2:2+3060::Hinweise.'HIRMS:3:2:3+3091::nicht benoetigt.'HIRMS:4:2:5+3955::Bitte in der App freigeben.'HIVPP:5:1:3+@8@VOPID123+++++DE89370400440532013000::::{code}'"
+        );
+        let r = reply(raw.as_bytes());
+        let mut c = FinTsConnector::new("20041111");
+        order_for(&mut c);
+        assert!(c.evaluate_payee(&r).is_some(), "{code}");
+    }
+}
+
+#[tokio::test]
+async fn confirming_a_negative_result_after_3091_resends_nothing() {
+    // The order is already with the bank (3091 + 3955): "send anyway" must
+    // continue that challenge. HKVPA + HKCCS + HKTAN again was rejected with
+    // 9010 on the order.
+    let r = reply(
+        b"HIRMG:2:2+3060::Hinweise.'HIRMS:3:2:3+3091::VOP-Ausfuehrungsauftrag nicht benoetigt.'HIRMS:4:2:5+3955::Auftrag empfangen - Bitte Auftrag in Ihrer App freigeben.'HIVPP:5:1:3+@8@VOPID123+++++DE89370400440532013000::::RVNA'",
+    );
+    let mut c = FinTsConnector::new("20041111");
+    order_for(&mut c);
+    let check = c.evaluate_payee(&r).unwrap();
+    assert_eq!(check.result, PayeeMatch::NotPossible);
+    c.keep_challenge_on_3091(&r, false).unwrap();
+    assert!(!c.vop_with_tan);
+    assert!(c.vop_resume.is_some());
+    c.vop_pending = Some(check.result);
+
+    // The connector has no URL: any message sent here would fail the call.
+    let phase = c.confirm_payee(&test_ctx()).await.unwrap();
+    assert!(matches!(phase, Phase::Challenge(_)), "{phase:?}");
+    assert!(c.vop_resume.is_none());
+    // A second confirmation is refused, as before.
+    assert!(c.confirm_payee(&test_ctx()).await.is_err());
+}
+
+#[test]
+fn the_3091_challenge_is_only_kept_when_the_reply_carries_it() {
+    let with_3091 = reply(
+        b"HIRMG:2:2+3060::Hinweise.'HIRMS:3:2:3+3091::nicht benoetigt.'HIRMS:4:2:5+3955::Bitte in der App freigeben.'",
+    );
+    // After polling the last reply answers a bare HKVPP: nothing to keep.
+    let mut c = FinTsConnector::new("20041111");
+    c.keep_challenge_on_3091(&with_3091, true).unwrap();
+    assert!(c.vop_resume.is_none());
+    // 3945 (confirmation needed): HKVPA + order are sent again, nothing to keep.
+    let confirm = reply(
+        b"HIRMG:2:2+3060::Hinweise.'HIRMS:3:2:3+3945::Freigabe ohne VOP-Bestaetigung nicht moeglich.'HIRMS:4:2:5+3955::Bitte in der App freigeben.'",
+    );
+    c.keep_challenge_on_3091(&confirm, false).unwrap();
+    assert!(c.vop_resume.is_none());
+    // No 3091: unchanged.
+    let plain = reply(b"HIRMG:2:2+3060::Hinweise.'HIRMS:4:2:5+3955::Bitte in der App freigeben.'");
+    c.keep_challenge_on_3091(&plain, false).unwrap();
+    assert!(c.vop_resume.is_none());
+    // A new order forgets what the previous one kept.
+    c.keep_challenge_on_3091(&with_3091, false).unwrap();
+    assert!(c.vop_resume.is_some());
+    c.begin_order();
+    assert!(c.vop_resume.is_none());
+}
+
+#[test]
+fn transfer_errors_name_the_rejected_segment() {
+    // Berliner Sparkasse, second message: HKVPA (#3) is fine, the order (#4) is not.
+    let r = BankReply {
+        segments: Vec::new(),
+        codes: vec![
+            (
+                "9050".into(),
+                None,
+                "Die Nachricht enthält Fehler.".into(),
+                vec![],
+            ),
+            ("0020".into(), Some(3), "In Ordnung.".into(), vec![]),
+            ("9010".into(), Some(4), "Systemfehler".into(), vec![]),
+        ],
+        sent: HashMap::from([(3, "HKVPA".to_string()), (4, "HKCCS".to_string())]),
+    };
+    match r.check_transfer() {
+        Err(CoreError::Bank { code, message }) => {
+            assert_eq!(code, "9050");
+            assert!(message.contains("9010"), "{message}");
+            assert!(message.contains("[HKCCS #4]"), "{message}");
+            assert!(!message.contains("HKVPA"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn builds_hkcaz_with_escaped_camt_urn() {
     let mut c = FinTsConnector::new("52090000");
     c.st.versions.insert("HKCAZ".into(), vec![1]);
@@ -1125,6 +1656,7 @@ fn builds_hkcaz_with_escaped_camt_urn() {
         account_number: String::new(),
         sub_account: String::new(),
         blz: "52090000".into(),
+        full_kti: false,
     };
     let seg = c.hkcaz(
         &acc,
@@ -1150,6 +1682,7 @@ fn builds_hkwpd_for_depot_with_touchdown() {
         account_number: "1234567".into(),
         sub_account: String::new(),
         blz: "12030000".into(),
+        full_kti: false,
     };
     assert_eq!(
         FinTsConnector::hkwpd(6, &acc, None),
@@ -1177,9 +1710,24 @@ fn loan_sub_accounts_get_distinct_labels() {
         account_number: "0098765400".into(),
         sub_account: sub.into(),
         blz: "52090000".into(),
+        full_kti: false,
     };
     assert_ne!(account_label(&mk("01")), account_label(&mk("02")));
     assert_eq!(account_label(&mk("")), "0098765400");
+}
+
+#[test]
+fn transfers_use_the_dk_profile_when_the_bank_lists_only_that() {
+    // #1792: comdirect lists only pain.001.003.03 for HKCCS; the .001.03 we sent is not among
+    // its formats ("Sepa-Format nicht mehr gültig"), and .001.09 is answered with 9110.
+    let mut c = FinTsConnector::new("20041111");
+    c.st.pain_formats.insert(
+        "HKCCS".into(),
+        vec![sepa::PAIN_DK_03_DESCRIPTOR.to_string()],
+    );
+    let v = c.pain_version("HKCCS");
+    assert_eq!(v, Some(sepa::PainVersion::V03Dk));
+    assert!(v.unwrap().descriptor().ends_with("pain.001.003.03"));
 }
 
 #[test]
@@ -1219,5 +1767,1270 @@ fn fints_date_needs_eight_ascii_digits() {
     assert_eq!(fints_date("20261107").as_deref(), Some("2026-11-07"));
     assert_eq!(fints_date("202ä1107"), None); // 8 bytes, not 8 digits
     assert_eq!(fints_date("2026110"), None);
+    assert_eq!(fints_date("20260230"), None);
     assert_eq!(fints_date(""), None);
+}
+
+#[test]
+fn pain_header_is_well_formed_and_always_names_the_owner() {
+    let h = sepa::PainHeader::new("  Max Mustermann ");
+    assert_eq!(h.owner, "Max Mustermann");
+    assert_eq!(sepa::PainHeader::new(" ").owner, "Kontoinhaber");
+    assert!(
+        jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", &h.created).is_ok(),
+        "{}",
+        h.created
+    );
+    // GC + timestamp + 8 hex digits, within the 35 characters pain allows.
+    assert!(h.message_id.starts_with("GC") && h.message_id.len() == 24);
+}
+
+#[test]
+fn orders_need_a_two_step_tan_method() {
+    let mut c = FinTsConnector::new("20041111");
+    assert!(matches!(
+        c.require_tan_method("refused"),
+        Err(CoreError::Bank { code, message }) if code == "HKTAN" && message == "refused"
+    ));
+    c.st.sec_func = "946".into();
+    assert!(c.require_tan_method("refused").is_ok());
+}
+
+fn order_connector(url: &str) -> FinTsConnector {
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSPA": [1]}, "tan_required": {}});
+    two_step_connector(url, state)
+}
+
+#[tokio::test]
+async fn order_source_account_honours_the_upd_and_says_why_it_is_missing() {
+    // The bank offers HKSPA but rejects it: the UPD alone still lists the account.
+    let (url, _) = mock_bank(vec![REJECT_9010]);
+    let mut c = order_connector(&url);
+    c.upd = vec![upd_acc(
+        "0532013000",
+        "",
+        IBAN_A,
+        "Girokonto",
+        &["HKSAL", "HKCCS"],
+    )];
+    let ctx = test_ctx();
+
+    let acc = c
+        .source_account(&ctx, "DE89 3704 0044 0532 0130 00", "HKCCS")
+        .await
+        .unwrap();
+    assert_eq!(acc.map(|a| a.iban).as_deref(), Some(IBAN_A));
+    assert!(
+        c.source_account(&ctx, IBAN_A, "HKIPZ")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The HKSPA error explains the missing account.
+    match c.source_account(&ctx, IBAN_B, "HKCCS").await {
+        Err(CoreError::NotFound { what }) => assert!(what.contains("HKSPA"), "{what}"),
+        other => panic!("{:?}", other.map(|a| a.map(|a| a.iban))),
+    }
+}
+
+#[tokio::test]
+async fn order_source_account_without_upd_restrictions_allows_every_order() {
+    // IBAN_B is known only from HKSPA (no UPD entry); IBAN_A's UPD lists nothing.
+    let (url, _) = mock_bank(vec![
+        "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'HISPA:3:1:3+J:DE02120300000000202051:BYLADEM1001:202051::280:12030000'",
+    ]);
+    let mut c = order_connector(&url);
+    c.upd = vec![upd_acc("0532013000", "", IBAN_A, "Girokonto", &[])];
+    let ctx = test_ctx();
+
+    for iban in [IBAN_A, IBAN_B] {
+        let acc = c.source_account(&ctx, iban, "HKCCS").await.unwrap();
+        assert_eq!(acc.map(|a| a.iban).as_deref(), Some(iban));
+    }
+}
+
+/// One savings account that allows only HKSAL, against a bank answering `hksal`.
+async fn fetch_savings(hksal: &'static str) -> FetchResult {
+    let (url, _) = mock_bank(vec![hksal]);
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSAL": [7]}, "tan_required": {}});
+    let mut c = two_step_connector(&url, state);
+    let mut savings = upd_acc("0532013000", "", IBAN_A, "Tagesgeld", &["HKSAL"]);
+    savings.kind_code = 10;
+    c.upd = vec![savings];
+    c.fetch(&test_ctx()).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_balance_the_bank_did_not_send_is_unknown_not_zero() {
+    // #998: no HISAL and no statement to take a closing balance from: the stored
+    // balance must stay, the 0 in `balance_cents` is only a placeholder.
+    let r = fetch_savings(ACCEPT).await;
+    assert_eq!(r.accounts.len(), 1);
+    assert_eq!(r.accounts[0].kind, AccountKind::Savings);
+    assert_eq!(r.balances_unknown, vec![r.accounts[0].external_ref.clone()]);
+
+    let r = fetch_savings(
+        "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'HISAL:3:7:3+DE89370400440532013000+Tagesgeld+EUR+C:1234,56:EUR:20261118'",
+    )
+    .await;
+    assert_eq!(r.accounts[0].balance_cents, 123_456);
+    assert!(r.balances_unknown.is_empty());
+}
+
+#[test]
+fn own_account_transfer_from_savings_uses_hkcum() {
+    // #1513: the savings account allows only SEPA-Umbuchung, the current account both.
+    let mut c = FinTsConnector::new("37040044");
+    c.upd = vec![
+        upd_acc("0532013000", "", IBAN_A, "Tagesgeld", &["HKSAL", "HKCUM"]),
+        upd_acc(
+            "0000202051",
+            "",
+            IBAN_B,
+            "Girokonto",
+            &["HKSAL", "HKCCS", "HKCUM"],
+        ),
+    ];
+    // Savings → own current account: Umbuchung, also with spaces in the IBAN.
+    assert!(c.is_upd_internal_transfer(IBAN_A, IBAN_B));
+    assert!(c.is_upd_internal_transfer("DE89 3704 0044 0532 0130 00", IBAN_B));
+    // A source that allows HKCCS keeps the regular transfer.
+    assert!(!c.is_upd_internal_transfer(IBAN_B, IBAN_A));
+    // A recipient outside this login is never an Umbuchung.
+    assert!(!c.is_upd_internal_transfer(IBAN_A, "DE75512108001245126199"));
+    // Without an explicit HKCUM in the UPD nothing changes.
+    c.upd[0] = upd_acc("0532013000", "", IBAN_A, "Tagesgeld", &["HKSAL"]);
+    assert!(!c.is_upd_internal_transfer(IBAN_A, IBAN_B));
+}
+
+/// The bank wants a TAN for the request it just got (0030, #1083).
+const TAN_DEMANDED: &str = "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'HIRMS:3:2:4+0030::Auftrag empfangen - TAN erforderlich.'HITAN:4:6:4+4++TASK1+TAN eingeben'";
+
+/// A login of two accounts, the second one's camt request answered with 0030 and
+/// a TAN task (#1083), fetched from `since`; with the segments each request held.
+async fn fetch_when_camt_wants_a_tan(
+    since: &str,
+) -> (
+    FetchResult,
+    std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+) {
+    let (url, seen) = mock_bank(vec![BALANCE, TAN_DEMANDED]);
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSAL": [7], "HKCAZ": [1], "HKKAZ": [7]}, "tan_required": {"HKCAZ": true, "HKKAZ": true}, "camt_formats": ["urn:iso:std:iso:20022:tech:xsd:camt.052.001.08"]});
+    let mut c = two_step_connector(&url, state);
+    c.upd = vec![
+        upd_acc("0532013000", "", IBAN_A, "Girokonto", &["HKSAL"]),
+        upd_acc(
+            "0000202051",
+            "",
+            IBAN_B,
+            "Verrechnungskonto",
+            &["HKCAZ", "HKKAZ"],
+        ),
+    ];
+    let ctx = ConnectContext {
+        since: since.into(),
+        ..test_ctx()
+    };
+    (c.fetch(&ctx).await.unwrap(), seen)
+}
+
+fn days_ago(n: i64) -> String {
+    crate::dates::iso(crate::dates::today() - crate::dates::days(n))
+}
+
+#[tokio::test]
+async fn bookings_that_need_a_tan_are_reported_and_not_requested_twice() {
+    // #1083 (flatex): the camt request gets 0030, a TAN the running fetch cannot
+    // ask for. MT940 would only send the next TAN to the app; the other
+    // account's balance is stored and the failure reported with the sync.
+    let (r, seen) = fetch_when_camt_wants_a_tan(&days_ago(30)).await;
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[1].iter().any(|i| i == "HKCAZ"), "{seen:?}");
+        assert!(!seen.iter().flatten().any(|i| i == "HKKAZ"), "{seen:?}");
+    }
+    // within the 90 days banks serve without a TAN, a shorter period would not help (#1627)
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].starts_with(IBAN_B), "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("HKCAZ"), "{:?}", r.warnings);
+    assert!(r.hints.is_empty(), "{:?}", r.hints);
+    // B's balance was not read: the stored one stays; A's was
+    assert_eq!(r.balances_unknown, vec![IBAN_B.to_string()]);
+    let a = r
+        .accounts
+        .iter()
+        .find(|a| a.external_ref == IBAN_A)
+        .unwrap();
+    assert_eq!(a.balance_cents, 123_456);
+}
+
+#[tokio::test]
+async fn a_tan_for_a_long_period_is_reported_with_one_hint_for_the_sync() {
+    // #1627 (comdirect): two years back on a first fetch; every account that
+    // fails says why, the way out is said once
+    let (r, _) = fetch_when_camt_wants_a_tan(&days_ago(730)).await;
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].starts_with(IBAN_B), "{:?}", r.warnings);
+    assert_eq!(r.hints, vec![dialog::period_hint().to_string()]);
+}
+
+#[tokio::test]
+async fn a_sync_that_read_nothing_puts_the_period_hint_into_its_error() {
+    // #1627: no account worked, so there is no sync result to carry the hint
+    let (url, _) = mock_bank(vec![TAN_DEMANDED]);
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKCAZ": [1]}, "tan_required": {"HKCAZ": true}, "camt_formats": ["urn:iso:std:iso:20022:tech:xsd:camt.052.001.08"]});
+    let mut c = two_step_connector(&url, state);
+    c.upd = vec![upd_acc(
+        "0000202051",
+        "",
+        IBAN_B,
+        "Verrechnungskonto",
+        &["HKCAZ"],
+    )];
+    let ctx = ConnectContext {
+        since: days_ago(730),
+        ..test_ctx()
+    };
+    let e = c.fetch(&ctx).await.unwrap_err().to_string();
+    assert!(e.contains("HKCAZ"), "{e}");
+    assert!(e.contains(dialog::period_hint()), "{e}");
+}
+
+#[test]
+fn only_a_tan_demand_for_a_period_beyond_90_days_calls_for_the_period_hint() {
+    let bank = |code: &str| CoreError::Bank {
+        code: code.into(),
+        message: "x".into(),
+    };
+    let ctx = |days: i64| ConnectContext {
+        since: days_ago(days),
+        ..test_ctx()
+    };
+    assert!(dialog::tan_beyond_free_period(&ctx(91), &bank("0030")));
+    // what banks serve without a TAN: a shorter period would not help
+    assert!(!dialog::tan_beyond_free_period(&ctx(90), &bank("0030")));
+    // the request is sent with the login's start, not with one account's
+    let mut mixed = ctx(30);
+    mixed.since_by_account.insert(IBAN_A.into(), days_ago(730));
+    assert!(!dialog::tan_beyond_free_period(&mixed, &bank("0030")));
+    // other answers are no TAN demand for a period
+    assert!(!dialog::tan_beyond_free_period(&ctx(730), &bank("9050")));
+    assert!(!dialog::tan_beyond_free_period(&ctx(730), &bank("3956")));
+}
+
+#[test]
+fn the_period_hint_survives_the_log_scrubber_in_every_language() {
+    // "TAN:" would be taken for a TAN value and blanked in the log row
+    for lang in [crate::i18n::Lang::De, crate::i18n::Lang::En] {
+        let hint = crate::i18n::with_language(lang, dialog::period_hint);
+        assert_eq!(crate::sync_log::scrub(hint, ""), hint, "{lang:?}");
+    }
+}
+
+#[test]
+fn hispas_advertises_pain_001_09_for_hkccs() {
+    let mut c = FinTsConnector::new("20041133");
+    c.learn_bpd(&reply(
+        b"HICCSS:10:1:3+1+1+0'HISPAS:11:1:3+1+1+0+J:N:N:sepade.pain.001.001.09.xsd:urn?:iso?:std?:iso?:20022?:tech?:xsd?:pain.008.001.08'",
+    ));
+    assert_eq!(c.pain_version("HKCCS"), Some(super::sepa::PainVersion::V09));
+}
+
+#[test]
+fn hispas_advertises_pain_001_09_for_standing_order_query() {
+    // #1647: a bank that lists its SEPA schemas only in HISPAS (no HICDBS) must get
+    // pain.001.001.09 for HKCDB too, not the .03 fallback ("SEPA-Deskriptor laut BPD nicht zugelassen").
+    let mut c = FinTsConnector::new("50010517");
+    assert_eq!(c.pain_version("HKCDB"), Some(super::sepa::PainVersion::V03));
+    c.learn_bpd(&reply(
+        b"HISPAS:11:1:3+1+1+0+J:N:N:sepade.pain.001.001.09.xsd:urn?:iso?:std?:iso?:20022?:tech?:xsd?:pain.008.001.08'",
+    ));
+    assert_eq!(c.pain_version("HKCDB"), Some(super::sepa::PainVersion::V09));
+}
+
+#[test]
+fn a_new_bpd_version_drops_a_withdrawn_pain_format() {
+    // The bank withdraws .001.09 from HISPAS with a new BPD version: HKCDB and HKCCS
+    // must fall back to .03 instead of keeping the stored .09.
+    let mut c = FinTsConnector::new("50010517");
+    c.learn_bpd(&reply(
+        b"HIBPA:5:3:3+6+280:50010517+Testbank+1'HISPAS:11:1:3+1+1+0+J:N:N:sepade.pain.001.001.09.xsd'",
+    ));
+    assert_eq!(c.pain_version("HKCDB"), Some(super::sepa::PainVersion::V09));
+    c.learn_bpd(&reply(
+        b"HIBPA:5:3:3+7+280:50010517+Testbank+1'HISPAS:11:1:3+1+1+0+J:N:N:sepade.pain.001.001.03.xsd'",
+    ));
+    assert_eq!(c.pain_version("HKCDB"), Some(super::sepa::PainVersion::V03));
+    assert_eq!(c.pain_version("HKCCS"), Some(super::sepa::PainVersion::V03));
+}
+
+#[test]
+fn partial_replies_and_the_same_bpd_version_keep_learned_pain_formats() {
+    let mut c = FinTsConnector::new("50010517");
+    c.learn_bpd(&reply(
+        b"HIBPA:5:3:3+6+280:50010517+Testbank+1'HISPAS:11:1:3+1+1+0+J:N:N:sepade.pain.001.001.09.xsd'",
+    ));
+    // a reply without HIBPA/HISPAS (e.g. the TAN media list) removes nothing
+    c.learn_bpd(&reply(b"HITAB:4:4:3+0'"));
+    assert_eq!(c.pain_version("HKCDB"), Some(super::sepa::PainVersion::V09));
+    // a second message of the same BPD version (other dialog) is merged, not replaced
+    c.learn_bpd(&reply(
+        b"HIBPA:5:3:3+6+280:50010517+Testbank+1'HISPAS:11:1:3+1+1+0+J:N:N:sepade.pain.001.001.03.xsd'",
+    ));
+    assert_eq!(c.pain_version("HKCDB"), Some(super::sepa::PainVersion::V09));
+}
+
+#[tokio::test]
+async fn a_rejected_account_list_is_no_warning_when_the_upd_lists_the_accounts() {
+    // #1083 (flatex): HKSPA is answered with 9380 on every sync; the UPD lists
+    // every account, so the sync is complete and must not say otherwise.
+    const NO_PERMISSION: &str = "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+9050::Teilweise fehlerhaft.'HIRMS:3:2:3+9380::Benutzer hat keine Auftragsberechtigung.'";
+    let (url, _) = mock_bank(vec![NO_PERMISSION, BALANCE]);
+    let mut c = order_connector(&url);
+    c.st.versions.insert("HKSAL".into(), vec![7]);
+    c.upd = vec![upd_acc("0532013000", "", IBAN_A, "Girokonto", &["HKSAL"])];
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    // the sync went on after the rejection: the balance was read
+    assert_eq!(r.accounts.len(), 1);
+    assert_eq!(r.accounts[0].balance_cents, 123_456);
+
+    // Without UPD accounts the rejection is the reason nothing came: still reported.
+    let (url, _) = mock_bank(vec![NO_PERMISSION]);
+    let e = order_connector(&url).fetch(&test_ctx()).await.unwrap_err();
+    assert!(e.to_string().contains("HKSPA"), "{e}");
+}
+
+// ------------------------------------------------- TAN prompts during the fetch (#1730)
+
+/// flatex's answer to `HKSAL` + `HKTAN` (#1083): a TAN to type for task TASK1.
+const SAL_TAN_DEMANDED: &str = "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+3060::Bitte beachten Sie die enthaltenen Warnungen/Hinweise.'HIRMS:3:2:4+3060::Die bereits reservierte TAN wurde entwertet.+0030::Auftrag empfangen - TAN erforderlich.'HITAN:4:6:4+4++TASK1+Bitte geben Sie die TAN ein.'";
+/// An app approval for task TASK1, and the status query's answer while it is open.
+const SAL_APPROVAL_DEMANDED: &str = "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+3060::Bitte beachten Sie die enthaltenen Warnungen/Hinweise.'HIRMS:3:2:4+3955::Sicherheitsfreigabe erfolgt über anderen Kanal.'HITAN:4:6:4+4++TASK1+Bitte in der App freigeben.'";
+const APPROVAL_OPEN: &str = "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+3060::Bitte beachten Sie die enthaltenen Warnungen/Hinweise.'HIRMS:3:2:3+3956::Starke Kundenauthentifizierung noch ausstehend.'";
+/// Account A's balance 1234,56 EUR, the reply to the TAN or the approved status query.
+const SAL_A: &str = "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'HISAL:3:7:3+DE89370400440532013000+Tagesgeld+EUR+C:1234,56:EUR:20261118'";
+
+/// A prompt whose questions `answer` decides; the questions asked are returned
+/// by the handle once the prompt is dropped.
+fn answering_prompt(
+    mut answer: impl FnMut(&Phase) -> Option<crate::connectors::PromptAnswer> + Send + 'static,
+) -> (
+    crate::connectors::FetchPrompt,
+    tokio::task::JoinHandle<Vec<Phase>>,
+) {
+    let (prompt, mut questions) = crate::connectors::FetchPrompt::channel();
+    let asked = tokio::spawn(async move {
+        let mut asked = Vec::new();
+        while let Some((q, reply)) = questions.recv().await {
+            // `None`: no answer, as when the user cancels
+            if let Some(a) = answer(&q) {
+                let _ = reply.send(a);
+            }
+            asked.push(q);
+        }
+        asked
+    });
+    (prompt, asked)
+}
+
+fn challenge(phase: &Phase) -> &Challenge {
+    match phase {
+        Phase::Challenge(c) | Phase::Pending(c) => c,
+        _ => panic!("no challenge"),
+    }
+}
+
+/// One savings account that allows only HKSAL, which needs a TAN at the bank.
+fn savings_needing_sca(url: &str) -> FinTsConnector {
+    savings_needing_sca_seen(url, &[])
+}
+
+/// [`savings_needing_sca`] after syncs that found the bank wanting SCA for `sca_seen` (#1828).
+fn savings_needing_sca_seen(url: &str, sca_seen: &[&str]) -> FinTsConnector {
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSAL": [7], "HKTAN": [6]}, "tan_required": {"HKSAL": true}, "sca_seen": sca_seen});
+    let mut c = two_step_connector(url, state);
+    let mut savings = upd_acc("0532013000", "", IBAN_A, "Tagesgeld", &["HKSAL"]);
+    savings.kind_code = 10;
+    c.upd = vec![savings];
+    // a task left from the login must not be answered
+    c.task_reference = Some("LOGINTASK".into());
+    c
+}
+
+#[tokio::test]
+async fn a_tan_the_bank_wants_during_the_fetch_is_asked_for_and_sent() {
+    // #1083 (flatex): HKSAL gets 0030; the user types the TAN, the bank answers
+    // the HKTAN process 2 with the balance
+    let (url, seen) = mock_bank(vec![SAL_TAN_DEMANDED, SAL_A]);
+    let mut c = savings_needing_sca(&url);
+    let (prompt, asked) = answering_prompt(|_| {
+        Some(crate::connectors::PromptAnswer::Code(SecretString::new(
+            "123456".into(),
+        )))
+    });
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(r.accounts[0].balance_cents, 123_456);
+    assert!(r.balances_unknown.is_empty());
+    let asked = asked.await.unwrap();
+    assert_eq!(asked.len(), 1);
+    let q = challenge(&asked[0]);
+    assert!(matches!(asked[0], Phase::Challenge(_)));
+    assert_eq!(q.kind, crate::connectors::ChallengeKind::Code);
+    assert_eq!(q.title, trf("TAN für {0}", &[&tr("Saldo")]));
+    assert_eq!(q.message, "Bitte geben Sie die TAN ein.");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    // the TAN goes with HKTAN alone, the order is not sent again
+    assert!(
+        has_hktan(&seen[1]) && !seen[1].iter().any(|i| i == "HKSAL"),
+        "{seen:?}"
+    );
+    assert_eq!(c.task_reference.as_deref(), Some("TASK1"));
+}
+
+#[tokio::test]
+async fn a_tan_asked_for_during_the_fetch_is_remembered_for_the_next_sync() {
+    // #1828: the bank wanted a TAN for HKSAL; the next automatic sync leaves it out
+    let (url, _seen) = mock_bank(vec![SAL_TAN_DEMANDED, SAL_A]);
+    let mut c = savings_needing_sca(&url);
+    assert!(c.st.sca_seen.is_empty());
+    let (prompt, asked) = answering_prompt(|_| {
+        Some(crate::connectors::PromptAnswer::Code(SecretString::new(
+            "123456".into(),
+        )))
+    });
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert_eq!(asked.await.unwrap().len(), 1);
+    assert!(c.st.sca_seen.contains("HKSAL"), "{:?}", c.st.sca_seen);
+    // the bank took the TAN: replies without SCA later in this dialog prove nothing
+    assert!(c.sca_in_dialog);
+    // part of the state that is stored with the login
+    let stored = serde_json::to_value(&c.st).unwrap();
+    assert_eq!(stored["sca_seen"], serde_json::json!(["HKSAL"]));
+}
+
+#[tokio::test]
+async fn a_tan_demanded_in_an_automatic_fetch_is_remembered_and_not_sent_again() {
+    // #1828: the first automatic sync learns it (nothing is known yet, the request goes out),
+    // the next one, from the stored state, sends nothing for HKSAL
+    let (url, seen) = mock_bank(vec![SAL_TAN_DEMANDED]);
+    let mut c = savings_needing_sca(&url);
+    assert!(c.fetch(&test_ctx()).await.is_err());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(c.st.sca_seen.contains("HKSAL"), "{:?}", c.st.sca_seen);
+
+    let state = serde_json::to_value(&c.st).unwrap();
+    let (url, seen) = mock_bank(vec![SAL_A]);
+    let mut next = savings_needing_sca(&url);
+    next.st = serde_json::from_value(state).unwrap();
+    let e = next.fetch(&test_ctx()).await.unwrap_err().to_string();
+    assert!(e.contains("HKSAL"), "{e}");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_automatic_fetch_leaves_out_what_the_bank_wants_a_tan_for() {
+    // #1828: A's balance (HKSAL) is known to need a TAN, B's bookings (MT940) do not:
+    // no HKSAL goes out, the warning names it and A's stored balance stays
+    let (url, seen) = mock_bank(vec![reply_with_binary(
+        "HIKAZ:3:7:3+",
+        MT940_CLOSING_347655,
+    )]);
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSAL": [7], "HKKAZ": [7], "HKTAN": [6]}, "tan_required": {"HKSAL": true}, "sca_seen": ["HKSAL"]});
+    let mut c = two_step_connector(&url, state);
+    c.upd = vec![
+        upd_acc("0532013000", "", IBAN_A, "Tagesgeld", &["HKSAL"]),
+        upd_acc("0000202051", "", IBAN_B, "Girokonto", &["HKKAZ"]),
+    ];
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    {
+        let seen = seen.lock().unwrap();
+        assert!(!seen.iter().flatten().any(|i| i == "HKSAL"), "{seen:?}");
+        assert!(seen.iter().flatten().any(|i| i == "HKKAZ"), "{seen:?}");
+    }
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].starts_with(IBAN_A), "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("HKSAL"), "{:?}", r.warnings);
+    assert_eq!(r.balances_unknown, vec![IBAN_A.to_string()]);
+    let b = r
+        .accounts
+        .iter()
+        .find(|a| a.external_ref == IBAN_B)
+        .unwrap();
+    assert_eq!(b.balance_cents, 347_655);
+    // still known for the next sync
+    assert!(c.st.sca_seen.contains("HKSAL"));
+}
+
+#[tokio::test]
+async fn a_failed_fetch_hands_back_the_jobs_it_found_out_about() {
+    // #1828: a bank that wants a TAN for every job: nothing is read, the sync fails, and the
+    // state with `sca_seen` still has to reach the sync session, or the next sync asks again
+    let (url, _seen) = mock_bank(vec![SAL_TAN_DEMANDED]);
+    let mut c = savings_needing_sca(&url);
+    assert!(
+        c.state_after_failed_fetch().is_none(),
+        "nothing learned yet"
+    );
+    assert!(c.fetch(&test_ctx()).await.is_err());
+    let kept: FinTsState = c.state_after_failed_fetch().unwrap().decode().unwrap();
+    assert!(kept.sca_seen.contains("HKSAL"), "{:?}", kept.sca_seen);
+    // the next sync, from that state, sends nothing for it
+    let (url, seen) = mock_bank(vec![SAL_A]);
+    let mut next = savings_needing_sca(&url);
+    next.st = kept;
+    assert!(next.fetch(&test_ctx()).await.is_err());
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+    // and had nothing new to tell
+    assert!(next.state_after_failed_fetch().is_none());
+}
+
+#[tokio::test]
+async fn forgetting_a_job_is_kept_too_when_the_fetch_fails() {
+    // the bank answers the job without SCA now (so it is forgotten), another job then fails
+    let (url, _seen) = mock_bank(vec![SAL_A]);
+    let mut c = savings_needing_sca_seen(&url, &["HKSAL", "HKKAZ"]);
+    let (prompt, asked) = answering_prompt(|_| None);
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert!(asked.await.unwrap().is_empty());
+    let kept: FinTsState = c.state_after_failed_fetch().unwrap().decode().unwrap();
+    assert_eq!(
+        kept.sca_seen.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["HKKAZ"]
+    );
+}
+
+#[tokio::test]
+async fn a_job_answered_without_sca_is_sent_again_by_the_next_automatic_sync() {
+    // #1828: the bank no longer wants a TAN (an exemption, a new login method): forgotten
+    let (url, seen) = mock_bank(vec![SAL_A]);
+    let mut c = savings_needing_sca_seen(&url, &["HKSAL"]);
+    // a sync the user started sends it, whatever was seen
+    let (prompt, asked) = answering_prompt(|_| None);
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert!(asked.await.unwrap().is_empty());
+    assert_eq!(r.accounts[0].balance_cents, 123_456);
+    assert!(c.st.sca_seen.is_empty(), "{:?}", c.st.sca_seen);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    // an automatic one now asks for it again
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    assert_eq!(r.accounts[0].balance_cents, 123_456);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_reply_without_sca_after_an_approval_in_the_dialog_is_not_remembered() {
+    // #1828: a bank that asked once per dialog answers the next job without SCA: that says
+    // nothing about the next sync, the job stays on the list
+    let (url, seen) = mock_bank(vec![SAL_A]);
+    let mut c = savings_needing_sca_seen(&url, &["HKSAL"]);
+    c.sca_in_dialog = true;
+    let (prompt, asked) = answering_prompt(|_| None);
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert!(asked.await.unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(c.st.sca_seen.contains("HKSAL"), "{:?}", c.st.sca_seen);
+}
+
+#[tokio::test]
+async fn a_skipped_tan_does_not_protect_what_later_replies_say() {
+    // #1828 (review): the user skips the TAN for HKSAL, nothing was approved in this dialog; the
+    // SCA-free answer to HKKAZ of the next account still clears its entry that is out of date
+    let (url, seen) = mock_bank(vec![
+        SAL_TAN_DEMANDED,
+        reply_with_binary("HIKAZ:3:7:3+", MT940_CLOSING_347655),
+    ]);
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSAL": [7], "HKKAZ": [7], "HKTAN": [6]}, "tan_required": {"HKSAL": true}, "sca_seen": ["HKKAZ"]});
+    let mut c = two_step_connector(&url, state);
+    c.upd = vec![
+        upd_acc("0532013000", "", IBAN_A, "Tagesgeld", &["HKSAL"]),
+        upd_acc("0000202051", "", IBAN_B, "Girokonto", &["HKKAZ"]),
+    ];
+    let (prompt, asked) = answering_prompt(|_| Some(crate::connectors::PromptAnswer::Skip));
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert_eq!(asked.await.unwrap().len(), 1);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(r.warnings[0].starts_with(IBAN_A), "{:?}", r.warnings);
+    assert!(!c.sca_in_dialog);
+    assert_eq!(
+        c.st.sca_seen.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["HKSAL"]
+    );
+}
+
+#[tokio::test]
+async fn a_tan_the_bank_does_not_accept_is_no_approval() {
+    // #1828 (review): the bank asks for the TAN again after the user typed one
+    let (url, _seen) = mock_bank(vec![SAL_TAN_DEMANDED]);
+    let mut c = savings_needing_sca(&url);
+    let (prompt, asked) = answering_prompt(|_| {
+        Some(crate::connectors::PromptAnswer::Code(SecretString::new(
+            "123456".into(),
+        )))
+    });
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    assert!(c.fetch(&ctx).await.is_err());
+    drop(ctx);
+    assert_eq!(asked.await.unwrap().len(), 1);
+    assert!(!c.sca_in_dialog);
+    assert!(c.st.sca_seen.contains("HKSAL"), "{:?}", c.st.sca_seen);
+}
+
+#[tokio::test]
+async fn a_skipped_tan_is_reported_and_the_rest_of_the_fetch_goes_on() {
+    // #1730: "Überspringen" leaves out the camt request of account B; its MT940
+    // is not tried either (it would only ask again), A's balance is stored
+    let (url, seen) = mock_bank(vec![BALANCE, TAN_DEMANDED]);
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSAL": [7], "HKCAZ": [1], "HKKAZ": [7]}, "tan_required": {"HKCAZ": true, "HKKAZ": true}, "camt_formats": ["urn:iso:std:iso:20022:tech:xsd:camt.052.001.08"]});
+    let mut c = two_step_connector(&url, state);
+    c.upd = vec![
+        upd_acc("0532013000", "", IBAN_A, "Girokonto", &["HKSAL"]),
+        upd_acc(
+            "0000202051",
+            "",
+            IBAN_B,
+            "Verrechnungskonto",
+            &["HKCAZ", "HKKAZ"],
+        ),
+    ];
+    let (prompt, asked) = answering_prompt(|_| Some(crate::connectors::PromptAnswer::Skip));
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        since: days_ago(30),
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    let asked = asked.await.unwrap();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(
+        challenge(&asked[0]).title,
+        trf("TAN für {0}", &[&tr("Umsätze")])
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].starts_with(IBAN_B), "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("HKCAZ"), "{:?}", r.warnings);
+    assert_eq!(r.balances_unknown, vec![IBAN_B.to_string()]);
+}
+
+#[tokio::test]
+async fn an_app_approval_during_the_fetch_is_shown_and_polled_by_the_front_end() {
+    // #1730: the approval is shown (no silent three-minute wait) and every poll
+    // of the front end is one status query
+    let (url, seen) = mock_bank(vec![SAL_APPROVAL_DEMANDED, APPROVAL_OPEN, SAL_A]);
+    let mut c = savings_needing_sca(&url);
+    let (prompt, asked) = answering_prompt(|_| Some(crate::connectors::PromptAnswer::Poll));
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(r.accounts[0].balance_cents, 123_456);
+    let asked = asked.await.unwrap();
+    assert_eq!(asked.len(), 2);
+    assert!(matches!(asked[0], Phase::Challenge(_)));
+    assert!(matches!(asked[1], Phase::Pending(_)));
+    let q = challenge(&asked[0]);
+    assert_eq!(q.kind, crate::connectors::ChallengeKind::DecoupledPush);
+    assert_eq!(
+        q.title,
+        trf("{0} in der Banking-App freigeben", &[&tr("Saldo")])
+    );
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    // #1828: the approval was given in this dialog
+    assert!(c.sca_in_dialog);
+}
+
+/// The user's side of a cancel: sets the session's flag when the first
+/// question comes, then answers it with `answer` (`None`: no answer).
+fn cancelling_prompt(
+    answer: Option<crate::connectors::PromptAnswer>,
+) -> (
+    crate::connectors::FetchPrompt,
+    crate::connectors::CancelFlag,
+    tokio::task::JoinHandle<()>,
+) {
+    let flag = crate::connectors::CancelFlag::default();
+    let (prompt, mut questions) = crate::connectors::FetchPrompt::cancelled_by(flag.clone());
+    let cancel = flag.clone();
+    let user = tokio::spawn(async move {
+        let (_, reply) = questions.recv().await.unwrap();
+        cancel.set();
+        if let Some(a) = answer {
+            let _ = reply.send(a);
+        }
+    });
+    (prompt, flag, user)
+}
+
+#[tokio::test]
+async fn after_a_cancel_during_the_fetch_nothing_more_goes_to_the_bank() {
+    // #1730: the first account's TAN is cancelled; the second account's
+    // requests fail before they are sent
+    let (url, seen) = mock_bank(vec![SAL_TAN_DEMANDED]);
+    let mut c = savings_needing_sca(&url);
+    c.upd
+        .push(upd_acc("0000202051", "", IBAN_B, "Tagesgeld", &["HKSAL"]));
+    let (prompt, cancelled, user) = cancelling_prompt(None);
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        cancelled,
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await;
+    user.await.unwrap();
+    assert!(r.is_err(), "nothing was read");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_cancel_right_after_the_answer_sends_no_tan() {
+    // review of #1733: the TAN was typed, the cancel came before it was sent
+    let (url, seen) = mock_bank(vec![SAL_TAN_DEMANDED, SAL_A]);
+    let mut c = savings_needing_sca(&url);
+    let (prompt, cancelled, user) = cancelling_prompt(Some(crate::connectors::PromptAnswer::Code(
+        SecretString::new("123456".into()),
+    )));
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        cancelled,
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await;
+    user.await.unwrap();
+    assert!(r.is_err(), "nothing was read");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_cancelled_automatic_fetch_sends_nothing_more() {
+    // review of #1733: an automatic sync has no prompt, the cancel reaches it anyway
+    let (url, seen) = mock_bank(vec![SAL_A]);
+    let mut c = savings_needing_sca(&url);
+    let ctx = test_ctx();
+    ctx.cancelled.set();
+    assert!(c.fetch(&ctx).await.is_err());
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn without_a_prompt_a_tan_during_the_fetch_still_fails_the_request() {
+    // automatic syncs (`begin_quiet_sync`) ask nobody: as before #1730
+    let (url, seen) = mock_bank(vec![SAL_TAN_DEMANDED]);
+    let mut c = savings_needing_sca(&url);
+    let e = c.fetch(&test_ctx()).await.unwrap_err().to_string();
+    assert!(e.contains("HKSAL"), "{e}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// One MT940 statement closing with 3476,55 EUR.
+const MT940_CLOSING_347655: &str = ":20:STARTUMSE\r\n:25:52090000/0012345678\r\n:28C:00000/001\r\n:60F:C250101EUR1000,00\r\n:61:2501030103CR2500,00NTRFNONREF\r\n:86:166?00GUTSCHRIFT?20SVWZ+Gehalt Januar?32Muster GmbH\r\n:62F:C250103EUR3476,55\r\n-\r\n";
+
+/// A bank reply carrying `prefix` with `data` as binary element (FinTS `@len@`).
+fn reply_with_binary(prefix: &str, data: &str) -> &'static str {
+    Box::leak(
+        format!(
+            "HNHBK:1:3+000000000000+300+DIALOG1+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'{prefix}@{}@{data}'",
+            data.len()
+        )
+        .into_boxed_str(),
+    )
+}
+
+#[tokio::test]
+async fn the_closing_balance_of_the_bookings_is_the_balance_with_its_date() {
+    // #1828: an account without HKSAL (or one whose HKSAL the bank wants a TAN for)
+    // takes the booked closing balance (:62F:) of its bookings, dated as the statement says
+    let mt940 = ":20:STARTUMSE\r\n:25:52090000/0012345678\r\n:28C:00000/001\r\n:60F:C250101EUR1000,00\r\n\
+        :61:2501020102DR23,45NDDTNONREF\r\n:86:105?00FOLGELASTSCHRIFT?20Einkauf REWE?32REWE Markt GmbH\r\n\
+        :62F:C250103EUR3476,55\r\n";
+    let (url, seen) = mock_bank(vec![reply_with_binary("HIKAZ:3:7:3+", mt940)]);
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKKAZ": [7]}, "tan_required": {}});
+    let mut c = two_step_connector(&url, state);
+    c.upd = vec![upd_acc(
+        "0532013000",
+        "",
+        IBAN_A,
+        "Verrechnungskonto",
+        &["HKKAZ"],
+    )];
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(
+        seen.lock().unwrap().iter().flatten().any(|i| i == "HKKAZ"),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+    assert_eq!(r.accounts.len(), 1);
+    assert_eq!(r.accounts[0].balance_cents, 347_655);
+    assert_eq!(r.accounts[0].balance_date, "2025-01-03");
+    assert!(r.balances_unknown.is_empty(), "{:?}", r.balances_unknown);
+}
+
+/// An HKWPD answer that carries no holdings statement and no error (#1743).
+const WPD_WITHOUT_DATA: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'HIRMS:3:2:3+3050::UPD nicht mehr aktuell.'";
+const WPD_WITH_DATA: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'HIRMS:3:2:3+0020::Auftrag ausgefuehrt.'HIWPD:4:6:3+@10@:16R:GENL-'";
+/// An HIWPD segment whose binary is empty: no statement, not an empty depot.
+const WPD_WITH_EMPTY_BINARY: &str = "HNHBK:1:3+000000000000+300+0+1'HIRMG:2:2+0010::Nachricht entgegengenommen.'HIRMS:3:2:3+0020::Auftrag ausgefuehrt.'HIWPD:4:6:3+@0@'";
+
+#[tokio::test]
+async fn holdings_answer_without_a_statement_is_an_error_not_an_empty_depot() {
+    let (url, _) = mock_bank(vec![WPD_WITHOUT_DATA]);
+    let mut c = two_step_connector(&url, synced());
+    let e = c
+        .holdings(&test_ctx(), &sepa_acc(IBAN_A, "1234567"))
+        .await
+        .unwrap_err()
+        .to_string();
+    // what the bank said instead is named; the routine 0010 is not
+    assert!(e.contains("3050 UPD nicht mehr aktuell"), "{e}");
+    assert!(!e.contains("0010"), "{e}");
+}
+
+#[tokio::test]
+async fn holdings_answer_with_a_statement_is_read() {
+    let (url, _) = mock_bank(vec![WPD_WITH_DATA]);
+    let mut c = two_step_connector(&url, synced());
+    let st = c
+        .holdings(&test_ctx(), &sepa_acc(IBAN_A, "1234567"))
+        .await
+        .expect("a statement without positions is an empty depot");
+    assert!(st.holdings.is_empty());
+}
+
+#[tokio::test]
+async fn holdings_answer_with_an_empty_statement_is_an_error_not_an_empty_depot() {
+    let (url, _) = mock_bank(vec![WPD_WITH_EMPTY_BINARY]);
+    let mut c = two_step_connector(&url, synced());
+    // the CRLF separator after an empty binary must not count as a statement (value 0)
+    let r = c.holdings(&test_ctx(), &sepa_acc(IBAN_A, "1234567")).await;
+    assert!(
+        r.is_err(),
+        "an empty HIWPD binary must not become an empty depot"
+    );
+}
+
+#[test]
+fn no_holdings_message_is_translated() {
+    use crate::i18n::{Lang, with_language};
+    let msg = with_language(Lang::En, || no_holdings_message(&["3050 x".into()]));
+    assert_eq!(msg, "The bank did not deliver any holdings (3050 x).");
+    let none = with_language(Lang::En, || no_holdings_message(&[]));
+    assert_eq!(none, "The bank did not deliver any holdings.");
+}
+
+/// One depot (Kontoart 30) that allows only HKWPD; `supported` = the bank lists HKWPD in its BPD.
+fn depot_connector(url: &str, supported: bool) -> FinTsConnector {
+    let versions = if supported {
+        serde_json::json!({"HKWPD": [6]})
+    } else {
+        serde_json::json!({})
+    };
+    let mut state = synced();
+    state["versions"] = versions;
+    let mut c = two_step_connector(url, state);
+    let mut depot = upd_acc("0532013000", "", IBAN_A, "Direkt-Depot", &["HKWPD"]);
+    depot.kind_code = 30;
+    c.upd = vec![depot];
+    c
+}
+
+#[tokio::test]
+async fn a_depot_the_bank_does_not_answer_fails_the_fetch_with_the_banks_codes() {
+    // #1743: no error code, no statement: not an empty depot worth 0 (alone it fails the sync)
+    let (url, _) = mock_bank(vec![WPD_WITHOUT_DATA]);
+    let r = depot_connector(&url, true)
+        .fetch(&test_ctx())
+        .await
+        .unwrap_err();
+    // nothing else worked either: the sync fails and says why
+    assert!(r.to_string().contains("3050 UPD nicht mehr aktuell"), "{r}");
+}
+
+#[tokio::test]
+async fn a_depot_without_hkwpd_at_the_bank_is_a_hint_not_a_failed_sync() {
+    // the only account of the login: nothing to fix, so the sync still ends (#1743)
+    let (url, seen) = mock_bank(vec![WPD_WITHOUT_DATA]);
+    let r = depot_connector(&url, false)
+        .fetch(&test_ctx())
+        .await
+        .expect("a depot the bank cannot serve is no failed sync");
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(
+        r.hints
+            .iter()
+            .any(|h| h.contains("von der Bank nicht angeboten")),
+        "{:?}",
+        r.hints
+    );
+    // the value stays as it was instead of becoming 0
+    assert_eq!(r.balances_unknown.len(), 1);
+    assert!(seen.lock().unwrap().is_empty(), "HKWPD is not sent");
+}
+
+#[tokio::test]
+async fn a_depot_without_hkwpd_keeps_its_value_even_when_hksal_answers() {
+    // the HKSAL figure of a depot is not its value: the stored one stays (#1743)
+    let (url, _) = mock_bank(vec![SAL_A]);
+    let mut c = depot_connector(&url, false);
+    c.st.versions.insert("HKSAL".into(), vec![7]);
+    c.upd[0].allowed.insert("HKSAL".into());
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    assert_eq!(r.balances_unknown.len(), 1, "{:?}", r.balances_unknown);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(
+        r.hints
+            .iter()
+            .any(|h| h.contains("von der Bank nicht angeboten")),
+        "{:?}",
+        r.hints
+    );
+}
+
+#[tokio::test]
+async fn a_depot_whose_holdings_were_not_delivered_does_not_take_the_hksal_figure() {
+    // HKSAL answers, HKWPD gets no statement: the cash figure is not the depot value (#1743)
+    let (url, _) = mock_bank(vec![SAL_A, WPD_WITHOUT_DATA]);
+    let mut c = depot_connector(&url, true);
+    c.st.versions.insert("HKSAL".into(), vec![7]);
+    c.upd[0].allowed.insert("HKSAL".into());
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    assert_eq!(r.balances_unknown.len(), 1, "{:?}", r.balances_unknown);
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+}
+
+#[tokio::test]
+async fn a_depot_without_hkwpd_does_not_take_the_closing_balance_of_its_bookings() {
+    // the MT940 fallback must not fill in what the unsupported HKWPD left unknown (#1743)
+    let mt940 = ":20:STARTUMSE\r\n:25:52090000/0012345678\r\n:28C:00000/001\r\n:60F:C250101EUR1000,00\r\n\
+        :61:2501020102DR23,45NDDTNONREF\r\n:86:105?00FOLGELASTSCHRIFT?20Einkauf REWE?32REWE Markt GmbH\r\n\
+        :62F:C250103EUR3476,55\r\n";
+    let (url, seen) = mock_bank(vec![reply_with_binary("HIKAZ:3:7:3+", mt940)]);
+    let mut c = depot_connector(&url, false);
+    c.st.versions.insert("HKKAZ".into(), vec![7]);
+    c.upd[0].allowed.insert("HKKAZ".into());
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    assert!(
+        seen.lock().unwrap().iter().flatten().any(|i| i == "HKKAZ"),
+        "the bookings are still fetched"
+    );
+    assert_eq!(r.balances_unknown.len(), 1, "{:?}", r.balances_unknown);
+}
+
+#[tokio::test]
+async fn a_depot_known_only_by_its_product_name_keeps_its_value_without_hkwpd() {
+    // Kontoart 1 (comdirect style), the product says "Depot": stored as a depot, so its value
+    // is one too (#1743)
+    let (url, _) = mock_bank(vec![SAL_A]);
+    let mut c = depot_connector(&url, false);
+    c.st.versions.insert("HKSAL".into(), vec![7]);
+    c.upd[0].allowed.insert("HKSAL".into());
+    c.upd[0].kind_code = 1;
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    assert_eq!(r.accounts[0].kind, AccountKind::Brokerage);
+    assert_eq!(r.balances_unknown.len(), 1, "{:?}", r.balances_unknown);
+    assert!(
+        r.hints
+            .iter()
+            .any(|h| h.contains("von der Bank nicht angeboten")),
+        "{:?}",
+        r.hints
+    );
+}
+
+#[tokio::test]
+async fn an_empty_depot_statement_is_a_finished_fetch_with_value_0() {
+    let (url, _) = mock_bank(vec![WPD_WITH_DATA]);
+    let r = depot_connector(&url, true)
+        .fetch(&test_ctx())
+        .await
+        .unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(r.accounts[0].balance_cents, 0);
+    assert!(r.balances_unknown.is_empty());
+}
+
+#[tokio::test]
+async fn bookings_known_to_need_a_tan_are_left_out_of_an_automatic_fetch() {
+    // #1828: HKCAZ wanted a TAN the last time; MT940 would send the next one to the app, so
+    // neither is requested. Not a case for the 90-day hint: a shorter period would not help.
+    let (url, seen) = mock_bank(vec![BALANCE]);
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSAL": [7], "HKCAZ": [1], "HKKAZ": [7]}, "tan_required": {"HKCAZ": true, "HKKAZ": true}, "camt_formats": ["urn:iso:std:iso:20022:tech:xsd:camt.052.001.08"], "sca_seen": ["HKCAZ"]});
+    let mut c = two_step_connector(&url, state);
+    c.upd = vec![
+        upd_acc("0532013000", "", IBAN_A, "Girokonto", &["HKSAL"]),
+        upd_acc(
+            "0000202051",
+            "",
+            IBAN_B,
+            "Verrechnungskonto",
+            &["HKCAZ", "HKKAZ"],
+        ),
+    ];
+    let ctx = ConnectContext {
+        since: days_ago(200),
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await.unwrap();
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            !seen.iter().flatten().any(|i| i == "HKCAZ" || i == "HKKAZ"),
+            "{seen:?}"
+        );
+    }
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].starts_with(IBAN_B), "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("HKCAZ"), "{:?}", r.warnings);
+    assert!(r.hints.is_empty(), "{:?}", r.hints);
+    assert_eq!(r.balances_unknown, vec![IBAN_B.to_string()]);
+}
+
+#[tokio::test]
+async fn a_login_tan_the_bank_asks_again_for_does_not_approve_the_dialog() {
+    // #1828 (review of #1839): the answer to the TAN asks for a new one, so nothing
+    // was accepted; a later reply without SCA may still clear `sca_seen`
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKTAN": [6]}, "tan_required": {}});
+    for (answer, approved) in [(TAN_DEMANDED, false), (ACCEPT, true)] {
+        let (url, _seen) = mock_bank(vec![answer]);
+        let mut c = two_step_connector(&url, state.clone());
+        c.task_reference = Some("TASK1".into());
+        let tan = ChallengeResponse::Code(SecretString::new("123456".into()));
+        c.respond(&test_ctx(), tan).await.unwrap();
+        assert_eq!(c.sca_in_dialog, approved, "{answer}");
+    }
+}
+
+#[tokio::test]
+async fn an_automatic_fetch_sends_further_pages_of_a_job_approved_in_the_app() {
+    // review of #1882: an automatic sync learns HKCAZ from an app approval it then gets; the
+    // next page of that request (3040) must still go out, or page 1's bookings are lost.
+    // Jobs remembered before the sync, learned without an approval, or learned while only
+    // another job was approved, stay left out.
+    let seg = || super::syntax::SegmentBuilder::new("HKCAZ", 3, 1).build();
+    for (stored, approved, sent) in [
+        (false, Some("HKCAZ"), true),
+        (true, Some("HKCAZ"), false),
+        (false, None, false),
+        (false, Some("HKSAL"), false),
+    ] {
+        let (url, seen) = mock_bank(vec![ACCEPT]);
+        let mut c = savings_needing_sca_seen(&url, &["HKCAZ"]);
+        if stored {
+            c.stored.sca_seen.insert("HKCAZ".into());
+        }
+        if let Some(job) = approved {
+            c.sca_in_dialog = true;
+            c.sca_approved.insert(job.into());
+        }
+        let r = c.request(&test_ctx(), "HKCAZ", seg()).await;
+        assert_eq!(
+            r.is_ok(),
+            sent,
+            "stored={stored} approved={approved:?}: {r:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), usize::from(sent));
+    }
+}
+
+const MT940_NO_CLOSING: &str = ":20:STARTUMSE\r\n:25:52090000/0012345678\r\n:28C:00000/001\r\n:60F:C250101EUR1000,00\r\n:61:2501030103CR2500,00NTRFNONREF\r\n:86:166?00GUTSCHRIFT?20SVWZ+Gehalt Januar?32Muster GmbH\r\n-\r\n";
+
+/// One checking account allowing HKSAL + HKKAZ, both needing a TAN at the bank (flatex, #1828).
+fn flatex_like(url: &str, sca_seen: &[&str]) -> FinTsConnector {
+    let state = serde_json::json!({"system_id": "123", "sec_func": "946", "tan_method_name": "", "tan_medium": "", "versions": {"HKSAL": [7], "HKKAZ": [7], "HKTAN": [6]}, "tan_required": {"HKSAL": true, "HKKAZ": true}, "sca_seen": sca_seen});
+    let mut c = two_step_connector(url, state);
+    c.upd = vec![upd_acc(
+        "0532013000",
+        "",
+        IBAN_A,
+        "Verrechnungskonto",
+        &["HKSAL", "HKKAZ"],
+    )];
+    c.task_reference = Some("LOGINTASK".into());
+    c
+}
+
+fn tan_prompt(
+    answer: crate::connectors::PromptAnswer,
+) -> (ConnectContext, tokio::task::JoinHandle<Vec<Phase>>) {
+    let answer = Some(answer);
+    let (prompt, asked) = answering_prompt(move |_| {
+        // every question is answered the same way
+        answer.as_ref().map(|a| match a {
+            crate::connectors::PromptAnswer::Skip => crate::connectors::PromptAnswer::Skip,
+            _ => crate::connectors::PromptAnswer::Code(SecretString::new("123456".into())),
+        })
+    });
+    (
+        ConnectContext {
+            prompt: Some(prompt),
+            ..test_ctx()
+        },
+        asked,
+    )
+}
+
+fn business_requests(seen: &[Vec<String>]) -> Vec<String> {
+    seen.iter()
+        .flatten()
+        .filter(|i| *i == "HKSAL" || *i == "HKKAZ")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn the_closing_balance_of_the_bookings_saves_the_tan_for_the_balance() {
+    // #1828 (flatex): HKSAL is known to want a TAN; the bookings come first and their
+    // :62F: is the balance, so one TAN per account
+    let (url, seen) = mock_bank(vec![
+        TAN_DEMANDED,
+        reply_with_binary("HIKAZ:3:7:3+", MT940_CLOSING_347655),
+    ]);
+    let mut c = flatex_like(&url, &["HKSAL"]);
+    let (ctx, asked) = tan_prompt(crate::connectors::PromptAnswer::Code(SecretString::new(
+        "123456".into(),
+    )));
+    let r = c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(r.accounts[0].balance_cents, 347_655);
+    assert_eq!(r.accounts[0].balance_date, "2025-01-03");
+    assert!(r.balances_unknown.is_empty());
+    assert_eq!(asked.await.unwrap().len(), 1);
+    assert_eq!(business_requests(&seen.lock().unwrap()), ["HKKAZ"]);
+}
+
+#[tokio::test]
+async fn the_balance_is_asked_for_after_bookings_without_a_closing_balance() {
+    let (url, seen) = mock_bank(vec![
+        TAN_DEMANDED,
+        reply_with_binary("HIKAZ:3:7:3+", MT940_NO_CLOSING),
+        SAL_TAN_DEMANDED,
+        SAL_A,
+    ]);
+    let mut c = flatex_like(&url, &["HKSAL"]);
+    let (ctx, asked) = tan_prompt(crate::connectors::PromptAnswer::Code(SecretString::new(
+        "123456".into(),
+    )));
+    let r = c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert_eq!(r.accounts[0].balance_cents, 123_456);
+    assert!(r.balances_unknown.is_empty());
+    assert_eq!(asked.await.unwrap().len(), 2);
+    assert_eq!(business_requests(&seen.lock().unwrap()), ["HKKAZ", "HKSAL"]);
+}
+
+#[tokio::test]
+async fn a_skipped_tan_for_the_bookings_also_leaves_out_the_balance() {
+    let (url, seen) = mock_bank(vec![TAN_DEMANDED, SAL_A]);
+    let mut c = flatex_like(&url, &["HKSAL"]);
+    let (ctx, asked) = tan_prompt(crate::connectors::PromptAnswer::Skip);
+    // nothing was read: the fetch fails (the account's balance stays unknown, not 0)
+    let e = c.fetch(&ctx).await.unwrap_err().to_string();
+    drop(ctx);
+    assert!(e.contains("übersprungen"), "{e}");
+    assert_eq!(asked.await.unwrap().len(), 1);
+    assert_eq!(business_requests(&seen.lock().unwrap()), ["HKKAZ"]);
+    assert!(c.tan_skipped);
+}
+
+#[tokio::test]
+async fn the_balance_stays_first_when_the_bank_has_not_asked_for_a_tan_for_it() {
+    let (url, seen) = mock_bank(vec![
+        SAL_A,
+        reply_with_binary("HIKAZ:3:7:3+", MT940_CLOSING_347655),
+    ]);
+    let mut c = flatex_like(&url, &[]);
+    let r = c.fetch(&test_ctx()).await.unwrap();
+    assert_eq!(r.accounts[0].balance_cents, 123_456);
+    assert_eq!(business_requests(&seen.lock().unwrap()), ["HKSAL", "HKKAZ"]);
+}
+
+#[tokio::test]
+async fn a_tan_skipped_before_the_bookings_does_not_leave_out_the_balance() {
+    // review of #1882: only a skipped TAN for the bookings leaves out the late HKSAL; one
+    // skipped for the depot request (HKWPD) before them does not
+    let (url, seen) = mock_bank(vec![
+        TAN_DEMANDED, // HKWPD: skipped
+        TAN_DEMANDED, // HKKAZ: TAN typed
+        reply_with_binary("HIKAZ:3:7:3+", MT940_NO_CLOSING),
+        SAL_TAN_DEMANDED, // late HKSAL: TAN typed
+        SAL_A,
+    ]);
+    let mut c = flatex_like(&url, &["HKSAL"]);
+    c.st.versions.insert("HKWPD".into(), vec![6]);
+    c.upd = vec![upd_acc(
+        "0532013000",
+        "",
+        IBAN_A,
+        "Depot",
+        &["HKSAL", "HKKAZ", "HKWPD"],
+    )];
+    let mut first = true;
+    let (prompt, asked) = answering_prompt(move |_| {
+        Some(if std::mem::take(&mut first) {
+            crate::connectors::PromptAnswer::Skip
+        } else {
+            crate::connectors::PromptAnswer::Code(SecretString::new("123456".into()))
+        })
+    });
+    let ctx = ConnectContext {
+        prompt: Some(prompt),
+        ..test_ctx()
+    };
+    let r = c.fetch(&ctx).await.unwrap();
+    drop(ctx);
+    assert_eq!(asked.await.unwrap().len(), 3);
+    assert_eq!(business_requests(&seen.lock().unwrap()), ["HKKAZ", "HKSAL"]);
+    // the late HKSAL was asked for; but the depot's holdings were not read (#1743), so no other
+    // figure stands in for its value: the stored balance stays
+    assert_eq!(r.balances_unknown, vec![IBAN_A.to_string()]);
 }

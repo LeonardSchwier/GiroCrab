@@ -48,18 +48,55 @@ enum RuleSearchMatcher {
     }
 }
 
+#if os(macOS)
+struct RuleEditorWindow: View {
+    static let id = "rule-editor"
+
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismissWindow) private var dismissWindow
+
+    private var isPresented: Bool { model.showRuleEditor && model.vaultState == .open }
+
+    var body: some View {
+        Group {
+            if isPresented {
+                RuleEditorView()
+                    .reportCapturable()
+                    .toastOverlay()
+            }
+        }
+        .onChange(of: isPresented, initial: true) {
+            if !isPresented { dismissWindow(id: Self.id) }
+        }
+        .onDisappear {
+            model.showRuleEditor = false
+            model.ruleDraft = nil
+        }
+    }
+}
+#endif
+
 /// Keyword / regex auto-categorisation rules with live preview.
 struct RuleEditorView: View {
     @Environment(AppModel.self) private var model
+    #if os(macOS)
+    @Environment(\.dismissWindow) private var dismissWindow
+    #else
     @Environment(\.dismiss) private var dismiss
-    let initialDraft: Rule?
+    #endif
 
     @State private var selection: Int64?
     @State private var draft: Rule?
+    @State private var draftRevision = 0
     @State private var searchText: String = ""
     @State private var ruleToDelete: Rule?
+    @State private var isSaving = false
+    @State private var saveError: (title: String, message: String)?
     /// Matching bookings that carry all of a rule's tags (#580), loaded off main.
     @State private var tagCounts: [Int64: UInt32] = [:]
+    /// Rules file being written / chosen (#1057).
+    @State private var exchange: RuleTagExport?
+    @State private var importing = false
 
     private var isFiltering: Bool {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -159,6 +196,12 @@ struct RuleEditorView: View {
                             .disabled(fullIndex >= model.rules.count - 1)
 
                             Divider()
+                            Button {
+                                exchange = .rules([rule.id])
+                            } label: {
+                                Label("Exportieren …", systemImage: "square.and.arrow.up")
+                            }
+                            Divider()
                             Button(role: .destructive) {
                                 ruleToDelete = rule
                             } label: {
@@ -168,6 +211,8 @@ struct RuleEditorView: View {
                     }
                     .onMove(perform: isFiltering ? nil : moveRulesFromList)
                 }
+                Divider()
+                exchangeBar
             }
             .navigationTitle("Regeln")
             .navigationSplitViewColumnWidth(min: 240, ideal: 280)
@@ -180,18 +225,39 @@ struct RuleEditorView: View {
             if let current = draft {
                 RuleForm(rule: Binding(get: { draft ?? current }, set: { draft = $0 }),
                          onSave: save, onDelete: { ruleToDelete = $0 })
+                    .id(draftRevision)
             } else {
                 ContentUnavailableView("Keine Regel ausgewählt", systemImage: "wand.and.stars", description: Text("Regeln werden von oben nach unten ausgewertet – die erste passende Regel gewinnt. Reihenfolge per Drag & Drop in der Liste ändern."))
             }
         }
         .macFrame(minWidth: 860, minHeight: 600)
+        // the detail column's toolbar background must not poke into the rule list (as in the main window, #1531)
+        .sidebarDividerToTop()
+        .disabled(isSaving)
+        .overlay {
+            if isSaving { ProgressView("Speichern & anwenden") }
+        }
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
-                Button("Fertig") { dismiss() }
+                Button("Fertig") {
+                    #if os(macOS)
+                    dismissWindow(id: RuleEditorWindow.id)
+                    #else
+                    dismiss()
+                    #endif
+                }
             }
             ToolbarItem(placement: .automatic) {
                 Button { model.applyAllRules() } label: { Label("Alle Regeln anwenden", systemImage: "play.fill") }
+                    .disabled(isSaving)
             }
+        }
+        .alert(saveError?.title ?? "", isPresented: Binding(
+            get: { saveError != nil }, set: { if !$0 { saveError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(saveError?.message ?? "")
         }
         .confirmationDialog("Regel löschen?",
                             isPresented: Binding(get: { ruleToDelete != nil }, set: { if !$0 { ruleToDelete = nil } }),
@@ -201,11 +267,11 @@ struct RuleEditorView: View {
         } message: { _ in
             Text("Buchungen, die diese Regel kategorisiert hat, sind danach wieder ohne Kategorie. Das lässt sich nicht widerrufen.")
         }
-        .onAppear {
-            if let d = initialDraft {
-                draft = d
-                selection = d.id == 0 ? nil : d.id
-            }
+        .onChange(of: model.ruleDraft, initial: true) { _, incoming in
+            guard let incoming else { return }
+            draft = incoming
+            selection = incoming.id == 0 ? nil : incoming.id
+            draftRevision &+= 1
             model.ruleDraft = nil
         }
         // rules saved or applied, tags set elsewhere: count again
@@ -215,6 +281,35 @@ struct RuleEditorView: View {
         .onChange(of: selection) { _, new in
             if let new, let r = model.rules.first(where: { $0.id == new }) { draft = r }
         }
+        .ruleTagExchange(export: $exchange, importing: $importing)
+    }
+
+    /// Bottom of the rule list: rules (with their tags) to and from a file (#1057),
+    /// the same menu button as in the tag manager.
+    private var exchangeBar: some View {
+        HStack {
+            Spacer(minLength: 0)
+            Menu {
+                Button("Regeln importieren …") { importing = true }
+                Divider()
+                Button("Alle Regeln exportieren …") { exchange = .rules([]) }
+                    .disabled(model.rules.isEmpty)
+                Button("Ausgewählte Regel exportieren …") {
+                    if let selection { exchange = .rules([selection]) }
+                }
+                .disabled(selection == nil)
+            } label: {
+                Image(systemName: "square.and.arrow.up.on.square")
+            }
+            #if os(macOS)
+            .menuStyle(.borderlessButton)
+            #endif
+            .fixedSize()
+            .help(Text("Regeln importieren oder exportieren"))
+            .accessibilityLabel(Text("Regeln importieren oder exportieren"))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
     }
 
     private func moveRulesFromList(from source: IndexSet, to destination: Int) {
@@ -263,10 +358,30 @@ struct RuleEditorView: View {
         draft = model.newRuleDraft()
     }
 
-    private func save(_ rule: Rule) {
-        if let id = model.saveRule(rule) {
-            selection = id
-            draft = model.rules.first { $0.id == id }
+    private func save(_ rule: Rule, onlyUncategorized: Bool) {
+        guard !isSaving else { return }
+        isSaving = true
+        let revision = draftRevision
+        Task {
+            defer { isSaving = false }
+            do {
+                guard let saved = try await model.saveRule(rule, onlyUncategorized: onlyUncategorized) else { return }
+                if revision == draftRevision, let updated = model.rules.first(where: { $0.id == saved.id }) {
+                    if !filteredRules.contains(where: { $0.id == saved.id }) { searchText = "" }
+                    selection = saved.id
+                    draft = updated
+                }
+                switch saved.application {
+                case .success(0):
+                    model.toast = String(localized: "Regel gespeichert – keine Buchungen geändert")
+                case .success(let count):
+                    model.toast = String(localized: "Regel gespeichert – geänderte Buchungen: \(count)")
+                case .failure(let error):
+                    saveError = (String(localized: "Regel gespeichert, Anwenden fehlgeschlagen"), describe(error))
+                }
+            } catch {
+                saveError = (String(localized: "Regel konnte nicht gespeichert werden"), describe(error))
+            }
         }
     }
 
@@ -280,9 +395,10 @@ struct RuleEditorView: View {
 struct RuleForm: View {
     @Environment(AppModel.self) private var model
     @Binding var rule: Rule
-    let onSave: (Rule) -> Void
+    let onSave: (Rule, Bool) -> Void
     let onDelete: (Rule) -> Void
 
+    @State private var showSaveScope = false
     @State private var minText = ""
     @State private var maxText = ""
     @State private var direction = 0
@@ -385,7 +501,7 @@ struct RuleForm: View {
                                 Text(b.counterparty).lineLimit(1).sensitive()
                                 Spacer()
                                 if b.categorySource == .manual && rule.categoryId != 0 {
-                                    Image(systemName: "hand.raised.fill").foregroundStyle(.secondary).help("Manuell zugeordnet – die Regel ändert das nicht")
+                                    Image(systemName: "hand.raised.fill").foregroundStyle(.secondary).help("Manuell kategorisiert")
                                 }
                                 Text(Money.format(b.amountCents)).monospacedDigit().foregroundStyle(Money.ink(b.amountCents))
                                     .sensitive(.amounts)
@@ -404,11 +520,23 @@ struct RuleForm: View {
                     Button("Regel löschen …", role: .destructive) { onDelete(rule) }
                 }
                 Spacer()
-                Button("Speichern & anwenden") { onSave(rule) }
+                Button("Speichern & anwenden") { showSaveScope = true }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .disabled(rule.pattern.trimmingCharacters(in: .whitespaces).isEmpty || preview.error != nil
                               || (rule.categoryId == 0 && rule.tagIds.isEmpty))
+                    .confirmationDialog("Auf welche Buchungen soll die Regel angewendet werden?",
+                                        isPresented: $showSaveScope, titleVisibility: .visible) {
+                        Button("Nur unkategorisierte Buchungen") { onSave(rule, true) }
+                        Button("Alle Buchungen", role: rule.categoryId == 0 ? nil : .destructive) {
+                            onSave(rule, false)
+                        }
+                        Button("Abbrechen", role: .cancel) {}
+                    } message: {
+                        if rule.categoryId != 0 {
+                            Text("Bei „Alle Buchungen“ kann die Regel auch manuell gesetzte Kategorien überschreiben.")
+                        }
+                    }
             }
             .padding(12)
         }
